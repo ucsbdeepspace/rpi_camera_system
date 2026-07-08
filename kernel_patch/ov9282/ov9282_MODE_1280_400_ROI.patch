@@ -1,0 +1,85 @@
+--- /home/pi/fta_camera_timing/kernel_patch/ov9282/ov9282.c.orig	2026-07-08 15:49:04.128106210 -0700
++++ /home/pi/fta_camera_timing/kernel_patch/ov9282/ov9282.c	2026-07-08 15:49:04.126991461 -0700
+@@ -290,6 +290,7 @@
+ #define MODE_1280_800		0
+ #define MODE_1280_720		1
+ #define MODE_640_400		2
++#define MODE_1280_400_ROI	3
+ 
+ #define DEFAULT_MODE		MODE_1280_720
+ 
+@@ -386,6 +387,37 @@
+ 	{0x4509, 0x80},
+ };
+ 
++static const struct ov9282_reg mode_1280x400_roi_regs[] = {
++	{0x3778, 0x00},
++	{0x3800, 0x00},
++	{0x3801, 0x00},
++	{0x3802, 0x00},
++	{0x3803, 0x00},
++	{0x3804, 0x05},
++	{0x3805, 0x0f},
++	{0x3806, 0x01},
++	{0x3807, 0x9f},
++	{0x3808, 0x05},
++	{0x3809, 0x00},
++	{0x380a, 0x01},
++	{0x380b, 0x90},
++	{0x3810, 0x00},
++	{0x3811, 0x08},
++	{0x3812, 0x00},
++	{0x3813, 0x08},
++	{0x3814, 0x11},
++	{0x3815, 0x11},
++	{OV9282_REG_TIMING_FORMAT_1, 0x3c},
++	{OV9282_REG_TIMING_FORMAT_2, 0x84},
++	{0x4003, 0x40},
++	{0x4008, 0x02},
++	{0x4009, 0x05},
++	{0x400c, 0x00},
++	{0x400d, 0x03},
++	{0x4507, 0x00},
++	{0x4509, 0x80},
++};
++
+ /* Supported sensor mode configurations */
+ static const struct ov9282_mode supported_modes[] = {
+ 	[MODE_1280_800] = {
+@@ -449,6 +481,36 @@
+ 			.regs = mode_640x400_regs,
+ 		},
+ 	},
++	[MODE_1280_400_ROI] = {
++		.width = 1280,
++		.height = 400,
++		.hblank_min = { 250, 176 },
++		.vblank = 1022,
++		.vblank_min = 41,
++		.vblank_max = 51540,
++		.link_freq_idx = 0,
++		.crop = {
++			/*
++			 * EXPERIMENTAL: real windowed crop (not binned), pattern
++			 * extrapolated from the 800->720 relationship in the stock
++			 * table: y_end = height + 15, y_start = 0, ISP y-offset
++			 * fixed at 8. Horizontal registers left untouched (no stock
++			 * precedent for horizontal windowing) -- width stays 1280.
++			 * TIMING_FORMAT_1/2, 4008/4009/400c/400d/4507/4509 copied
++			 * verbatim from MODE_1280_720 (nearest non-binned analog);
++			 * their exact semantics are undocumented here and unverified
++			 * for this height -- validate on hardware before trusting.
++			 */
++			.left = OV9282_PIXEL_ARRAY_LEFT,
++			.top = OV9282_PIXEL_ARRAY_TOP,
++			.width = 1280,
++			.height = 400
++		},
++		.reg_list = {
++			.num_of_regs = ARRAY_SIZE(mode_1280x400_roi_regs),
++			.regs = mode_1280x400_roi_regs,
++		},
++	},
+ };
+ 
+ /**
