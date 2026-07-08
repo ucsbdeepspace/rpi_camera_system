@@ -9,6 +9,19 @@ don't let it drift from what's actually true. Full prior conversation history
 (pre-2026-07-08) is archived in `docs/archive/handoff_conversation_2026-07-08.txt`
 for context, but treat *this* file as authoritative, not the archive.
 
+## ⚠ ACTION NEEDED: reboot before touching cameras (as of 2026-07-08 15:50)
+
+A kernel BUG/Oops was just triggered while testing a patched camera driver
+(see "Sensor-level windowing — MODE_1280_400_ROI" section below). Kernel is
+currently tainted (`D`=DIE, `W`=WARN, `O`=OOT_MODULE). **Reboot the Pi before
+running any camera test or touching kernel modules again** — do not trust
+current driver/media-controller state. The patched module was never
+`depmod`-installed, so a plain reboot reverts to the stock driver automatically;
+no manual cleanup is needed first. After rebooting, re-run the Stage 0 baseline
+checks (see that section) to confirm clean state before deciding next steps —
+do not immediately retry the module swap; the root-cause hypothesis below needs
+investigating first.
+
 ## Settled configuration (validated, don't re-derive from scratch)
 
 - **Architecture**: multiprocessing — two separate OS processes, one per camera.
@@ -71,10 +84,123 @@ instead, plain `--get-selection` is for video-capture nodes, not subdevs.)
 Result: `crop` == `crop_bounds` == `crop_default` == 1280x800 @ offset (8,8),
 identical on both sensors. `native_size` is 1296x816 (the 8px border is just
 optical-black trim, not a tunable margin). **Since crop already equals its own
-bounds, there is no addressable range left to shrink — this driver/sensor
-combo does not expose adjustable sensor-level windowing.** The 3400µs frame
-duration floor is a hardware/driver limit, not a software gap. Don't re-chase
-this lever unless a different driver/overlay is introduced.
+bounds, there is no addressable range left to shrink at the stock-driver API
+level.** See the next section — this was later found to be a driver-policy
+limitation, not a hardware one; the sensor itself supports a real windowed
+crop, the stock driver just never exposes it via a mode variant.
+
+## Sensor-level windowing — MODE_1280_400_ROI, out-of-tree driver patch (2026-07-08, IN PROGRESS / BLOCKED)
+
+**Status: patch written and committed, module-load attempt crashed the
+kernel. Root cause not yet confirmed to be patch-specific. See the reboot
+banner at the top of this file before doing anything with the cameras.**
+
+### Background
+
+The stock `ov9282` kernel driver (`drivers/media/i2c/ov9282.c`, in-tree in
+`raspberrypi/linux` branch `rpi-6.18.y`, matches running kernel
+`6.18.34+rpt-rpi-2712`) ships 3 modes: 1280x800, 1280x720, 640x400. The 640x400
+mode is pixel-*binned* (subsampling regs `0x3814/0x3815 = 0x31/0x22`) — it
+still scans the full sensor array, so it doesn't reduce per-frame readout time.
+That's why the previous "RESOLVED, not available" investigation above found no
+addressable crop range: the driver pins `.crop` to full-frame for every mode
+regardless of output size.
+
+The 1280x720 mode, however, *is* a genuine windowed crop (readout-window
+register `0x3806/0x3807` shrinks `y_end` from 815 to 735 vs the 800-mode).
+Comparing the two stock modes revealed a clean, consistent pattern:
+`y_end = height + 15`, `y_start = 0`, ISP y-offset register fixed at 8
+regardless of height, independent of any horizontal register.
+
+Using that pattern, added `MODE_1280_400_ROI` (index 3) to `supported_modes[]`:
+1280x400, real vertical crop (not binned). Width deliberately left at 1280 —
+no stock precedent exists for horizontal windowing, so that's out of scope for
+this pass. Several registers in the new mode's reg list (`TIMING_FORMAT_1/2`,
+`0x4008/0x4009/0x400c/0x400d`, `0x4507/0x4509`) were copied verbatim from the
+1280x720 mode since their exact hardware semantics aren't documented anywhere
+available — flagged as unverified, meant to be validated by inspecting an
+actual captured frame (never got that far — see below).
+
+Patch lives at `kernel_patch/ov9282/` in this repo: `ov9282.c` (patched),
+`ov9282.c.orig` (stock baseline), `ov9282_MODE_1280_400_ROI.patch` (diff),
+`Makefile`, and the built `ov9282.ko` (out-of-tree module, built against
+`linux-headers-6.18.34+rpt-rpi-2712`, vermagic- and depends-matched to the
+running kernel — confirmed via `modinfo`). **Never `depmod`-installed** —
+loaded only via loose `insmod`, specifically so a reboot is a total, guaranteed
+rollback to stock.
+
+### What happened when loading it
+
+Procedure: stopped `wireplumber`/`pipewire` (they hold `/dev/media*` fds via
+libcamera's camera monitor and will block `rmmod`), confirmed via `lsof` that
+nothing held the camera devices, then:
+```
+sudo rmmod ov9282        # succeeded cleanly, dmesg quiet, lsmod confirmed empty
+sudo insmod kernel_patch/ov9282/ov9282.ko
+```
+`insmod` **segfaulted** (exit 139). `lsmod` afterward showed `ov9282` loaded
+with refcount 1 (so it partially succeeded — likely one of the two i2c clients
+bound before the crash). `dmesg` showed:
+
+```
+WARNING: CPU: 2 PID: 10114 at drivers/media/mc/mc-device.c:619 media_device_register_entity+0x1d8/0x208 [mc]
+```
+— fired **twice** (once per camera, `ov9282_probe → i2c_register_driver` →
+... → `v4l2_async_register_subdev_sensor → cfe_async_complete →
+__video_register_device → media_device_register_entity`), followed by:
+```
+kernel BUG at drivers/media/mc/mc-entity.c:146!
+Internal error: Oops - BUG: ... [#1] SMP
+```
+and the kernel taint flags progressed to `Tainted: G  D  W  O` (`D`=DIE). A
+later, separate WARNING also appeared in the idle loop
+(`ct_kernel_exit.constprop.0`, `PID 0 Comm swapper/2`), suggesting broader
+instability after the BUG, not just a contained failure in the media subsystem.
+
+### Root-cause hypothesis — likely NOT specific to the patch content
+
+**The entire crashing call stack is generic/stock code** — `ov9282_probe()`,
+`v4l2_async_register_subdev_sensor()`, `cfe_async_complete()`,
+`__video_register_device()`, `media_device_register_entity()` — none of it
+touches the new mode-table entry added by this patch. The `media_device`
+object being registered into is owned by `rp1_cfe_downstream` (the CSI/CFE
+bridge driver), which stays loaded across the `ov9282` `rmmod`/`insmod` cycle.
+**Best current guess: `rmmod` of the sensor driver does not cleanly tear down
+the entity it registered into the bridge driver's shared `media_device` at
+boot, so re-probing on `insmod` collides with a stale entity registration.**
+If true, this would be a pre-existing fragility in `rmmod`/`insmod`-cycling
+*this driver on this kernel*, unrelated to whether the loaded module is stock
+or patched — not confirmed yet, but consistent with everything in the trace.
+
+**This needs to be tested before re-attempting the swap**: does `rmmod` +
+`insmod` of the *unmodified stock* `ov9282.ko.xz` (after a clean reboot)
+trigger the same `mc-device.c:619` warning / `mc-entity.c:146` BUG? If yes,
+the module-swap approach itself needs a different strategy (candidates: (a)
+check whether `v4l2_async_unregister_subdev`/`__video_unregister_device` is
+actually being called on `rmmod` — may be a real kernel/driver bug in this
+version; (b) skip live module swapping entirely and instead `depmod`-install
++ reboot into the patched module for a test session, then reboot back to
+stock afterward — trades convenience for avoiding the reload path entirely).
+If the stock module reload is clean and only the patched one crashes, the
+patch content itself needs re-examination despite the trace not touching it
+directly (e.g., possible ABI-level struct-layout mismatch between the
+headers-based out-of-tree build and however the distro's stock module was
+actually built, even with matching vermagic).
+
+### Next actions for this thread
+
+1. Reboot (see banner at top of file).
+2. Re-run Stage 0 baseline checks (`lsmod`, `dmesg`, `rpicam-hello
+   --list-cameras`, no camera processes running) to confirm clean stock state.
+3. **Diagnostic test before re-attempting the patched module**: `rmmod
+   ov9282` then `sudo insmod /lib/modules/$(uname -r)/kernel/drivers/media/i2c/ov9282.ko.xz`
+   (the untouched stock module) — does this alone reproduce the
+   `mc-device.c:619`/`mc-entity.c:146` crash? This isolates "reload mechanism
+   is fragile" from "the patch is broken."
+4. Based on that result, pick a strategy (see hypothesis section above) and
+   retry — full staged plan (software-only verification before any streaming,
+   conservative frame durations, single-camera-first, etc.) is preserved and
+   should still be followed once a load strategy that doesn't crash is found.
 
 ## Hardware status
 
@@ -140,8 +266,13 @@ hang — reboot before trusting subsequent runs.
 
 ## Next steps (as of 2026-07-08)
 
-1. Stress-test `i2c@80000` reconnection: run
+1. **Reboot the Pi**, then follow "Next actions for this thread" under the
+   MODE_1280_400_ROI section above — diagnose whether stock-module
+   rmmod/insmod reload alone crashes (isolates the mechanism from the patch)
+   before retrying anything.
+2. Stress-test `i2c@80000` reconnection: run
    `led_dual_camera_closed_loop_test_mp.py 3400` several times, watch for
-   intermittent failures.
-2. Get Phil's answer on discrete-step vs. continuous tracking (determines
+   intermittent failures. (Blocked until the kernel is back in a clean,
+   rebooted state.)
+3. Get Phil's answer on discrete-step vs. continuous tracking (determines
    whether ~120Hz or ~280fps is the real ceiling to design around).
