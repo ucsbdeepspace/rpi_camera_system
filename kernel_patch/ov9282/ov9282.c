@@ -1195,8 +1195,18 @@ static int ov9282_set_selection(struct v4l2_subdev *sd,
 	}
 
 	max_y_start = OV9282_PIXEL_ARRAY_HEIGHT - ov9282->cur_mode->crop.height;
-	y_start = sel->r.top > OV9282_PIXEL_ARRAY_TOP ?
-		  sel->r.top - OV9282_PIXEL_ARRAY_TOP : 0;
+	{
+		/* sel->r.top is signed; OV9282_PIXEL_ARRAY_TOP is an unsigned
+		 * literal. Do the subtraction in a signed temporary before
+		 * clamping into the unsigned y_start -- comparing/subtracting
+		 * the raw types here previously let a negative top silently
+		 * promote to a huge unsigned value and clamp to max_y_start
+		 * instead of 0 (confirmed via a direct top=-42 v4l2-ctl test).
+		 */
+		s32 signed_y_start = (s32)sel->r.top - (s32)OV9282_PIXEL_ARRAY_TOP;
+
+		y_start = signed_y_start > 0 ? (u32)signed_y_start : 0;
+	}
 	if (y_start > max_y_start)
 		y_start = max_y_start;
 	y_start -= y_start % 4; /* 4-row alignment, matches the binned

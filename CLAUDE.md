@@ -199,21 +199,36 @@ All against camera 0 (`i2c@88000` → `/dev/v4l-subdev5`), mode `640x200`
    (`python3 roi_set_selection.py <cam_index> [y_start]`).
 
    **Found a real driver bug while dogfooding this**: a negative `y_start`
-   sent straight to the driver does **not** clamp to the `0` floor the way
-   an over-range value correctly clamps to the max — it wraps around
-   (almost certainly unsigned-arithmetic underflow in the kernel-side clamp
-   in `ov9282_set_selection`) and lands at the **max** position (400)
+   sent straight to the driver did **not** clamp to the `0` floor the way
+   an over-range value correctly clamped to the max — it wrapped around
+   (unsigned-arithmetic underflow in the kernel-side clamp in
+   `ov9282_set_selection`) and landed at the **max** position (400)
    instead. Confirmed directly with a raw `v4l2-ctl --set-subdev-selection
-   ...top=-42...` call (independent of this Python script), so it's a
-   genuine kernel-side gap, not a bug in the wrapper. **Not fixed in the
-   driver** — worked around in `roi_set_selection.py` by clamping
-   `y_start` to `[0, MAX_Y_START]` in Python *before* it ever reaches the
-   driver, so this wrapper never triggers the bug. Anything that talks to
-   the subdev directly (bypassing this script) is still exposed to it —
-   worth a kernel-side fix at some point (the driver's own clamp should
-   check for negative input as a signed value before comparing against 0),
-   but not blocking since the one sanctioned Python entry point now guards
-   against it.
+   ...top=-42...` call (independent of this Python script), so it was a
+   genuine kernel-side gap, not a bug in the wrapper. Worked around in
+   `roi_set_selection.py` by clamping `y_start` to `[0, MAX_Y_START]` in
+   Python *before* it ever reaches the driver, so this wrapper never
+   triggered the bug.
+
+   **Kernel-side fix — DONE, committed (2026-07-14).** Fixed the clamp
+   itself in `ov9282_set_selection()`: the old code compared/subtracted
+   `sel->r.top` (signed) against `OV9282_PIXEL_ARRAY_TOP` (unsigned
+   literal) directly, so a negative `top` silently promoted to a huge
+   unsigned value before the `> OV9282_PIXEL_ARRAY_TOP` check, and that
+   huge value then clamped down to `max_y_start` instead of `0`. Fix does
+   the subtraction in a signed `s32` temporary first, then clamps into the
+   unsigned `y_start` only after checking the sign. Built, vermagic-
+   matched, depmod-installed, reboot done. **Validated directly against
+   the live subdev** (camera 0, bypassing the Python wrapper entirely, raw
+   `v4l2-ctl --set-subdev-selection ...top=-42...`): now correctly lands
+   at `top=8` (`y_start=0`), not the old `top=408` (`y_start=400`) wrap.
+   Regression-checked the existing over-range-positive clamp still works
+   (`top=608` → clamps to `top=408`/`y_start=400`, unchanged). `tainted`
+   stayed `4096`, no dmesg BUG/Oops during either test. Camera 0 reset
+   back to `y_start=0` afterward. The Python-side clamp in
+   `roi_set_selection.py` is now redundant (driver enforces both ends
+   correctly) but left in place as defense-in-depth / documentation of the
+   valid range — no reason to remove it.
 8. **Mid-stream write, full camera×mode matrix — DONE, all 4 clean
    (2026-07-14).** Extended the item-5 mid-stream test (background capture
    loop + an external, separate-shell `v4l2-ctl set-subdev-selection` fired
