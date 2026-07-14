@@ -17,11 +17,13 @@ writes validated across both cameras and both ROI modes (all combinations
 clean, see "Validation results" below); `roi_set_selection.py` is a real,
 committed helper (`get_roi_y_start`/`set_roi_y_start`); and
 `roi_live_demo.py` is a real, committed interactive demo — two live camera
-windows, keyboard-driven ROI move, confirmed working end-to-end on the
-Pi's actual display (see "Live demo" section below). Remaining open items
-are polish, not blockers: repeated mid-stream trials (each combo has only
-been tried once), and a known-but-worked-around kernel-side clamp bug (see
-item 7 below).
+windows with a live fps overlay, keyboard-driven ROI move, and a per-camera
+binning toggle, confirmed working end-to-end on the Pi's actual display
+(see "Live demo" section below, item 11 in particular for the binning
+toggle and the two real bugs found validating it). The item-7 kernel-side
+negative-`y_start` clamp bug is now fixed (not just worked around) — see
+that item for details. Remaining open item is repeated mid-stream trials
+(each camera×mode combo has only been tried once) — polish, not a blocker.
 
 ### Why this exists
 
@@ -361,6 +363,75 @@ All against camera 0 (`i2c@88000` → `/dev/v4l-subdev5`), mode `640x200`
     fds via `lsof`, taint stayed clean — so OS-level process teardown was
     sufficient in practice, but this means the demo's own cleanup code is
     *not* what's relied on if it's ever killed by something other than `q`.
+
+11. **fps overlay + live binning toggle — DONE, committed (2026-07-14).**
+    User asked for a test app showing both feeds with fps and letting them
+    adjust ROI *and* toggle binning per camera. Added to `roi_live_demo.py`:
+    a rolling 30-frame fps counter per camera in the overlay (`{fps:.1f}fps`,
+    computed from wall-clock timestamps of the app's own capture loop — an
+    honest "what this app is actually achieving," not an isolated hardware
+    benchmark), and a `b` key that toggles the *active* camera between the
+    two windowed ROI modes (`640x200` binned <-> `1280x400` unbinned) via a
+    real `cam.stop()` / reconfigure / `cam.start()` cycle — a materially
+    different, heavier operation than the mid-stream `y_start` move (see the
+    "Scope decision" note near the top of this section on why binning/size
+    changes need a full reconfigure).
+
+    **Two real bugs found and fixed while validating this on the live
+    display, not just written and assumed correct:**
+
+    - **Shift+key shortcuts don't work through this app's input path.**
+      First cut had `B` (shift+b) as a "toggle binning on all cameras"
+      shortcut. Testing via `xdotool key shift+b` (the same driving method
+      used for all prior live-demo validation) showed cv2's `waitKey()` on
+      this GTK backend never receives the shifted keycode — it silently
+      delivers plain lowercase `b` instead, confirmed by logging the raw
+      key values received. This meant `B` was actually just re-toggling
+      whichever camera was already active, not operating on both — wrong
+      silently, not wrong loudly. Fixed by dropping the bulk shortcut
+      entirely rather than chasing a fragile modifier-key path: `b` now
+      only ever affects the active camera (select the other with `1`/`2`
+      and press `b` again for both) — also a better fit for this app's
+      already-established independent-per-camera control model than a
+      bulk "do both" shortcut would have been anyway.
+    - **Reconfiguring one camera silently resets the OTHER (untouched)
+      camera's `roi_y_start` back to 0.** Found by testing the full
+      sequence live: set cam0 to `y_start=60` and cam1 to `y_start=40`
+      (both confirmed via `v4l2-ctl --get-subdev-selection`), toggled
+      cam1's binning (cam1's own position correctly preserved at 40,
+      verified immediately after) — and cam0, never touched, had silently
+      dropped to `y_start=0`. Reproduced in both directions (toggling
+      either camera clobbers the other's already-applied position) and
+      confirmed NOT just an app-side bookkeeping bug: the driver itself
+      reports the wrong value on direct `v4l2-ctl` reads of the untouched
+      camera's own subdev, so this is a genuine kernel/driver-level side
+      effect, most likely the two sensors sharing one media-graph
+      pad-format validation pass in the CFE bridge driver during any
+      single camera's `cam.configure()`, even though their CSI/register
+      paths are otherwise fully independent (matches the shared
+      `media_device` object noted in the `MODE_1280_400_ROI` crash
+      investigation elsewhere in this file, though that was a much more
+      severe rmmod/insmod-only bug — this is a much milder, non-crashing
+      side effect of routine reconfigure). **Not a kernel patch fix** —
+      worked around at the application level: `toggle_binning()` now
+      re-applies *every* camera's stored `y_start` (with the existing
+      retry-verify logic, itself added after finding cam.start() can also
+      return before the driver's pad-format selection has fully settled,
+      causing an immediate set_selection to silently no-op) after any
+      single camera's reconfigure, not just the one that was toggled.
+      Validated after the fix: toggled cam1 then cam0 in sequence, both
+      held their distinct positions (60 vs. 40) both immediately and 5s
+      later; `tainted` stayed `4096`, no dmesg anomaly throughout. Worth
+      flagging as a real, reproducible driver quirk if anyone digs into
+      the CFE bridge driver later — out of scope to root-cause further
+      here now that there's a working per-app-level guard against it.
+
+    End-to-end re-validated on the Pi's live display after both fixes:
+    fps overlay renders correctly on both cameras, `b` toggles only the
+    active camera's binning with its window resizing to match (confirmed
+    via screenshot), `q` exits cleanly (process gone, no lingering
+    `/dev/video*`/`/dev/media*` fds via `lsof`), both subdevs reset to
+    `y_start=0` afterward.
 
 ## MODE_640_200_ROI — DONE, committed (`d5eb808`, 2026-07-08)
 
@@ -828,13 +899,17 @@ camera module matching if needed later.
   also runnable as a CLI (`python3 roi_set_selection.py <cam_index>
   [y_start]`). Clamps `y_start` client-side before it reaches the driver —
   see the "runtime-movable ROI" section above for a driver-side clamp bug
-  this works around.
+  this fixed.
 - `roi_live_demo.py` — interactive live demo: both camera ROI feeds side by
-  side, independent per-camera control (`1`/`2` picks the active camera,
-  `w`/`s` move only that one while streaming, `r` resets it, `a` resets
-  all, `q` quits). Needs an actual display (`DISPLAY=:0` — this Pi has a
-  real desktop session via `labwc`), not runnable headless. `python3
-  roi_live_demo.py [WxH] [step]`, defaults `640x200`, step=20 rows.
+  side with a live fps overlay, independent per-camera control (`1`/`2`
+  picks the active camera, `w`/`s` move its ROI while streaming, `r`
+  resets it, `a` resets all ROIs, `b` toggles its binning between
+  `640x200` binned and `1280x400` unbinned via a full reconfigure, `q`
+  quits — no bulk "toggle all binning" shortcut, see item 11 in the
+  "runtime-movable ROI" section for why). Needs an actual display
+  (`DISPLAY=:0` — this Pi has a real desktop session via `labwc`), not
+  runnable headless. `python3 roi_live_demo.py [WxH] [step]`, defaults
+  `640x200`, step=20 rows.
 - `led_dual_camera_closed_loop_test_single_process.py`,
   `led_dual_camera_closed_loop_test_mp_buf1.py` — comparison baselines,
   already answered their questions, probably don't need to run again
