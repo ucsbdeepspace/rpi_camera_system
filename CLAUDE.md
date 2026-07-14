@@ -780,10 +780,31 @@ previously caused (both now fixed as of the reimage):
    permanent damage.
 
 **Re-verified 2026-07-08**: `rpicam-hello --list-cameras` shows both sensors
-detected (`i2c@88000` and `i2c@80000`). **Still not stress-tested for
-stability** — run `led_dual_camera_closed_loop_test_mp.py 3400` a few times
-and watch for intermittent failures before fully trusting the `i2c@80000`
-connection under sustained load.
+detected (`i2c@88000` and `i2c@80000`).
+
+**Stress-tested 2026-07-14 — `i2c@80000` connection is solid.** Ran
+`led_dual_camera_closed_loop_test_mp.py 3400` 8 times back-to-back (fresh
+process each run, stock 640x400). Every run: both cameras initialized
+cleanly and sustained their normal ~280-282fps raw capture rate for the
+full 5s, `tainted` stayed `4096` throughout, no dmesg BUG/Oops/WARNING at
+any point. **No sign of the CSI-2-link-silently-not-coming-up failure mode
+that motivated this test** — camera 1 never failed to init or dropped out
+across 8 consecutive runs.
+
+One separate, pre-existing wrinkle surfaced during this stress test, **not**
+a camera/driver reliability finding: runs 5 and 7 (of 8) showed a collapsed
+confirmed-transition rate (2.24Hz and 8.78Hz vs. the normal ~140-230Hz) with
+real timeouts (5 each), and 3 of the 8 runs logged `POOR SEPARATION` on the
+script's own ON/OFF brightness calibration check. This tracks as LED-
+detection/ambient-light noise in the test harness's calibration step, not
+an `i2c@80000`-specific hardware fault: `POOR SEPARATION` hit *both*
+cameras' calibration simultaneously in every affected run (an asymmetric,
+camera-1-only failure would be the expected signature of a flaky physical
+connection, not a symmetric one), and run 7 had timeouts despite *both*
+cameras calibrating "ok" — so the correlation with the calibration warning
+isn't even clean. Worth knowing about if someone reruns this test and sees
+a low toggle-frequency outlier, but doesn't call the hardware connection
+into question — that's now considered validated under sustained load.
 
 Also note: 2 spare Raspberry Pis + 2 spare cameras have been ordered. Ribbon
 cable is printed "HBV-Raspberry-160FPC" — useful search string for exact
@@ -840,19 +861,18 @@ exploration needs one-value-at-a-time testing in fresh processes, watching the
 terminal, ready to kill/reboot. Camera driver state is uncertain after any such
 hang — reboot before trusting subsequent runs.
 
-## Next steps (as of 2026-07-08 16:35)
+## Next steps (as of 2026-07-14)
 
-1. **Design and test a combined mode** (e.g. `MODE_640_200_ROI`): stock
-   horizontal binning + a real vertical window well under 400 rows — see
-   "Throughput result — NEGATIVE for the speed goal" above. This is the
-   actual next lever for higher capture rate; `MODE_1280_400_ROI` alone is
-   validated-working but does not beat current fps.
-2. Stress-test `i2c@80000` reconnection: run
-   `led_dual_camera_closed_loop_test_mp.py 3400` several times, watch for
-   intermittent failures. (Unblocked — kernel is in a clean, rebooted state
-   with the patched module loaded.)
-3. Get Phil's answer on discrete-step vs. continuous tracking (determines
-   whether ~120Hz or ~280fps is the real ceiling to design around) — matters
-   even more now that a straightforward vertical-only crop hasn't moved the
-   ceiling; worth confirming a higher rate is actually the right thing to
-   chase before investing in another driver-patch/reboot cycle.
+1. **Ask Phil**: discrete step-and-confirm (~120-230Hz range, see closed-loop
+   numbers throughout this file) vs. continuous latest-frame tracking
+   (~280-527fps range, mode-dependent) — this determines which ceiling is
+   actually the one to design/optimize around. Blocking further speed work.
+2. ~~Stress-test `i2c@80000` reconnection~~ — **done, solid** (2026-07-14, see
+   "Hardware status" above): 8 back-to-back runs, no init failures, no
+   dmesg anomalies, consistent ~280fps raw capture every time.
+3. **Repeat mid-stream ROI-move trials** for more confidence: each of the 4
+   camera×mode combinations for the live `set_selection` write (see
+   "runtime-movable ROI" section) has only been tried once. More repeats —
+   especially writes landing at different points within a frame's readout
+   window, or back-to-back writes in a single stream — would build more
+   confidence than "clean once per combination" currently provides.
