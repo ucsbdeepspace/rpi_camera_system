@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
 Live dual-camera demo for the runtime-movable ROI (set_selection) feature.
-Shows both cameras' ROI-mode feeds side by side and lets the user move the
-shared ROI position live, while both cameras are actively streaming --
-exercising the exact mid-stream set_selection path validated in CLAUDE.md
-("runtime-movable ROI" section), not just a before-start move.
+Shows both cameras' ROI-mode feeds side by side and lets the user move each
+camera's ROI position independently, live, while both cameras are actively
+streaming -- exercising the exact mid-stream set_selection path validated in
+CLAUDE.md ("runtime-movable ROI" section), not just a before-start move.
 
-Controls (click a video window to give it keyboard focus first):
-  w   move ROI up   (decrease y_start)
-  s   move ROI down (increase y_start)
-  r   reset to y_start=0
-  q   quit
+Controls (keys apply to the "active" camera, shown highlighted in its
+window's overlay -- switch which one is active with the number keys):
+  1/2   make camera 0/1 the active camera
+  w     move the active camera's ROI up   (decrease y_start)
+  s     move the active camera's ROI down (increase y_start)
+  r     reset the active camera to y_start=0
+  a     reset ALL cameras to y_start=0
+  q     quit
 
 Usage:
   python3 roi_live_demo.py                  # 640x200, step=20 sensor rows
@@ -78,9 +81,13 @@ for name in window_names:
     cv2.namedWindow(name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(name, max(RAW_SIZE[0], 480), max(RAW_SIZE[1], 200))
 
-y_start = 0
-print(f"y_start=0  (range 0-{MAX_Y_START})")
-print("Controls: w = ROI up, s = ROI down, r = reset, q = quit")
+y_starts = {i: 0 for i in indices}
+active = indices[0]
+digit_keys = {ord(str(i + 1)): i for i in indices if i < 9}
+
+print(f"y_start=0 for all cameras (range 0-{MAX_Y_START})")
+print(f"Active camera: {active}")
+print("Controls: 1/2 select camera, w/s move it, r reset it, a reset all, q quit")
 
 try:
     while True:
@@ -89,27 +96,33 @@ try:
             display = np.empty_like(frame, dtype=np.uint8)
             cv2.normalize(frame, display, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
             display = cv2.cvtColor(display, cv2.COLOR_GRAY2BGR)
-            cv2.putText(display, f"y_start={y_start}  (w/s move, r reset, q quit)",
-                        (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1,
+            is_active = (i == active)
+            tag = " [ACTIVE -- w/s/r apply here]" if is_active else "  (press %d to control)" % (i + 1)
+            color = (0, 255, 0) if is_active else (160, 160, 160)
+            cv2.putText(display, f"cam {i}: y_start={y_starts[i]}{tag}",
+                        (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1,
                         cv2.LINE_AA)
             cv2.imshow(window_names[i], display)
 
         key = cv2.waitKey(1) & 0xFF
-        requested = None
         if key == ord('q'):
             break
+        elif key in digit_keys:
+            active = digit_keys[key]
+            print(f"active camera: {active}")
         elif key == ord('w'):
-            requested = y_start - STEP
+            y_starts[active] = set_roi_y_start(active, y_starts[active] - STEP)
+            print(f"cam {active}: y_start={y_starts[active]}")
         elif key == ord('s'):
-            requested = y_start + STEP
+            y_starts[active] = set_roi_y_start(active, y_starts[active] + STEP)
+            print(f"cam {active}: y_start={y_starts[active]}")
         elif key == ord('r'):
-            requested = 0
-
-        if requested is not None:
+            y_starts[active] = set_roi_y_start(active, 0)
+            print(f"cam {active}: y_start={y_starts[active]}")
+        elif key == ord('a'):
             for i in indices:
-                actual = set_roi_y_start(i, requested)
-            y_start = actual  # driver-applied value (post-clamp), same for both cams
-            print(f"y_start={y_start}")
+                y_starts[i] = set_roi_y_start(i, 0)
+            print(f"all cameras reset: {y_starts}")
 
 finally:
     cv2.destroyAllWindows()

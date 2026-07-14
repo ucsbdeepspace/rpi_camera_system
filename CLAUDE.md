@@ -275,12 +275,20 @@ All against camera 0 (`i2c@88000` → `/dev/v4l-subdev5`), mode `640x200`
     camera streams with a way to change the ROI interactively. Built on top
     of `roi_set_selection.py`: opens both cameras in an ROI mode (default
     `640x200`), shows each in its own OpenCV window with the current
-    `y_start` overlaid, and reads keyboard input each frame (`w`/`s` move
-    the *shared* ROI up/down together on both cameras by a configurable
-    step, `r` resets to 0, `q` quits) — every move goes through
-    `set_roi_y_start()` while both cameras are actively streaming, i.e. it
-    continuously exercises the exact mid-stream write path validated in
-    items 5/8/9 above, not just a canned before-start move.
+    `y_start` overlaid — every move goes through `set_roi_y_start()` while
+    both cameras are actively streaming, i.e. it continuously exercises the
+    exact mid-stream write path validated in items 5/8/9 above, not just a
+    canned before-start move.
+
+    **First version moved both cameras' ROI together (shared `y_start`)**;
+    validated as described just below, then **the user asked for
+    independent per-camera control instead**, so it was redesigned:
+    `1`/`2` pick which camera is "active" (highlighted green in its own
+    overlay, e.g. `cam 0: y_start=60 [ACTIVE -- w/s/r apply here]`, vs. gray
+    `cam 1: y_start=40  (press 2 to control)` for the inactive one), `w`/`s`
+    move only the active camera, `r` resets only the active camera, `a`
+    resets all cameras, `q` quits. Each camera keeps its own `y_start` in a
+    dict, independent of the others.
 
     **Actually tested end-to-end on the Pi's live display, not just
     inspected as code.** This session has a real desktop session
@@ -310,6 +318,34 @@ All against camera 0 (`i2c@88000` → `/dev/v4l-subdev5`), mode `640x200`
     variable, each is actually reporting back its own driver-applied
     position and they agree. `q` exited cleanly (exit 0), `tainted` stayed
     `4096`, no dmesg anomaly, both subdevs reset to `y_start=0` after.
+
+    **Independent-control redesign validated the same way (2026-07-14,
+    `python3 roi_live_demo.py 640x200 20`).** Confirmed via direct
+    `v4l2-ctl --get-subdev-selection` reads on both subdevs after each
+    keypress (not just the on-screen overlay), which is the ground truth:
+    with camera 0 active, three `s` presses moved only `/dev/v4l-subdev5`
+    to `top=68` (`y_start=60`) while `/dev/v4l-subdev2` (camera 1) stayed at
+    `top=8` (`y_start=0`) — untouched. Pressed `2` to switch active to
+    camera 1, then `s` twice: `/dev/v4l-subdev2` moved to `top=48`
+    (`y_start=40`) while camera 0 stayed exactly at `y_start=60` — i.e. the
+    two cameras ended up at **genuinely different, independently-held
+    positions** (60 vs. 40), not just independently-driven toward the same
+    value. Switched back to camera 0, moved it further (three more `s`) to
+    `y_start=60`+more while camera 1 stayed at 40. Screenshotted both
+    windows and confirmed the overlay tagging matches reality: the active
+    camera's text renders green with `[ACTIVE -- w/s/r apply here]`, the
+    inactive one gray with `(press N to control)`. `q` exited cleanly (exit
+    0), `tainted` stayed `4096` throughout, no dmesg anomaly, both subdevs
+    reset to `y_start=0` after. One caveat noted during this test, not a
+    bug: a `timeout`-based kill (SIGTERM, as opposed to pressing `q`) does
+    **not** run the script's `finally` cleanup (`cv2.destroyAllWindows()` /
+    `cam.stop()`) — Python's default SIGTERM handling doesn't raise
+    anything catchable the way Ctrl-C/SIGINT does. Checked after one such
+    kill happened by accident (this session's own 90s test timeout expired
+    mid-test): no lingering process, no held `/dev/video*`/`/dev/media*`
+    fds via `lsof`, taint stayed clean — so OS-level process teardown was
+    sufficient in practice, but this means the demo's own cleanup code is
+    *not* what's relied on if it's ever killed by something other than `q`.
 
 ## MODE_640_200_ROI — DONE, committed (`d5eb808`, 2026-07-08)
 
@@ -758,9 +794,10 @@ camera module matching if needed later.
   see the "runtime-movable ROI" section above for a driver-side clamp bug
   this works around.
 - `roi_live_demo.py` — interactive live demo: both camera ROI feeds side by
-  side, `w`/`s` move the shared ROI up/down while streaming, `r` resets,
-  `q` quits. Needs an actual display (`DISPLAY=:0` — this Pi has a real
-  desktop session via `labwc`), not runnable headless. `python3
+  side, independent per-camera control (`1`/`2` picks the active camera,
+  `w`/`s` move only that one while streaming, `r` resets it, `a` resets
+  all, `q` quits). Needs an actual display (`DISPLAY=:0` — this Pi has a
+  real desktop session via `labwc`), not runnable headless. `python3
   roi_live_demo.py [WxH] [step]`, defaults `640x200`, step=20 rows.
 - `led_dual_camera_closed_loop_test_single_process.py`,
   `led_dual_camera_closed_loop_test_mp_buf1.py` — comparison baselines,
