@@ -9,12 +9,17 @@ out to `v4l2-ctl` subdev ioctls -- the same approach used by the one-off
 test scripts that validated this design (pre-stream moves, and moves while
 a capture is already running, on both cameras and both windowed ROI modes).
 
-Only `y_start` (vertical crop position) is adjustable, and only for the two
-windowed-crop ROI modes (MODE_1280_400_ROI, MODE_640_200_ROI) -- both use
-the same real sensor crop window, 1280 wide x 400 rows, before any binning.
-Width, output height, and binning are NOT adjustable here (see CLAUDE.md for
-why: changing them needs a full reconfigure, not a live crop move, and there
-is no hardware-verified register formula for horizontal panning).
+Only `y_start` (vertical crop position) is adjustable, and only for the four
+windowed-crop ROI modes (MODE_1280_400_ROI, MODE_640_200_ROI,
+MODE_1280_200_ROI, MODE_640_100_ROI). The real (pre-bin) sensor crop window
+height differs by mode -- 400 rows for the first two, 200 for the newer
+pair -- so the valid y_start range differs too; this module queries the
+live crop height from the driver on every call rather than hardcoding it,
+so it works for whichever mode is currently configured without needing to
+know about it in advance. Width, output height, and binning are NOT
+adjustable here (see CLAUDE.md for why: changing them needs a full
+reconfigure, not a live crop move, and there is no hardware-verified
+register formula for horizontal panning).
 
 The driver clamps out-of-range requests silently (validated: values past the
 max, or below 0, land on the nearest valid value rather than erroring) --
@@ -34,10 +39,8 @@ import sys
 
 from picamera2 import Picamera2
 
-CROP_WIDTH = 1280
-CROP_HEIGHT = 400  # real sensor crop window for both ROI modes -- see CLAUDE.md
+PIXEL_ARRAY_HEIGHT = 800  # full sensor height every ROI mode crops within
 TOP_BASE = 8  # fixed ISP offset, independent of y_start (same at every stock mode)
-MAX_Y_START = 800 - CROP_HEIGHT  # driver's own valid range is [0, MAX_Y_START]
 
 
 def _subdev_for_camera(cam_index):
@@ -56,28 +59,48 @@ def _subdev_for_camera(cam_index):
     raise ValueError(f"unrecognized camera Id, can't map to subdev: {cam_id}")
 
 
-def _parse_top(v4l2ctl_output):
-    for tok in v4l2ctl_output.split(","):
-        tok = tok.strip()
-        if tok.startswith("Top"):
-            return int(tok.split()[1])
-    raise ValueError(f"couldn't parse 'Top' from v4l2-ctl output: {v4l2ctl_output!r}")
-
-
-def get_roi_y_start(cam_index):
-    """Return the currently active y_start (real sensor rows) for this camera."""
+def _get_crop(cam_index):
+    """Read the subdev's live crop rect (Left/Top/Width/Height), fresh every
+    call. Height is the real, mode-dependent sensor window -- 400 for
+    MODE_1280_400_ROI/MODE_640_200_ROI, 200 for MODE_1280_200_ROI/
+    MODE_640_100_ROI -- so this is what lets the rest of this module avoid
+    hardcoding which mode is active.
+    """
     subdev = _subdev_for_camera(cam_index)
     out = subprocess.run(
         ["v4l2-ctl", "-d", subdev, "--get-subdev-selection=pad=0,stream=0,target=crop"],
         capture_output=True, text=True, check=True,
     ).stdout
-    return _parse_top(out) - TOP_BASE
+    # v4l2-ctl's output has an "ioctl: ..." line before the data line and a
+    # trailing "Flags: " field with no value, both of which contain commas/
+    # tokens that aren't clean "Key value" pairs -- only pick out the four
+    # fields this module actually needs, same defensive approach the
+    # original single-field _parse_top used.
+    crop = {}
+    for tok in out.split(","):
+        tok = tok.strip()
+        for key in ("Left", "Top", "Width", "Height"):
+            if tok.startswith(key + " "):
+                crop[key] = int(tok.split()[1])
+    return crop
+
+
+def get_max_y_start(cam_index):
+    """Valid y_start upper bound for whichever mode is currently configured
+    on this camera -- 400 for the two original ROI modes, 600 for the newer
+    pair (their real crop window is 200 rows, not 400)."""
+    return PIXEL_ARRAY_HEIGHT - _get_crop(cam_index)["Height"]
+
+
+def get_roi_y_start(cam_index):
+    """Return the currently active y_start (real sensor rows) for this camera."""
+    return _get_crop(cam_index)["Top"] - TOP_BASE
 
 
 def set_roi_y_start(cam_index, y_start):
     """Move the ROI to a new y_start. Safe to call before cam.start() or while
     actively streaming (validated clean in both cases on both cameras and
-    both ROI modes -- see CLAUDE.md).
+    all four ROI modes -- see CLAUDE.md).
 
     Returns the y_start the driver actually applied, which may differ from
     the request if it was outside the valid range -- the driver clamps
@@ -89,13 +112,15 @@ def set_roi_y_start(cam_index, y_start):
     negative/over-range values are clamped here in Python before ever
     reaching the driver, rather than relying on its clamp for the low end.
     """
-    y_start = max(0, min(y_start, MAX_Y_START))
+    crop = _get_crop(cam_index)
+    max_y_start = PIXEL_ARRAY_HEIGHT - crop["Height"]
+    y_start = max(0, min(y_start, max_y_start))
     subdev = _subdev_for_camera(cam_index)
     top = TOP_BASE + y_start
     subprocess.run(
         ["v4l2-ctl", "-d", subdev, "--set-subdev-selection",
-         f"pad=0,stream=0,target=crop,top={top},left=8,"
-         f"width={CROP_WIDTH},height={CROP_HEIGHT}"],
+         f"pad=0,stream=0,target=crop,top={top},left={crop['Left']},"
+         f"width={crop['Width']},height={crop['Height']}"],
         capture_output=True, text=True, check=True,
     )
     return get_roi_y_start(cam_index)
@@ -109,4 +134,5 @@ if __name__ == "__main__":
         note = "" if actual == requested else f" (clamped from requested {requested})"
         print(f"camera {index}: y_start={actual}{note}")
     else:
-        print(f"camera {index}: y_start={get_roi_y_start(index)}")
+        print(f"camera {index}: y_start={get_roi_y_start(index)} "
+              f"(max={get_max_y_start(index)})")
