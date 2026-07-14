@@ -291,6 +291,7 @@ static struct ov9282_reg_list common_regs_list = {
 #define MODE_1280_720		1
 #define MODE_640_400		2
 #define MODE_1280_400_ROI	3
+#define MODE_640_200_ROI	4
 
 #define DEFAULT_MODE		MODE_1280_720
 
@@ -418,6 +419,59 @@ static const struct ov9282_reg mode_1280x400_roi_regs[] = {
 	{0x4509, 0x80},
 };
 
+/*
+ * EXPERIMENTAL: combined binning + real vertical window, targeting a higher
+ * capture rate than any stock mode. MODE_1280_400_ROI (above) proved that
+ * shrinking y_end shrinks real readout time, but at full 1280 width it's
+ * still slower overall than the binned 640x400 mode (unbinned rows cost more
+ * per row than binning saves by having fewer of them -- measured 283.6fps
+ * dual-concurrent vs 281.8fps stock, no real gain).
+ *
+ * This mode instead applies that same y_end-shrink trick ON TOP OF the
+ * binned 640x400 mode's register set, rather than the unbinned 720p set --
+ * i.e. keep binning (fast rows) AND read fewer of them (fewer rows). Cloned
+ * verbatim from mode_640x400_regs (so all the binning/timing registers whose
+ * exact semantics aren't understood here stay exactly as they are in the
+ * already-working stock mode) with only two registers changed:
+ *   - 0x3806/0x3807 (y_end): 0x032f (815, full sensor) -> 0x019f (415),
+ *     using the same "target_rows + 15" pattern already validated for
+ *     MODE_1280_400_ROI (400 + 15 = 415) to window the real row range read
+ *     before binning down to roughly the top half of the sensor.
+ *   - 0x380a/0x380b (y_output_size): 0x0190 (400) -> 0x00c8 (200), halved to
+ *     match halving the real row range, assuming the 2:1 vertical binning
+ *     ratio holds proportionally for a shorter window (unverified -- this is
+ *     the part that most needs checking against an actual captured frame).
+ */
+static const struct ov9282_reg mode_640x200_roi_regs[] = {
+	{0x3778, 0x10},
+	{0x3800, 0x00},
+	{0x3801, 0x00},
+	{0x3802, 0x00},
+	{0x3803, 0x00},
+	{0x3804, 0x05},
+	{0x3805, 0x0f},
+	{0x3806, 0x01},
+	{0x3807, 0x9f},
+	{0x3808, 0x02},
+	{0x3809, 0x80},
+	{0x380a, 0x00},
+	{0x380b, 0xc8},
+	{0x3810, 0x00},
+	{0x3811, 0x04},
+	{0x3812, 0x00},
+	{0x3813, 0x04},
+	{0x3814, 0x31},
+	{0x3815, 0x22},
+	{OV9282_REG_TIMING_FORMAT_1, 0x60},
+	{OV9282_REG_TIMING_FORMAT_2, 0x01},
+	{0x4008, 0x02},
+	{0x4009, 0x05},
+	{0x400c, 0x00},
+	{0x400d, 0x03},
+	{0x4507, 0x03},
+	{0x4509, 0x80},
+};
+
 /* Supported sensor mode configurations */
 static const struct ov9282_mode supported_modes[] = {
 	[MODE_1280_800] = {
@@ -509,6 +563,33 @@ static const struct ov9282_mode supported_modes[] = {
 		.reg_list = {
 			.num_of_regs = ARRAY_SIZE(mode_1280x400_roi_regs),
 			.regs = mode_1280x400_roi_regs,
+		},
+	},
+	[MODE_640_200_ROI] = {
+		.width = 640,
+		.height = 200,
+		.hblank_min = { 890, 816 },
+		.vblank = 1022,
+		.vblank_min = 22,
+		.vblank_max = 51540,
+		.link_freq_idx = 0,
+		.crop = {
+			/*
+			 * EXPERIMENTAL: see mode_640x200_roi_regs comment above.
+			 * .height here is the approximate real (pre-binning) row
+			 * window, following the same convention as
+			 * MODE_1280_400_ROI, not the post-binning output height
+			 * (200) -- unverified, meant to be checked against an
+			 * actual captured frame before trusting.
+			 */
+			.left = OV9282_PIXEL_ARRAY_LEFT,
+			.top = OV9282_PIXEL_ARRAY_TOP,
+			.width = 1280,
+			.height = 400
+		},
+		.reg_list = {
+			.num_of_regs = ARRAY_SIZE(mode_640x200_roi_regs),
+			.regs = mode_640x200_roi_regs,
 		},
 	},
 };

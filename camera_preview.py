@@ -83,7 +83,12 @@ print("Streaming -- press 'q' in any window to quit.\n")
 try:
     while True:
         for i, cam in zip(indices, cams):
-            frame = cam.capture_array("raw")
+            # capture_array("raw") returns the buffer as flat uint8 bytes,
+            # but this pipeline always delivers raw frames as 16-bit-per-pixel
+            # words (Picamera2 negotiates "R16" even when "R8" is requested)
+            # -- .view() reinterprets consecutive byte pairs as the real
+            # pixel values instead of interleaved data/padding bytes.
+            frame = cam.capture_array("raw").view(np.uint16)
 
             # Normalize for display only -- raw sensor values often sit in a
             # low range that reads as solid black otherwise. This never

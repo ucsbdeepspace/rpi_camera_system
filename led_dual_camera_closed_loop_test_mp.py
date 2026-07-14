@@ -45,14 +45,23 @@ import numpy as np
 LED_PIN          = 14
 GPIOCHIP         = 4
 
-ROI_CAM0         = (0, 0, 640, 400)
-ROI_CAM1         = (0, 0, 640, 400)
-
-RAW_SIZE         = (640, 400)
 RAW_FORMAT       = "R8"
 FORCE_FRAME_DURATION_US = int(sys.argv[1]) if len(sys.argv) > 1 else 6000
 EXPOSURE_US      = 1500
 ANALOGUE_GAIN    = 4.0
+
+# Optional 2nd CLI arg selects raw size (e.g. "640x200" for MODE_640_200_ROI).
+# Defaults to the original stock 640x400. ROI is always full-frame for
+# whatever size is selected -- a smaller ROI previously caused a silent
+# per-camera detection failure (see CLAUDE.md settled-config notes), full
+# frame is the validated-working choice regardless of raw size.
+if len(sys.argv) > 2:
+    _w, _h = sys.argv[2].lower().split("x")
+    RAW_SIZE = (int(_w), int(_h))
+else:
+    RAW_SIZE = (640, 400)
+ROI_CAM0 = (0, 0, RAW_SIZE[0], RAW_SIZE[1])
+ROI_CAM1 = (0, 0, RAW_SIZE[0], RAW_SIZE[1])
 
 TEST_DURATION_S  = 5.0
 CALIB_TIMEOUT_S  = 3.0
@@ -131,7 +140,7 @@ def worker(index, roi, led_on_event, led_off_event,
 
 
 def main():
-    print(f"FORCE_FRAME_DURATION_US={FORCE_FRAME_DURATION_US}")
+    print(f"FORCE_FRAME_DURATION_US={FORCE_FRAME_DURATION_US}  RAW_SIZE={RAW_SIZE}")
     gpio = lgpio.gpiochip_open(GPIOCHIP)
     lgpio.gpio_claim_output(gpio, LED_PIN, 0)
 

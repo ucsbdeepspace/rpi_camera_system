@@ -9,18 +9,210 @@ don't let it drift from what's actually true. Full prior conversation history
 (pre-2026-07-08) is archived in `docs/archive/handoff_conversation_2026-07-08.txt`
 for context, but treat *this* file as authoritative, not the archive.
 
-## ⚠ ACTION NEEDED: reboot before touching cameras (as of 2026-07-08 15:50)
+## ⚠ IN PROGRESS: MODE_640_200_ROI loaded and partially validated (2026-07-08 16:55)
 
-A kernel BUG/Oops was just triggered while testing a patched camera driver
-(see "Sensor-level windowing — MODE_1280_400_ROI" section below). Kernel is
-currently tainted (`D`=DIE, `W`=WARN, `O`=OOT_MODULE). **Reboot the Pi before
-running any camera test or touching kernel modules again** — do not trust
-current driver/media-controller state. The patched module was never
-`depmod`-installed, so a plain reboot reverts to the stock driver automatically;
-no manual cleanup is needed first. After rebooting, re-run the Stage 0 baseline
-checks (see that section) to confirm clean state before deciding next steps —
-do not immediately retry the module swap; the root-cause hypothesis below needs
-investigating first.
+Added a second experimental mode, `MODE_640_200_ROI`, to
+`kernel_patch/ov9282/ov9282.c` — combines the stock 640x400 mode's binning
+registers (fast per-row readout) with a shrunk vertical window (fewer rows),
+targeting an actual speed win that `MODE_1280_400_ROI` alone didn't deliver
+(see "Throughput result — NEGATIVE" below). Built, vermagic-matched,
+depmod-installed to `/lib/modules/.../updates/ov9282.ko`, reboot triggered
+to load it.
+
+**Reboot succeeded, first two checks pass:**
+1. **Clean state — confirmed.** `tainted` = `4096` (only `O`=OOT_MODULE, no
+   `D`/`W`), no BUG/Oops in dmesg. `rpicam-hello --list-cameras` now shows a
+   `640x200 [588.93 fps - (0, 0)/1280x400 crop]` R8 mode on both cameras
+   alongside the original four.
+2. **Frame content — looks real, not garbage.** Wrote a headless capture
+   script (one-off, not committed — GUI preview scripts need a live display
+   to eyeball; this saves PNGs + prints min/max/mean instead) modeled on
+   `camera_preview_roi.py` but for `RAW_SIZE=(640,200)`. Both cameras
+   negotiated the correct `(640, 200)` raw config, captured arrays of the
+   right shape, non-degenerate pixel ranges (cam0: min=4096 max=8960
+   mean=6018; cam1: min=3840 max=16640 mean=6922 — note these are 16-bit
+   values per the `R16`-delivery quirk documented elsewhere in this file),
+   and visually showed coherent gradients/objects with normal sensor noise
+   texture — no tearing, banding, or tiling. This is reasonable (not
+   conclusive) evidence the guessed `0x380a/0x380b` y_output_size halving
+   (see comment above `mode_640x200_roi_regs` in `ov9282.c`) didn't break
+   the image, though a rigorous check (e.g. a known test pattern) hasn't
+   been done.
+3. **Throughput — apples-to-apples point measured, real ceiling not yet
+   probed.** Dual-concurrent at 3400µs (same duration as the existing
+   281.8fps/283.6fps comparison): **282.14fps**, essentially identical to
+   both prior modes. This is expected and *not yet informative* — 3400µs is
+   still well above this mode's rated floor (588.93fps mode ≈ 1698µs native
+   period), so all three modes are duration-limited, not sensor-limited, at
+   this setting. The actual test of whether this mode beats ~282fps requires
+   stepping the requested frame duration down toward ~1700µs.
+
+4. **Throughput floor found (2026-07-08 ~17:00) — real speed win confirmed.**
+   Built `camera_throughput_sweep_subprocess.py` (mirrors
+   `led_dual_camera_sweep_subprocess.py`'s fresh-subprocess-per-value
+   pattern: each duration runs in its own OS process via
+   `subprocess.run(timeout=...)`, so a hang can be killed from outside
+   instead of freezing the whole interpreter with no catchable exception).
+   Also gave `camera_throughput_test.py` an optional 3rd CLI arg for raw
+   size (defaults to 640x400, unchanged behavior otherwise). Swept
+   3400µs → 1750µs on `RAW_SIZE=640x200`, dual-concurrent:
+
+   | duration | achieved fps (cam0/cam1) |
+   |---|---|
+   | 3400µs | 282.4 / 282.2 |
+   | 3000µs | 319.4 / 319.8 |
+   | 2400µs | 396.0 / 395.0 |
+   | 2000µs | 476.3 / 475.5 |
+   | 1900µs | 500.8 / 501.2 |
+   | **1800µs** | **526.8 / 526.7 — highest clean result** |
+   | 1750µs | **hung** — process timed out (20s) and was killed |
+
+   **This is a genuine ~1.9x throughput win over the ~282fps ceiling that
+   held across stock 640x400 and `MODE_1280_400_ROI`.** 1800µs is the
+   current known-good floor for this mode; full CSV at
+   `camera_throughput_sweep_640x200.csv`.
+
+   **What happened at the 1750µs hang, and recovery (important for next
+   time):** `subprocess.run(timeout=20)` correctly killed the *top-level*
+   `camera_throughput_test.py` process, but that script itself forks two
+   `multiprocessing` worker processes (one per camera) — killing the
+   parent does not kill already-forked children, so the two workers were
+   orphaned and kept running, still holding all `/dev/video*` fds (found
+   via `lsof`, reparented to PID 1). Checked their state before doing
+   anything: `ps -o stat,wchan` showed `Sl` (interruptible sleep) blocked
+   on `futex_do_wait` — a userspace lock wait (picamera2 waiting on a
+   completion queue a too-fast request never satisfied), **not** `D`
+   (uninterruptible kernel-driver block). That distinction mattered: `S`
+   state means a plain `kill -9 <pid>` on the two orphans is expected to
+   work cleanly, vs `D` state which usually means only a reboot recovers
+   it. Killed both orphans directly, `lsof` confirmed devices released,
+   then ran a known-good sanity check (`camera_throughput_test.py 01
+   3400`, stock 640x400) which came back at 280.66fps — matching the
+   established baseline exactly. **No reboot was needed this time** —
+   kernel taint stayed `4096` (no `D`/`W`) and dmesg showed no BUG/Oops
+   throughout, consistent with this being a userspace-level hang, not the
+   kernel-level `rmmod`/`insmod` crash documented elsewhere in this file.
+   `camera_throughput_sweep_subprocess.py`'s own `RUN_TIMEOUT_S=20` does
+   *not* currently kill orphaned children automatically — if re-running
+   deeper into a hang-prone range, check for and clean up orphaned
+   `camera_throughput_test.py` workers the same way after any timeout row.
+
+5. **Closed-loop LED round-trip test run at these settings (2026-07-08
+   ~17:10) — result is a major win, both on rate and on latency.**
+   Added an optional 2nd CLI arg to `led_dual_camera_closed_loop_test_mp.py`
+   for raw size (`WxH`, defaults to stock 640x400 — fully backward
+   compatible); ROI is now always derived as full-frame for whatever size
+   is selected (settled-config already established full-frame ROI as the
+   correct choice, so this generalizes cleanly rather than hardcoding a
+   second ROI constant). Ran twice at `1800 640x200`:
+
+   | | run 1 | run 2 |
+   |---|---|---|
+   | confirmed transitions (5s) | 1034 (0 timeouts) | 1040 (0 timeouts) |
+   | achieved capture fps | 530.25 / 530.25 | 528.78 / 529.38 |
+   | mean latency cam0/cam1 | 4.124 / 4.422 ms | 4.405 / 4.430 ms |
+   | max latency cam0/cam1 | 7.579 / 8.252 ms | 7.850 / 8.165 ms |
+   | mean skew | −0.298 ms | −0.025 ms |
+   | max \|skew\| | 2.673 ms | 4.118 ms |
+   | **effective closed-loop freq** | **206.64 Hz** | **207.87 Hz** |
+
+   Consistent across both runs, zero timeouts. **Closed-loop confirmed
+   rate went from ~90-122Hz (previous stock/1280x400-ROI ceiling) to
+   ~207Hz — about a 1.8-2.3x win**, matching the ~1.9x pure-throughput
+   gain the sweep already found. **Mean per-camera latency (4.1-4.4ms) is
+   now comfortably under Phil's 10ms loop-latency target** for the first
+   time — previous best was ~7ms mean with a 10-15ms tail; now the *max*
+   observed latency (7.6-8.3ms) is close to where the old *mean* used to
+   sit. This is the strongest result so far toward the original 10ms/
+   10-20Hz-disturbance-band goal at the top of this file.
+
+   **Not yet done**: only 2 runs so far (both clean, no timeouts) — more
+   repeats would build confidence this isn't a lucky pair, especially
+   since 1800µs sits just above the confirmed 1750µs hang point found in
+   the pure-throughput sweep. Also haven't stress-tested this duration for
+   longer than 5s, and the true floor between 1750-1800µs hasn't been
+   narrowed further. If either matters before presenting results to Phil,
+   worth doing.
+
+## Status (as of 2026-07-08 16:19)
+
+**The depmod-install + reboot strategy worked.** The patched `ov9282.ko` is
+now installed at `/lib/modules/6.18.34+rpt-rpi-2712/updates/ov9282.ko` and
+loads cleanly at boot via the normal `modprobe`/initramfs path — no live
+`rmmod`/`insmod` cycling involved, so the reload bug never gets triggered.
+
+Confirmed clean post-reboot: `tainted` = `4096` (only `O`=OOT_MODULE, no
+`D`/`W`), no BUG/Oops in dmesg, both cameras enumerate normally. **And the new
+mode is live**: `rpicam-hello --list-cameras` now lists a
+`1280x400 [296.47 fps - (0, 0)/1280x400 crop]` R8 mode on *both* cameras
+(`i2c@88000` and `i2c@80000`), alongside the original 640x400/1280x720/1280x800
+modes — `MODE_1280_400_ROI` is real and selectable.
+
+Frame content validated visually (2026-07-08 ~16:30, see below) and throughput
+benchmarked against stock: **this mode does NOT deliver a higher capture
+rate** — see "Throughput result — NEGATIVE for the speed goal" below. It's a
+real, correctly-oriented crop (confirmed against actual captured frames), just
+not a faster one. This module is a boot-time install, not a loose `insmod` —
+a plain reboot will *not* revert it; removing it requires deleting
+`/lib/modules/.../updates/ov9282.ko` and running `depmod -a` before the next
+reboot.
+
+### Frame content validated (2026-07-08 ~16:30)
+
+Wrote `camera_preview_roi.py` (live OpenCV viewer, modeled on
+`camera_preview.py`) to eyeball the new mode. Both scripts initially appeared
+to show solid black / wrong aspect ratio — turned out to be a viewer bug, not
+a driver problem: `capture_array("raw")` returns the buffer as flat uint8
+bytes, but this pipeline always delivers raw frames as 16-bit-per-pixel words
+(Picamera2 negotiates format `"R16"` even when `"R8"` is requested) — treating
+it as flat uint8 interleaves each real pixel byte with a zero padding byte,
+reading as near-black at double the apparent width. Fix: `.view(np.uint16)`
+on the captured array. Applied to `camera_preview.py` and
+`camera_preview_roi.py`.
+
+**This same bug exists in ~15 other scripts in the repo** (everything using
+raw capture except the two preview scripts now) — including
+`led_dual_camera_closed_loop_test_mp.py` and `led_centroid_test_raw.py`.
+Per-project-owner decision (2026-07-08): **not being fixed repo-wide right
+now** — out of scope unless it turns out to affect the ROI/higher-rate goal
+(it doesn't: fps/timing scripts only count frames or threshold on relative
+brightness, both unaffected by the byte-interleaving). Known exception:
+`led_centroid_test_raw.py`'s X/Y centroid math **is** affected (X-axis
+indexing operates on the byte-doubled array) — any past centroid position
+numbers from that script should be treated as unvalidated until it's fixed.
+
+Once fixed up, both cameras showed a real, correctly-exposed image in the new
+mode — confirms the copied-verbatim registers aren't producing garbage. Also
+visually confirmed the crop is anchored at the top of the sensor (not
+centered): a centered object in the stock (binned, full-height) view appears
+shifted toward the bottom edge of the ROI (top-400-rows-only) view. Expected
+given `y_start=0` in the patch, not a defect.
+
+### Throughput result — NEGATIVE for the speed goal (2026-07-08 ~16:35)
+
+Goal was capturing at a **higher rate** via sensor-level ROI. Measured dual-
+camera concurrent achieved fps:
+
+- Stock 640x400 (binned, known-stable floor, 3400µs): **281.8 fps**
+- New 1280x400 ROI (native rated period, 3373µs): **283.6 fps**
+
+Essentially no difference — matches the rated max fps too (309.79 vs 296.47,
+i.e. the new mode's own ceiling is *lower* than the stock mode's). **Root
+cause: the stock 640x400 mode bins in both dimensions** (faster-to-digitize
+rows *and* fewer of them), while this patch only crops vertically at full
+1280-pixel width — the extra per-row time from staying unbinned eats all the
+time saved by reading fewer rows. So this specific ROI variant trades field-
+of-view width for no speed gain.
+
+**Real next step toward higher rate**: a mode combining stock horizontal
+binning (`0x3814`/`0x3815`) with a *much* shorter vertical window than 400
+(e.g. 640x200 or 640x150), applying the same `y_end = height + 15` pattern on
+top of the binned register set instead of the full-width set. That's where an
+actual speed win over the current ~282fps ceiling would come from — neither
+existing mode combines both levers. Next concrete steps: (1) add
+`MODE_640_200_ROI` (or similar) to the patch, (2) depmod-install + reboot
+(same safe process as this round), (3) benchmark and visually validate the
+same way as today.
 
 ## Settled configuration (validated, don't re-derive from scratch)
 
@@ -89,11 +281,13 @@ level.** See the next section — this was later found to be a driver-policy
 limitation, not a hardware one; the sensor itself supports a real windowed
 crop, the stock driver just never exposes it via a mode variant.
 
-## Sensor-level windowing — MODE_1280_400_ROI, out-of-tree driver patch (2026-07-08, IN PROGRESS / BLOCKED)
+## Sensor-level windowing — MODE_1280_400_ROI, out-of-tree driver patch (2026-07-08, LOADED / UNVALIDATED)
 
-**Status: patch written and committed, module-load attempt crashed the
-kernel. Root cause not yet confirmed to be patch-specific. See the reboot
-banner at the top of this file before doing anything with the cameras.**
+**Status: the depmod-installed patched module is loaded and stable (see
+Status section at top of file). Both cameras present a `1280x400 [296.47
+fps]` R8 mode. Not yet validated: an actual captured frame in this mode
+hasn't been inspected, so the registers copied verbatim from the 1280x720
+mode (see below) are still unverified.**
 
 ### Background
 
@@ -157,7 +351,7 @@ later, separate WARNING also appeared in the idle loop
 (`ct_kernel_exit.constprop.0`, `PID 0 Comm swapper/2`), suggesting broader
 instability after the BUG, not just a contained failure in the media subsystem.
 
-### Root-cause hypothesis — likely NOT specific to the patch content
+### Root cause — CONFIRMED not specific to the patch content (2026-07-08 16:04)
 
 **The entire crashing call stack is generic/stock code** — `ov9282_probe()`,
 `v4l2_async_register_subdev_sensor()`, `cfe_async_complete()`,
@@ -165,42 +359,53 @@ instability after the BUG, not just a contained failure in the media subsystem.
 touches the new mode-table entry added by this patch. The `media_device`
 object being registered into is owned by `rp1_cfe_downstream` (the CSI/CFE
 bridge driver), which stays loaded across the `ov9282` `rmmod`/`insmod` cycle.
-**Best current guess: `rmmod` of the sensor driver does not cleanly tear down
-the entity it registered into the bridge driver's shared `media_device` at
-boot, so re-probing on `insmod` collides with a stale entity registration.**
-If true, this would be a pre-existing fragility in `rmmod`/`insmod`-cycling
-*this driver on this kernel*, unrelated to whether the loaded module is stock
-or patched — not confirmed yet, but consistent with everything in the trace.
 
-**This needs to be tested before re-attempting the swap**: does `rmmod` +
-`insmod` of the *unmodified stock* `ov9282.ko.xz` (after a clean reboot)
-trigger the same `mc-device.c:619` warning / `mc-entity.c:146` BUG? If yes,
-the module-swap approach itself needs a different strategy (candidates: (a)
-check whether `v4l2_async_unregister_subdev`/`__video_unregister_device` is
-actually being called on `rmmod` — may be a real kernel/driver bug in this
-version; (b) skip live module swapping entirely and instead `depmod`-install
-+ reboot into the patched module for a test session, then reboot back to
-stock afterward — trades convenience for avoiding the reload path entirely).
-If the stock module reload is clean and only the patched one crashes, the
-patch content itself needs re-examination despite the trace not touching it
-directly (e.g., possible ABI-level struct-layout mismatch between the
-headers-based out-of-tree build and however the distro's stock module was
-actually built, even with matching vermagic).
+**Diagnostic test performed**: after a reboot to confirm clean stock state
+(taint=0, `ov9282` loaded normally, both cameras detected via `rpicam-hello
+--list-cameras`), stopped `wireplumber` (had to stop the systemd *service*,
+not just `pipewire`/`pipewire-pulse` — those alone don't release the
+`/dev/media*`/`/dev/video*` fds), confirmed via `lsof` nothing held the camera
+devices, then:
+```
+sudo rmmod ov9282                                                          # succeeded cleanly, exit 0
+sudo insmod /lib/modules/$(uname -r)/kernel/drivers/media/i2c/ov9282.ko.xz  # the UNMODIFIED stock module
+```
+**This reproduced the exact same crash** — `insmod` segfaulted (exit 139),
+dmesg showed `rp1-cfe: Rejecting subdev ov9281 11-0060 (Already set!!)`,
+repeated `kobject tried to init an initialized object` + `WARNING ... at
+drivers/media/mc/mc-device.c:619 media_device_register_entity` (one pair per
+video node registered, ~8 times), finally escalating to the identical
+`kernel BUG at drivers/media/mc/mc-entity.c:146!` in `media_gobj_create`
+(called from `cfe_async_complete`), and taint progressed to `D W` again.
+
+**Conclusion: this is a pre-existing bug in `rmmod`/`insmod`-cycling the
+`ov9282` driver on this kernel/bridge-driver combination, 100% independent of
+whether the loaded module is stock or patched.** `rmmod` does not cleanly
+tear down the entities `ov9282` registered into `rp1_cfe_downstream`'s shared
+`media_device` (which stays resident across the cycle), so `insmod`'s
+re-probe collides with stale registrations and crashes. The patch content
+itself is not implicated and does not need re-examination on this basis.
 
 ### Next actions for this thread
 
-1. Reboot (see banner at top of file).
-2. Re-run Stage 0 baseline checks (`lsmod`, `dmesg`, `rpicam-hello
-   --list-cameras`, no camera processes running) to confirm clean stock state.
-3. **Diagnostic test before re-attempting the patched module**: `rmmod
-   ov9282` then `sudo insmod /lib/modules/$(uname -r)/kernel/drivers/media/i2c/ov9282.ko.xz`
-   (the untouched stock module) — does this alone reproduce the
-   `mc-device.c:619`/`mc-entity.c:146` crash? This isolates "reload mechanism
-   is fragile" from "the patch is broken."
-4. Based on that result, pick a strategy (see hypothesis section above) and
-   retry — full staged plan (software-only verification before any streaming,
-   conservative frame durations, single-camera-first, etc.) is preserved and
-   should still be followed once a load strategy that doesn't crash is found.
+1. ~~Reboot~~ / ~~depmod-install the patched module~~ — **done, confirmed
+   working** (see Status section at top of file).
+2. Capture a frame in the new `1280x400` mode and visually/numerically sanity
+   check it (look for tearing, garbage rows, wrong offset — anything that
+   would indicate the copied-verbatim registers, e.g. `TIMING_FORMAT_1/2`,
+   `0x4008/0x4009/0x400c/0x400d`, `0x4507/0x4509`, are wrong for this crop
+   height).
+3. If the frame looks correct, benchmark it: run the throughput/closed-loop
+   scripts against the new mode the same way `3400µs` was characterized for
+   the stock 640x400 mode, and compare.
+4. Decide whether to keep the patched module installed for further testing or
+   revert to stock — remember reverting now requires actively deleting
+   `/lib/modules/.../updates/ov9282.ko` + `depmod -a` (not just a reboot),
+   since this is a boot-time install, not a loose `insmod`.
+5. Root-causing *why* `rmmod` doesn't clean up the `media_device` entity is a
+   deeper kernel/driver investigation, not necessary to unblock this project;
+   worth a note upstream to `raspberrypi/linux` at some point but out of scope
+   here.
 
 ## Hardware status
 
@@ -264,15 +469,19 @@ exploration needs one-value-at-a-time testing in fresh processes, watching the
 terminal, ready to kill/reboot. Camera driver state is uncertain after any such
 hang — reboot before trusting subsequent runs.
 
-## Next steps (as of 2026-07-08)
+## Next steps (as of 2026-07-08 16:35)
 
-1. **Reboot the Pi**, then follow "Next actions for this thread" under the
-   MODE_1280_400_ROI section above — diagnose whether stock-module
-   rmmod/insmod reload alone crashes (isolates the mechanism from the patch)
-   before retrying anything.
+1. **Design and test a combined mode** (e.g. `MODE_640_200_ROI`): stock
+   horizontal binning + a real vertical window well under 400 rows — see
+   "Throughput result — NEGATIVE for the speed goal" above. This is the
+   actual next lever for higher capture rate; `MODE_1280_400_ROI` alone is
+   validated-working but does not beat current fps.
 2. Stress-test `i2c@80000` reconnection: run
    `led_dual_camera_closed_loop_test_mp.py 3400` several times, watch for
-   intermittent failures. (Blocked until the kernel is back in a clean,
-   rebooted state.)
+   intermittent failures. (Unblocked — kernel is in a clean, rebooted state
+   with the patched module loaded.)
 3. Get Phil's answer on discrete-step vs. continuous tracking (determines
-   whether ~120Hz or ~280fps is the real ceiling to design around).
+   whether ~120Hz or ~280fps is the real ceiling to design around) — matters
+   even more now that a straightforward vertical-only crop hasn't moved the
+   ceiling; worth confirming a higher rate is actually the right thing to
+   chase before investing in another driver-patch/reboot cycle.

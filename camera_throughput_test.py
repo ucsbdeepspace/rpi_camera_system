@@ -13,10 +13,11 @@ that's direct evidence of a shared bandwidth/pipeline ceiling -- not an
 artifact of the "wait for both" closed-loop test's order statistics.
 
 Usage:
-  python3 camera_throughput_test.py 0          # solo, camera 0
-  python3 camera_throughput_test.py 1          # solo, camera 1
-  python3 camera_throughput_test.py 01         # both, concurrently
-  python3 camera_throughput_test.py 01 4000    # both, at 4000us frame duration
+  python3 camera_throughput_test.py 0                  # solo, camera 0
+  python3 camera_throughput_test.py 1                  # solo, camera 1
+  python3 camera_throughput_test.py 01                  # both, concurrently
+  python3 camera_throughput_test.py 01 4000              # both, at 4000us frame duration
+  python3 camera_throughput_test.py 01 2000 640x200     # both, ROI mode, 2000us
 
 Install:  pip install numpy
           (picamera2 is pre-installed on RPi OS Bookworm)
@@ -26,7 +27,6 @@ import multiprocessing as mp
 import sys
 import time
 
-RAW_SIZE = (640, 400)
 RAW_FORMAT = "R8"
 EXPOSURE_US = 1500
 ANALOGUE_GAIN = 4.0
@@ -34,6 +34,11 @@ TEST_DURATION_S = 5.0
 
 which = sys.argv[1] if len(sys.argv) > 1 else "01"
 duration_us = int(sys.argv[2]) if len(sys.argv) > 2 else 4000
+if len(sys.argv) > 3:
+    w, h = sys.argv[3].lower().split("x")
+    RAW_SIZE = (int(w), int(h))
+else:
+    RAW_SIZE = (640, 400)
 indices = [int(c) for c in which]
 
 
@@ -75,7 +80,7 @@ def worker(index, duration_us, result_queue):
 
 def main():
     label = "SOLO" if len(indices) == 1 else "DUAL (concurrent)"
-    print(f"{label} throughput test -- camera(s) {indices}, "
+    print(f"{label} throughput test -- camera(s) {indices}, RAW_SIZE={RAW_SIZE}, "
           f"requested frame duration {duration_us}us, {TEST_DURATION_S}s each\n")
 
     ctx = mp.get_context("fork")
