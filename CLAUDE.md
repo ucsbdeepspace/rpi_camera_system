@@ -73,18 +73,44 @@ args (`[WxH] [durations_csv] [output_csv]`) so the same sweep script works
 for any mode — defaults reproduce the original `MODE_640_200_ROI`-only
 behavior exactly, fully backward compatible.
 
-**Not yet done**:
-1. **Commit `ov9282.c`/`ov9282.ko`** — validated but still sitting as
-   uncommitted working-tree changes.
-2. Closed-loop LED round-trip test at these settings (the actual
-   throughput→closed-loop-Hz translation, same as was done for
-   `MODE_640_200_ROI` at 1800µs) hasn't been run for either new mode yet —
-   pure capture throughput is validated, the end-to-end control-relevant
-   number isn't.
-3. Mid-stream `set_selection` write validation (the item-5/8 pattern from
+~~1. Commit `ov9282.c`/`ov9282.ko`~~ — **done**, commit `3343434`.
+
+**Closed-loop LED round-trip test — DONE, both new modes, both a major win
+(2026-07-14).** Same `led_dual_camera_closed_loop_test_mp.py` pattern used
+for `MODE_640_200_ROI` (2nd CLI arg selects raw size, ROI always
+full-frame). Two runs each, at each mode's validated clean floor:
+
+| | `1280x200` @ 1775µs, run 1 | run 2 | `640x100` @ 1050µs, run 1 | run 2 |
+|---|---|---|---|---|
+| confirmed transitions (5s) | 1172 (0 timeouts) | 1136 (0 timeouts) | 1194 (0 timeouts) | 1160 (0 timeouts) |
+| achieved capture fps | 496.31 / 495.71 | 491.84 / 492.64 | 860.59 / 860.79 | 858.32 / 861.92 |
+| mean latency cam0/cam1 | 3.381 / 3.297 ms | 3.392 / 3.289 ms | 3.501 / 3.540 ms | 3.724 / 3.645 ms |
+| max latency cam0/cam1 | 29.568 / 9.179 ms | 27.332 / 13.583 ms | 12.697 / 7.705 ms | 15.593 / 21.900 ms |
+| max \|skew\| | 25.386 ms | 23.683 ms | 8.693 ms | 17.828 ms |
+| **effective closed-loop freq** | **234.38 Hz** | **227.18 Hz** | **238.79 Hz** | **232.06 Hz** |
+
+**`MODE_640_100_ROI` is now the best closed-loop result in the project**:
+~232-239Hz effective toggle rate (vs. the prior best ~207Hz at
+`MODE_640_200_ROI`/1800µs), mean per-camera latency 3.5-3.7ms (comfortably
+under Phil's 10ms target, same as the prior best), and *tighter* tails than
+`1280x200` (max latency 7.7-21.9ms vs. 9.2-29.6ms) despite running at a much
+higher fps — consistent with it being the mode with the most margin below
+its own hang point (1050µs floor vs. a 1000µs hang, a comfortable 5% gap)
+whereas `1280x200`'s floor was chosen from a plateau, not a hang boundary,
+so it isn't actually "close to the edge" in the same sense.
+`MODE_1280_200_ROI`'s occasional latency/skew outliers (e.g. the 29.568ms
+max in run 1) are still well within the *closed-loop* success criterion (0
+timeouts across all 4 runs) — flagged as worth another look before
+presenting to Phil, not as a failure. `tainted` stayed `4096` throughout all
+4 runs, no dmesg BUG/Oops. Calibration `POOR SEPARATION` appeared once
+(cam0, `1280x200` run 2) — the same ambient-light calibration-noise wrinkle
+already documented in "Hardware status" below, not a new finding.
+
+**Still not yet done**:
+1. Mid-stream `set_selection` write validation (the item-5/8 pattern from
    the runtime-ROI section below) hasn't been repeated on these two new
    modes specifically — only the original two ROI modes were covered there.
-4. `camera_preview_roi.py`/`roi_live_demo.py` haven't been driven against
+2. `camera_preview_roi.py`/`roi_live_demo.py` haven't been driven against
    these sizes on the live display yet (the CLI already accepts arbitrary
    `WxH` so this should just work, but hasn't been exercised).
 
