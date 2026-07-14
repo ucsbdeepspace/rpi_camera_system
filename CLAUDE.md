@@ -299,6 +299,18 @@ All against camera 0 (`i2c@88000` → `/dev/v4l-subdev5`), mode `640x200`
     timeout-kill). `tainted` stayed `4096` throughout, no dmesg BUG/Oops.
     Both subdevs confirmed back at `y_start=0` after the run.
 
+    **Repeated the same live test on `MODE_1280_400_ROI` (2026-07-14,
+    `python3 roi_live_demo.py 1280x400 40`).** Both windows correctly
+    titled `Camera N -- ROI 1280x400` (confirms the `WxH` CLI arg actually
+    changes the negotiated mode, not just the label). Three `s` presses
+    (step=40) moved the overlay `0`→`40`→`80`→`120` on camera 0; brought
+    camera 1's window to the front separately and confirmed it independently
+    read the same `y_start=120` and showed correspondingly shifted content
+    — the two cameras' windows aren't just both displaying the same
+    variable, each is actually reporting back its own driver-applied
+    position and they agree. `q` exited cleanly (exit 0), `tainted` stayed
+    `4096`, no dmesg anomaly, both subdevs reset to `y_start=0` after.
+
 ## MODE_640_200_ROI — DONE, committed (`d5eb808`, 2026-07-08)
 
 Superseded by the in-progress section above as the active thread, but the
