@@ -182,6 +182,11 @@ struct ov9282_mode {
  * @cur_mode: Pointer to current selected sensor mode
  * @code: Mbus code currently selected
  * @mutex: Mutex for serializing sensor controls
+ * @roi_y_start: Runtime-adjustable vertical ROI window offset (real,
+ *		 pre-binning sensor rows). Only meaningful for the two
+ *		 windowed-crop ROI modes (MODE_1280_400_ROI,
+ *		 MODE_640_200_ROI); reset to 0 whenever cur_mode changes.
+ *		 See ov9282_set_selection() / ov9282_apply_roi_y_start().
  */
 struct ov9282 {
 	struct device *dev;
@@ -205,6 +210,7 @@ struct ov9282 {
 	u32 code;
 	struct mutex mutex;
 	int trigger_mode;
+	u32 roi_y_start;
 };
 
 static const s64 link_freq[] = {
@@ -1028,6 +1034,9 @@ static int ov9282_set_pad_format(struct v4l2_subdev *sd,
 		if (!ret) {
 			ov9282->cur_mode = mode;
 			ov9282->code = code;
+			/* fresh format selection always starts at the mode's
+			 * default (top-anchored) window */
+			ov9282->roi_y_start = 0;
 		}
 	}
 
@@ -1082,6 +1091,12 @@ static int ov9282_get_selection(struct v4l2_subdev *sd,
 		mutex_lock(&ov9282->mutex);
 		sel->r = *__ov9282_get_pad_crop(ov9282, sd_state, sel->pad,
 						sel->which);
+		/* cur_mode->crop is a compile-time constant (always
+		 * top-anchored) -- report the live window position for the
+		 * active format instead, since that's what's actually
+		 * programmed into the sensor right now. */
+		if (sel->which == V4L2_SUBDEV_FORMAT_ACTIVE)
+			sel->r.top = OV9282_PIXEL_ARRAY_TOP + ov9282->roi_y_start;
 		mutex_unlock(&ov9282->mutex);
 
 		return 0;
@@ -1106,6 +1121,106 @@ static int ov9282_get_selection(struct v4l2_subdev *sd,
 	}
 
 	return -EINVAL;
+}
+
+/**
+ * ov9282_apply_roi_y_start() - Push the current roi_y_start to the sensor
+ * @ov9282: pointer to ov9282 device
+ *
+ * Writes only the two registers that encode vertical window position
+ * (0x3802/0x3803 y_start, 0x3806/0x3807 y_end), leaving every other
+ * mode register (binning, output size, ISP offsets, timing) exactly as
+ * ov9282_start_streaming() already wrote them for cur_mode. Reuses the
+ * empirically-derived y_end = y_start + height + 15 relationship found
+ * comparing the stock 800/720-row modes (see mode_1280x400_roi_regs
+ * comment) -- previously only ever exercised at y_start=0, so a nonzero
+ * y_start here is a new, hardware-unverified extrapolation of that
+ * pattern until checked against a captured frame.
+ *
+ * Must be called with ov9282->mutex held and the sensor powered on.
+ *
+ * Return: 0 if successful, error code otherwise.
+ */
+static int ov9282_apply_roi_y_start(struct ov9282 *ov9282)
+{
+	u32 y_start = ov9282->roi_y_start;
+	u32 y_end = y_start + ov9282->cur_mode->crop.height + 15;
+	int ret;
+
+	ret = ov9282_write_reg(ov9282, 0x3802, 2, y_start);
+	if (ret)
+		return ret;
+
+	return ov9282_write_reg(ov9282, 0x3806, 2, y_end);
+}
+
+/**
+ * ov9282_set_selection() - Set subdevice pad crop (runtime ROI position)
+ * @sd: pointer to ov9282 V4L2 sub-device structure
+ * @sd_state: V4L2 sub-device configuration
+ * @sel: V4L2 subdevice selection to be applied
+ *
+ * Only the vertical window *position* is adjustable, and only for the two
+ * windowed-crop ROI modes -- width, output height, and binning stay fixed
+ * at each mode's already-validated values (changing those would change the
+ * negotiated buffer geometry, which needs a full stream reconfigure, not a
+ * live crop move). Horizontal windowing has no stock-derived register
+ * pattern to extrapolate from and isn't supported here.
+ *
+ * For every other mode this silently reports back the fixed default crop
+ * rather than erroring, matching how ov9282_get_selection() already treats
+ * modes with no adjustable window.
+ *
+ * Return: 0 if successful, error code otherwise.
+ */
+static int ov9282_set_selection(struct v4l2_subdev *sd,
+				struct v4l2_subdev_state *sd_state,
+				struct v4l2_subdev_selection *sel)
+{
+	struct ov9282 *ov9282 = to_ov9282(sd);
+	u32 max_y_start;
+	u32 y_start;
+	int ret = 0;
+
+	if (sel->target != V4L2_SEL_TGT_CROP)
+		return -EINVAL;
+
+	mutex_lock(&ov9282->mutex);
+
+	if (ov9282->cur_mode != &supported_modes[MODE_1280_400_ROI] &&
+	    ov9282->cur_mode != &supported_modes[MODE_640_200_ROI]) {
+		sel->r = ov9282->cur_mode->crop;
+		mutex_unlock(&ov9282->mutex);
+		return 0;
+	}
+
+	max_y_start = OV9282_PIXEL_ARRAY_HEIGHT - ov9282->cur_mode->crop.height;
+	y_start = sel->r.top > OV9282_PIXEL_ARRAY_TOP ?
+		  sel->r.top - OV9282_PIXEL_ARRAY_TOP : 0;
+	if (y_start > max_y_start)
+		y_start = max_y_start;
+	y_start -= y_start % 4; /* 4-row alignment, matches the binned
+				  * family's existing offset registers */
+
+	if (sel->which == V4L2_SUBDEV_FORMAT_ACTIVE) {
+		ov9282->roi_y_start = y_start;
+
+		/* Sensor may already be streaming -- push the move live
+		 * rather than waiting for the next stream start. */
+		if (pm_runtime_get_if_in_use(ov9282->dev)) {
+			ret = ov9282_apply_roi_y_start(ov9282);
+			pm_runtime_put(ov9282->dev);
+		}
+	}
+
+	sel->r.left = OV9282_PIXEL_ARRAY_LEFT;
+	sel->r.width = ov9282->cur_mode->crop.width;
+	sel->r.top = OV9282_PIXEL_ARRAY_TOP + y_start;
+	sel->r.height = ov9282->cur_mode->crop.height;
+
+	mutex_unlock(&ov9282->mutex);
+
+	return ret;
 }
 
 /**
@@ -1195,6 +1310,18 @@ static int ov9282_start_streaming(struct ov9282 *ov9282)
 	ret = ov9282_write_regs(ov9282, reg_list->regs, reg_list->num_of_regs);
 	if (ret) {
 		dev_err(ov9282->dev, "fail to write initial registers");
+		return ret;
+	}
+
+	/*
+	 * Re-apply y_start/y_end on top of the mode's static reg list. A
+	 * no-op (writes back the same values already in reg_list) unless
+	 * ov9282_set_selection() moved roi_y_start away from its 0 default
+	 * before this stream start.
+	 */
+	ret = ov9282_apply_roi_y_start(ov9282);
+	if (ret) {
+		dev_err(ov9282->dev, "fail to apply roi y_start");
 		return ret;
 	}
 
@@ -1418,6 +1545,7 @@ static const struct v4l2_subdev_pad_ops ov9282_pad_ops = {
 	.get_fmt = ov9282_get_pad_format,
 	.set_fmt = ov9282_set_pad_format,
 	.get_selection = ov9282_get_selection,
+	.set_selection = ov9282_set_selection,
 };
 
 static const struct v4l2_subdev_ops ov9282_subdev_ops = {

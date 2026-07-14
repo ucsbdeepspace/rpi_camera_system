@@ -9,7 +9,267 @@ don't let it drift from what's actually true. Full prior conversation history
 (pre-2026-07-08) is archived in `docs/archive/handoff_conversation_2026-07-08.txt`
 for context, but treat *this* file as authoritative, not the archive.
 
-## ⚠ IN PROGRESS: MODE_640_200_ROI loaded and partially validated (2026-07-08 16:55)
+## ⚠ IN PROGRESS: runtime-movable ROI via `set_selection` — rebooted, mid-stream write validated clean (2026-07-14)
+
+**Stop here if picking this up fresh: the reboot has happened and the
+riskiest part (moving `y_start` while a capture is actively streaming) has
+now been tested once and came back completely clean — see "Validation
+results" below. What's NOT done yet: trying more than 2 `y_start` values
+(only 0 and 200 tested, "near max" ~400 still unchecked), and writing the
+Python helper for setting this from a script (step 7 of the plan).**
+
+### Why this exists
+
+User asked for (1) an app to view the `MODE_640_200_ROI` feed — already
+satisfied, `camera_preview_roi.py` defaults to `640x200` and was already used
+to validate that mode — and (2) a way to add/move ROIs without a
+rebuild+reboot cycle per new crop, i.e. change the ROI from Python at
+runtime instead of hardcoding it into the kernel driver.
+
+Investigated the driver: `ov9282_pad_ops` had `.get_selection` but no
+`.set_selection` at all — that's *why* the earlier "sensor-level
+crop/windowing — RESOLVED, not available" investigation (below) found
+`crop == crop_bounds == crop_default` fixed. There was no code path for
+userspace to change it; every mode's window is baked into a compile-time
+register array.
+
+Two options were on the table: (a) Picamera2's `ScalerCrop` control — settable
+live, zero kernel changes, but almost certainly an ISP-level crop applied
+*after* the sensor already read out the full window, so it would silently
+give up the 1.9x throughput win MODE_640_200_ROI just proved (same
+conclusion as the earlier "software ROI slicing costs <3%, no speed benefit"
+finding). (b) Real driver-level runtime windowing via `.set_selection`,
+translating a requested rect into i2c writes of the sensor's own window
+registers, preserving the speed win. **User chose (b).**
+
+### Scope decision (deliberately narrow)
+
+Only vertical **position** (`y_start`) is runtime-adjustable, and only for
+the two windowed-crop ROI modes (`MODE_1280_400_ROI`, `MODE_640_200_ROI`).
+Width, output height, and binning stay fixed at each mode's already-validated
+values. Reasons for the narrower scope, not a fully general crop API:
+
+- **Height/size changes are excluded**: changing output height would change
+  the negotiated buffer geometry mid-stream, which needs a full
+  reconfigure/restart, not a live crop move — different, riskier problem.
+- **Horizontal (x_start) panning is excluded**: unlike vertical, there's no
+  stock-mode precedent to extrapolate a register formula from (noted
+  already in the `MODE_1280_400_ROI` section below — width was "deliberately
+  left at 1280, no stock precedent exists for horizontal windowing"). Adding
+  it now would be pure speculation with zero empirical anchor, unlike
+  vertical which has 3 confirmed data points (800→720→400 row windows).
+
+### What was implemented (`kernel_patch/ov9282/ov9282.c`, not yet committed)
+
+- New `struct ov9282` field `roi_y_start` (real sensor rows, default 0),
+  reset to 0 whenever `ov9282_set_pad_format` selects/reselects any mode.
+- `ov9282_apply_roi_y_start()`: writes only `0x3802/0x3803` (y_start) and
+  `0x3806/0x3807` (y_end), reusing the already-validated
+  `y_end = y_start + height + 15` relationship (derived by comparing the
+  stock 800/720/400-row modes) — **but every prior use of that formula only
+  ever exercised `y_start = 0`. A nonzero `y_start` here is a new,
+  hardware-unverified extrapolation, not yet checked against a captured
+  frame.** Called from `ov9282_start_streaming()` right after the mode's
+  static `reg_list` (so it's a no-op reproducing the same values already in
+  `reg_list` unless `set_selection` moved `roi_y_start` first — verified this
+  reproduces the exact stock register values for all 5 modes at `y_start=0`).
+- `ov9282_set_selection()`: new pad op, target `V4L2_SEL_TGT_CROP` only.
+  Clamps requested `y_start` to `[0, 800 - mode_height]`, rounds down to a
+  4-row boundary. For any mode other than the two ROI modes, silently
+  echoes back the fixed default crop instead of erroring (matches how
+  `get_selection` already treats non-adjustable modes). For `ACTIVE` state:
+  stores the new `roi_y_start`, and if the sensor is currently powered/
+  streaming (`pm_runtime_get_if_in_use`), pushes the two registers over i2c
+  immediately — i.e. **intended to move the ROI while a capture is already
+  running**, not just before `cam.start()`. This live-while-streaming path is
+  the least-tested part of the design (see validation plan below).
+- `ov9282_get_selection()` updated to report the *live* `top` (not the
+  static compile-time default) when `which == ACTIVE`.
+
+### Exact current state (2026-07-14)
+
+1. Code changes made to `ov9282.c`, **not yet git-committed** (working tree
+   dirty).
+2. `make` in `kernel_patch/ov9282/` — clean build, no warnings.
+3. `modinfo ov9282.ko` confirmed `vermagic: 6.18.34+rpt-rpi-2712 ... aarch64`
+   — matches running kernel exactly, same check done before every prior
+   install.
+4. `sudo cp` to `/lib/modules/6.18.34+rpt-rpi-2712/updates/ov9282.ko`
+   (overwriting the previously-installed MODE_640_200_ROI-only build) +
+   `sudo depmod -a` — both succeeded.
+5. **Reboot happened** (sometime between the 2026-07-14 hand-off note above
+   being written and this update — exact trigger not captured, but the
+   system came up on the patched module without incident).
+
+### Validation results (2026-07-14, post-reboot)
+
+All against camera 0 (`i2c@88000` → `/dev/v4l-subdev5`), mode `640x200`
+(`MODE_640_200_ROI`, real sensor crop window `1280x400` pre-bin per
+`rpicam-hello`'s own reporting).
+
+1. **Clean boot — confirmed.** `tainted` = `4096` (only `O`=OOT_MODULE, no
+   `D`/`W`), no BUG/Oops/WARNING in dmesg.
+2. **Same 5 modes present — confirmed.** `rpicam-hello --list-cameras` lists
+   `640x200`, `640x400`, `1280x400`, `1280x720`, `1280x800` on both cameras,
+   unchanged from pre-patch.
+3. **Default `y_start=0` reporting — confirmed.** Fresh mode-select via
+   `v4l2-ctl --set-subdev-fmt` to `640x200`/`Y8_1X8`, then
+   `--get-subdev-selection=...target=crop` reported `Left 8, Top 8, Width
+   1280, Height 400` — i.e. `top=8` = `y_start=0`, matching the sensor
+   window `rpicam-hello` itself advertises for this mode. `crop_bounds`/
+   `crop_default` still correctly report the full `1280x800` sensor,
+   unaffected.
+4. **Pre-stream nonzero `y_start` + frame content — confirmed clean.**
+   Wrote a one-off headless script (not committed — GUI preview needs a live
+   display, same reasoning as the earlier `MODE_640_200_ROI` frame-content
+   check) that: opens Picamera2, `configure()`s `640x200` raw, pushes
+   `set-subdev-selection top=208` (`y_start=200`, i.e. `left=8,width=1280,
+   height=400` — the real pre-bin sensor window) via `v4l2-ctl` **after**
+   `configure()` but **before** `cam.start()` (order matters:
+   `ov9282_set_pad_format` resets `roi_y_start=0` on every mode
+   select/reselect, so pushing the write any earlier would just get
+   clobbered by Picamera2's own `configure()` call), then starts and
+   captures. Compared against a `y_start=0` baseline capture of the same
+   static scene: `get-subdev-selection` correctly reflected `top=208` both
+   before and during streaming, no dmesg/taint anomaly, and the captured
+   image visibly shifted content in the correct direction/magnitude (a
+   bright blob moved from the bottom half toward the upper-middle of frame,
+   consistent with sliding a 400-row window down 200 rows) with no tearing,
+   banding, or corruption in either frame.
+5. **The real test — mid-stream register write while actively capturing —
+   PASSED CLEAN.** Wrote `roi_midstream_capture.py` (one-off, not
+   committed): opens camera 0, `640x200`, starts streaming, then just
+   captures continuously into an in-memory frame stack (with a wall-clock
+   timestamp per frame) for 20s while doing nothing else. Ran it as a
+   background process, and — from a **separate shell**, i.e. genuinely a
+   different, unrelated process, not coordinated in-process — fired
+   `v4l2-ctl --set-subdev-selection top=208` partway through the run.
+   Post-hoc analysis of the saved frame stack (per-row correlation against
+   reference "steady old-position" and "steady new-position" frames, in 50-
+   row quarters) found: the write landed cleanly between two whole frames —
+   frame N was **100% old-position** in all four quarters (row-wise
+   correlation ≈0.995 to old ref, ≈−0.96 to new ref, no exceptions), frame
+   N+1 was **100% new-position** in all four quarters (≈0.99+ to new ref,
+   strongly negative to old ref). **No frame showed a mixed/torn signature**
+   (e.g. top quarters correlating to one position while bottom quarters
+   correlate to the other) — the sensor evidently applies the window-
+   register change atomically at a frame boundary rather than mid-readout,
+   at least in this one trial. Visually confirmed too (saved PNGs of both
+   frames): the bright blob is at the old position in frame N, shifted to
+   the new position in frame N+1, both frames individually clean/coherent.
+   `tainted` stayed `4096` throughout, no dmesg BUG/Oops/WARNING.
+   Cam0's crop was reset back to `y_start=0` afterward to leave hardware in
+   a known state.
+
+6. **Range coverage — DONE, all clean (2026-07-14).** Tried `y_start` = 0,
+   100, 200, 300, 380, and 400 (the exact max, since `800 - mode_height(400)
+   = 400` and that's already a multiple of 4 so no rounding kicks in) on
+   camera 0 / `640x200`, each in a fresh process via the same pre-stream
+   `set-subdev-selection`-before-`cam.start()` pattern as item 4. Every
+   value: `get-subdev-selection` echoed back the exact requested `top`, the
+   captured frame was visually coherent (a different, correctly-shifted
+   vertical slice of the same static scene each time, no tearing/banding/
+   garbage — spot-checked visually at `y=0/200/400`, stats-checked via row
+   means at all six), and `tainted`/dmesg stayed clean throughout. This is
+   reasonable evidence `y_end = y_start + height + 15` generalizes across
+   the *whole* allowed range, not just the `y_start=0` case every stock mode
+   already validated — though it's still only camera 0 / one mode; camera 1
+   and `MODE_1280_400_ROI` haven't been touched by this new code path.
+   **Also tested clamp behavior directly** (not just in-range values):
+   requesting `top=608` (`y_start=600`, far past the `400` max) clamped down
+   to `top=408` (`y_start=400`) exactly; requesting `top=0` (below the
+   `top=8` floor) clamped up to `top=8` (`y_start=0`) exactly. Both clamps
+   silent (no ioctl error), no dmesg/taint anomaly — `ov9282_set_selection`'s
+   clamp logic holds at both edges, not just accepting whatever's asked.
+7. **Python helper — DONE, committed as `roi_set_selection.py`
+   (2026-07-14).** Real repo script (not scratchpad), exposing
+   `get_roi_y_start(cam_index)` / `set_roi_y_start(cam_index, y_start)`.
+   Shells out to `v4l2-ctl` subdev ioctls (Picamera2 has no high-level API
+   for arbitrary sensor crop) — same approach the one-off validation
+   scripts used. Handles the camera-index → subdev path mapping internally
+   (`i2c@88000`→`/dev/v4l-subdev5`, `i2c@80000`→`/dev/v4l-subdev2`, read via
+   `Picamera2.global_camera_info()`), and always reads the position back
+   after writing so callers get the value the driver actually applied, not
+   just an echo of the request. Also runnable directly as a CLI
+   (`python3 roi_set_selection.py <cam_index> [y_start]`).
+
+   **Found a real driver bug while dogfooding this**: a negative `y_start`
+   sent straight to the driver does **not** clamp to the `0` floor the way
+   an over-range value correctly clamps to the max — it wraps around
+   (almost certainly unsigned-arithmetic underflow in the kernel-side clamp
+   in `ov9282_set_selection`) and lands at the **max** position (400)
+   instead. Confirmed directly with a raw `v4l2-ctl --set-subdev-selection
+   ...top=-42...` call (independent of this Python script), so it's a
+   genuine kernel-side gap, not a bug in the wrapper. **Not fixed in the
+   driver** — worked around in `roi_set_selection.py` by clamping
+   `y_start` to `[0, MAX_Y_START]` in Python *before* it ever reaches the
+   driver, so this wrapper never triggers the bug. Anything that talks to
+   the subdev directly (bypassing this script) is still exposed to it —
+   worth a kernel-side fix at some point (the driver's own clamp should
+   check for negative input as a signed value before comparing against 0),
+   but not blocking since the one sanctioned Python entry point now guards
+   against it.
+8. **Mid-stream write, full camera×mode matrix — DONE, all 4 clean
+   (2026-07-14).** Extended the item-5 mid-stream test (background capture
+   loop + an external, separate-shell `v4l2-ctl set-subdev-selection` fired
+   mid-run) from camera 0/`640x200` (already done) to the remaining three
+   combinations: camera 1/`640x200`, camera 0/`1280x400`, camera
+   1/`1280x400`. Generalized `roi_midstream_capture.py` to take a `WxH` CLI
+   arg and tag its output files by mode so runs don't clobber each other.
+   For each combination: launched a 20s background capture, fired the
+   external write partway through (landed 3-4.7s into the window each
+   time), then found the transition via frame-mean discontinuity and
+   checked per-quarter (of the frame height) row-correlation against
+   "steady old" and "steady new" reference frames. **Every one of the 4
+   combinations showed the identical pattern already found for camera
+   0/`640x200`**: one frame is fully old-position in all 4 quarters (corr
+   ≈0.95-1.0 to old, negative/weak to new), the very next frame is fully
+   new-position in all 4 quarters (corr ≈0.95-1.0 to new, negative/weak to
+   old) — **no mixed/torn frame in any of the 4 trials**, and this held
+   whether the write landed early (~3s) or later (~4.7s) into the capture
+   window. `tainted` stayed `4096` throughout all 4 runs, no dmesg BUG/
+   Oops/WARNING. Visually spot-checked the transition-frame pair for the
+   camera 1/`640x200` case too (not just the correlation numbers) — same
+   clean before/after cut seen in the camera 0 case. Both subdevs reset to
+   `y_start=0` afterward.
+
+   **Net result: the mid-stream live-write path is now validated clean
+   across all 4 camera×mode combinations** (2 cameras × the 2 windowed ROI
+   modes), 1 trial each. Still true that each combination has only been
+   tried *once* — repeated trials (esp. writes landing at different points
+   within a frame's readout window, or back-to-back writes in a single
+   stream) would build more confidence than "clean once per combination"
+   currently provides, but the earlier open question of "does this even
+   work outside the one camera/mode it was first tried on" is answered:
+   yes, consistently.
+
+9. **Camera 1 and `MODE_1280_400_ROI` coverage — DONE for the pre-stream
+   path, all clean (2026-07-14).** Repeated the item-4/6-style pre-stream
+   test (`set-subdev-selection` after `configure()`, before `start()`,
+   `y_start` = 0/200/400) across all three previously-untested combinations:
+   camera 1 / `640x200`, camera 0 / `1280x400`, camera 1 / `1280x400`. All
+   9 runs (3 combos × 3 values): `get-subdev-selection` echoed back the
+   exact requested `top` both before and during streaming, captured frames
+   were visually coherent and correctly shifted (spot-checked at least one
+   image per combo), and `tainted`/dmesg stayed clean (`4096`, no BUG/Oops)
+   throughout — including confirming the right per-camera CSI controller
+   logged the streaming-start message (`1f00110000.csi` for camera 0,
+   `1f00128000.csi` for camera 1), i.e. the two cameras' independent CFE
+   paths both handled the runtime crop change correctly. Camera mapping
+   confirmed via `Picamera2.global_camera_info()`: index 0 → `i2c@88000` →
+   `/dev/v4l-subdev5`, index 1 → `i2c@80000` → `/dev/v4l-subdev2`. Combined
+   with the earlier camera 0 / `640x200` results, **the pre-stream
+   set_selection path is now validated on both cameras and both windowed
+   ROI modes.** Both subdevs reset back to `y_start=0` afterward.
+   **What this does NOT cover**: the mid-stream (item 5/8) write — that
+   real-time "move it while streaming" test has still only ever been done
+   once, on camera 0 / `640x200`.
+
+## MODE_640_200_ROI — DONE, committed (`d5eb808`, 2026-07-08)
+
+Superseded by the in-progress section above as the active thread, but the
+underlying mode itself is validated and unchanged. Detail preserved below
+for reference.
 
 Added a second experimental mode, `MODE_640_200_ROI`, to
 `kernel_patch/ov9282/ov9282.c` — combines the stock 640x400 mode's binning
@@ -443,6 +703,14 @@ camera module matching if needed later.
   (0/1/01 arg)
 - `camera_preview.py` — live visual preview, 1 or 2 cameras, for basic sanity
   checks
+- `camera_preview_roi.py` — live visual preview for the patched-driver ROI
+  modes (`MODE_1280_400_ROI`, `MODE_640_200_ROI`), defaults to `640x200`
+- `roi_set_selection.py` — runtime helper for the `set_selection` patch:
+  `get_roi_y_start(cam_index)` / `set_roi_y_start(cam_index, y_start)`,
+  also runnable as a CLI (`python3 roi_set_selection.py <cam_index>
+  [y_start]`). Clamps `y_start` client-side before it reaches the driver —
+  see the "runtime-movable ROI" section above for a driver-side clamp bug
+  this works around.
 - `led_dual_camera_closed_loop_test_single_process.py`,
   `led_dual_camera_closed_loop_test_mp_buf1.py` — comparison baselines,
   already answered their questions, probably don't need to run again
