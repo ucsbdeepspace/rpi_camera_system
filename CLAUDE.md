@@ -9,14 +9,19 @@ don't let it drift from what's actually true. Full prior conversation history
 (pre-2026-07-08) is archived in `docs/archive/handoff_conversation_2026-07-08.txt`
 for context, but treat *this* file as authoritative, not the archive.
 
-## ⚠ IN PROGRESS: runtime-movable ROI via `set_selection` — rebooted, mid-stream write validated clean (2026-07-14)
+## DONE: runtime-movable ROI via `set_selection`, live dual-camera demo built (2026-07-14)
 
-**Stop here if picking this up fresh: the reboot has happened and the
-riskiest part (moving `y_start` while a capture is actively streaming) has
-now been tested once and came back completely clean — see "Validation
-results" below. What's NOT done yet: trying more than 2 `y_start` values
-(only 0 and 200 tested, "near max" ~400 still unchecked), and writing the
-Python helper for setting this from a script (step 7 of the plan).**
+**Stop here if picking this up fresh: this whole feature is validated and
+usable now.** Driver patch rebooted in and clean; mid-stream/pre-stream
+writes validated across both cameras and both ROI modes (all combinations
+clean, see "Validation results" below); `roi_set_selection.py` is a real,
+committed helper (`get_roi_y_start`/`set_roi_y_start`); and
+`roi_live_demo.py` is a real, committed interactive demo — two live camera
+windows, keyboard-driven ROI move, confirmed working end-to-end on the
+Pi's actual display (see "Live demo" section below). Remaining open items
+are polish, not blockers: repeated mid-stream trials (each combo has only
+been tried once), and a known-but-worked-around kernel-side clamp bug (see
+item 7 below).
 
 ### Why this exists
 
@@ -264,6 +269,35 @@ All against camera 0 (`i2c@88000` → `/dev/v4l-subdev5`), mode `640x200`
    **What this does NOT cover**: the mid-stream (item 5/8) write — that
    real-time "move it while streaming" test has still only ever been done
    once, on camera 0 / `640x200`.
+
+10. **Live interactive dual-camera demo — DONE, committed as
+    `roi_live_demo.py` (2026-07-14).** User asked for a demo showing both
+    camera streams with a way to change the ROI interactively. Built on top
+    of `roi_set_selection.py`: opens both cameras in an ROI mode (default
+    `640x200`), shows each in its own OpenCV window with the current
+    `y_start` overlaid, and reads keyboard input each frame (`w`/`s` move
+    the *shared* ROI up/down together on both cameras by a configurable
+    step, `r` resets to 0, `q` quits) — every move goes through
+    `set_roi_y_start()` while both cameras are actively streaming, i.e. it
+    continuously exercises the exact mid-stream write path validated in
+    items 5/8/9 above, not just a canned before-start move.
+
+    **Actually tested end-to-end on the Pi's live display, not just
+    inspected as code.** This session has a real desktop session
+    (`DISPLAY=:0`, `labwc` compositor, confirmed via `who`/`loginctl`), so
+    launched the demo in the background and drove it for real: installed
+    `xdotool` (via `sudo apt-get install`, kept installed per user's
+    choice) to focus the camera window and send actual `s`/`r`/`q`
+    keypresses, using `grim` to screenshot the real screen after each one.
+    Confirmed, with actual screenshots, not just log output: (1) both
+    camera windows render live, correctly-labeled feeds side by side; (2)
+    three `s` presses moved the overlay from `y_start=0` → `20` → `40` →
+    `60` (step=20 default) and the visible image content in *both* windows
+    shifted together, in sync; (3) `r` correctly reset both back to
+    `y_start=0`, with the image content visibly returning to its original
+    framing; (4) `q` exited the process cleanly (exit code 0, not a
+    timeout-kill). `tainted` stayed `4096` throughout, no dmesg BUG/Oops.
+    Both subdevs confirmed back at `y_start=0` after the run.
 
 ## MODE_640_200_ROI — DONE, committed (`d5eb808`, 2026-07-08)
 
@@ -711,6 +745,11 @@ camera module matching if needed later.
   [y_start]`). Clamps `y_start` client-side before it reaches the driver —
   see the "runtime-movable ROI" section above for a driver-side clamp bug
   this works around.
+- `roi_live_demo.py` — interactive live demo: both camera ROI feeds side by
+  side, `w`/`s` move the shared ROI up/down while streaming, `r` resets,
+  `q` quits. Needs an actual display (`DISPLAY=:0` — this Pi has a real
+  desktop session via `labwc`), not runnable headless. `python3
+  roi_live_demo.py [WxH] [step]`, defaults `640x200`, step=20 rows.
 - `led_dual_camera_closed_loop_test_single_process.py`,
   `led_dual_camera_closed_loop_test_mp_buf1.py` — comparison baselines,
   already answered their questions, probably don't need to run again
