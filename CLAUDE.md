@@ -508,6 +508,24 @@ All against camera 0 (`i2c@88000` → `/dev/v4l-subdev5`), mode `640x200`
     stayed `4096` throughout, no dmesg anomaly, both subdevs reset to
     `y_start=0` afterward.
 
+    **Binning toggle re-validated starting from `1280x400`, DONE
+    (2026-07-14).** All prior binning-toggle validation (item 11) started
+    from the `640x200` default; user asked to also confirm starting from
+    unbinned. Launched `roi_live_demo.py 1280x400 40`, set cam0/cam1 to
+    distinct positions (`y_start=120`/`80`) while both unbinned, toggled
+    each camera's binning to `640x200` individually (`1`/`b` then `2`/`b`)
+    — both landed at the ~527fps ceiling (**532.2fps cam0, 529.7fps
+    cam1**, read directly off the overlay) with positions correctly
+    preserved (confirmed both via the app's own log and independently via
+    `v4l2-ctl` reads on both subdevs — the cross-camera clobbering fix
+    from item 11 held with `1280x400` as the starting mode too, not just
+    `640x200`). Completed the full round trip by toggling both cameras
+    back to unbinned: both subdevs correctly reported `Width 1280, Height
+    400` again with positions still exactly `y_start=120`/`80` unchanged.
+    `tainted` stayed `4096` throughout, no dmesg anomaly, `q` exited
+    cleanly (no lingering `/dev/video*`/`/dev/media*` fds), both subdevs
+    reset to `y_start=0` afterward.
+
 ## MODE_640_200_ROI — DONE, committed (`d5eb808`, 2026-07-08)
 
 Superseded by the in-progress section above as the active thread, but the
