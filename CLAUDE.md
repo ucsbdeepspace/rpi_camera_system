@@ -481,6 +481,33 @@ All against camera 0 (`i2c@88000` → `/dev/v4l-subdev5`), mode `640x200`
     test in this investigation, no dmesg anomaly. Both subdevs reset to
     `y_start=0` afterward.
 
+    **Follow-up found and fixed a second-order regression from the fps
+    fix itself, DONE (2026-07-14).** User asked to re-test on
+    `1280x400` with the display visible; while re-validating fps there
+    (confirmed **241.1fps / 241.4fps** cam0/cam1, matching the ~262fps
+    display-free ceiling within normal display overhead), a rapid 2x `s`
+    keypress test only moved the ROI once instead of twice. Root cause:
+    throttling `cv2.waitKey()` to ~15Hz means each poll only pops a
+    *single* queued key (`waitKey` never drains a queue, just returns one
+    key per call) — before this session's fps fix, `waitKey` ran on every
+    capture (~500+/sec), so this was never an issue; throttling it
+    exposed a real gap. Fixed by draining all pending keys in a `while`
+    loop each time the throttle window opens (loop until `waitKey`
+    returns "no key"/`0xFF`), instead of processing just one. Verified
+    with `xdotool key --delay 30 s s s s` (4 presses ~30ms apart): still
+    only 3 of 4 registered even after the drain-loop fix — traced this to
+    X11/GTK itself coalescing keydown events faster than ~30-100ms apart
+    before they ever reach `cv2.waitKey()`, not something app-level
+    draining can address. At `--delay 120` (a realistic human typing
+    cadence), all 4 presses registered correctly every time. Net: the
+    drain-loop fix closes the real gap (2 rapid presses: 1→2 registered)
+    that throttling introduced; the remaining synthetic-burst-speed edge
+    case is a lower-level input-stack limit below any real human typing
+    speed, not a practical concern for this demo. fps re-confirmed
+    unchanged after the drain-loop fix (240.7fps / 236.7fps). `tainted`
+    stayed `4096` throughout, no dmesg anomaly, both subdevs reset to
+    `y_start=0` afterward.
+
 ## MODE_640_200_ROI — DONE, committed (`d5eb808`, 2026-07-08)
 
 Superseded by the in-progress section above as the active thread, but the

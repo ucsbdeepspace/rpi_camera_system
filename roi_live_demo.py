@@ -227,27 +227,41 @@ try:
             continue
         last_waitkey_time = now
 
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
+        # Drain every pending key this throttle window, not just one --
+        # cv2.waitKey() only ever returns a single queued key per call, so
+        # with waitKey now polled at ~15Hz instead of every capture, two
+        # keys pressed faster than ~67ms apart used to strand the second
+        # one until the next poll (confirmed by testing: two rapid 's'
+        # presses only moved the ROI once). Looping until the queue is
+        # empty (0xFF = no key) fixes that without giving up the fps win.
+        quit_requested = False
+        while True:
+            key = cv2.waitKey(1) & 0xFF
+            if key == 0xFF:
+                break
+            if key == ord('q'):
+                quit_requested = True
+                break
+            elif key in digit_keys:
+                active = digit_keys[key]
+                print(f"active camera: {active}")
+            elif key == ord('w'):
+                y_starts[active] = set_roi_y_start(active, y_starts[active] - STEP)
+                print(f"cam {active}: y_start={y_starts[active]}")
+            elif key == ord('s'):
+                y_starts[active] = set_roi_y_start(active, y_starts[active] + STEP)
+                print(f"cam {active}: y_start={y_starts[active]}")
+            elif key == ord('r'):
+                y_starts[active] = set_roi_y_start(active, 0)
+                print(f"cam {active}: y_start={y_starts[active]}")
+            elif key == ord('a'):
+                for i in indices:
+                    y_starts[i] = set_roi_y_start(i, 0)
+                print(f"all cameras reset: {y_starts}")
+            elif key == ord('b'):
+                toggle_binning(active)
+        if quit_requested:
             break
-        elif key in digit_keys:
-            active = digit_keys[key]
-            print(f"active camera: {active}")
-        elif key == ord('w'):
-            y_starts[active] = set_roi_y_start(active, y_starts[active] - STEP)
-            print(f"cam {active}: y_start={y_starts[active]}")
-        elif key == ord('s'):
-            y_starts[active] = set_roi_y_start(active, y_starts[active] + STEP)
-            print(f"cam {active}: y_start={y_starts[active]}")
-        elif key == ord('r'):
-            y_starts[active] = set_roi_y_start(active, 0)
-            print(f"cam {active}: y_start={y_starts[active]}")
-        elif key == ord('a'):
-            for i in indices:
-                y_starts[i] = set_roi_y_start(i, 0)
-            print(f"all cameras reset: {y_starts}")
-        elif key == ord('b'):
-            toggle_binning(active)
 
 finally:
     cv2.destroyAllWindows()
