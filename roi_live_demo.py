@@ -9,6 +9,12 @@ stop/reconfigure/start cycle for binning changes (a separate, heavier
 operation -- see CLAUDE.md's "Height/size changes are excluded" note on
 why ROI position and binning are handled differently).
 
+Capture runs at each mode's validated max rate (1800us/~527fps binned,
+3400us/~280fps unbinned) every loop iteration; the on-screen image and fps
+readout only redraw at DISPLAY_INTERVAL_S (~15fps) so GTK/imshow overhead
+never gates capture speed -- the fps counter reflects true capture rate,
+not display rate.
+
 Controls (keys apply to the "active" camera, shown highlighted in its
 window's overlay -- switch which one is active with the number keys):
   1/2   make camera 0/1 the active camera
@@ -43,14 +49,26 @@ from roi_set_selection import MAX_Y_START, set_roi_y_start
 RAW_FORMAT = "R8"
 EXPOSURE_US = 1500
 ANALOGUE_GAIN = 4.0
-FRAME_DURATION_US = 6000
 FPS_WINDOW = 30  # frames averaged for the displayed fps
+DISPLAY_INTERVAL_S = 1 / 15  # redraw each window at ~15fps regardless of capture rate
 
 # The two windowed ROI modes the patched driver exposes -- same real 1280x400
 # pre-bin sensor crop window either way, differing only in whether the
 # horizontal/vertical binning registers are set. See CLAUDE.md.
 BINNED_SIZE = (640, 200)
 UNBINNED_SIZE = (1280, 400)
+
+# Validated per-mode floors from CLAUDE.md's throughput sweeps -- NOT the
+# 6000us placeholder the first cut of this script used, which capped
+# capture at ~166fps regardless of mode and made the ROI's whole point
+# (real speed win) invisible. 1800us is the confirmed-clean floor for
+# 640x200 binned (~527fps); 1750us hangs. 3400us matches the stock/
+# unbinned 1280x400 floor (~280fps -- that mode never beat stock, see
+# "Throughput result -- NEGATIVE" section).
+FRAME_DURATION_US_BY_SIZE = {
+    BINNED_SIZE: 1800,
+    UNBINNED_SIZE: 3400,
+}
 
 if len(sys.argv) > 1:
     w, h = sys.argv[1].lower().split("x")
@@ -78,8 +96,9 @@ def configure_and_start(cam, index, raw_size):
         print(f"WARNING camera {index}: requested {raw_size} got {actual_raw['size']} "
               f"-- the ROI mode was not selected as expected.")
     cam.start()
+    frame_duration_us = FRAME_DURATION_US_BY_SIZE[raw_size]
     controls = {
-        "FrameDurationLimits": (FRAME_DURATION_US, FRAME_DURATION_US),
+        "FrameDurationLimits": (frame_duration_us, frame_duration_us),
         "AeEnable": False,
         "NoiseReductionMode": 0,
         "ExposureTime": EXPOSURE_US,
@@ -152,6 +171,8 @@ for i, name in zip(indices, window_names):
 raw_sizes = {i: START_SIZE for i in indices}
 y_starts = {i: 0 for i in indices}
 fps_history = {i: deque(maxlen=FPS_WINDOW) for i in indices}
+last_display_time = {i: 0.0 for i in indices}
+last_waitkey_time = 0.0
 active = indices[0]
 digit_keys = {ord(str(i + 1)): i for i in indices if i < 9}
 
@@ -163,8 +184,21 @@ print("Controls: 1/2 select camera, w/s move it, r reset it, a reset all, "
 try:
     while True:
         for i, cam in zip(indices, cams):
+            # Capture every iteration, unconditionally -- this is what lets
+            # capture run at the mode's real rate. Display work below (the
+            # actual bottleneck this app used to have: normalize/cvtColor/
+            # imshow every single frame) only runs on a throttled cadence,
+            # so the fps counter reflects true capture speed, not display
+            # speed, while still refreshing the on-screen image and its fps
+            # readout often enough to watch live.
             frame = cam.capture_array("raw").view(np.uint16)
-            fps_history[i].append(time.monotonic())
+            now = time.monotonic()
+            fps_history[i].append(now)
+
+            if now - last_display_time[i] < DISPLAY_INTERVAL_S:
+                continue
+            last_display_time[i] = now
+
             display = np.empty_like(frame, dtype=np.uint8)
             cv2.normalize(frame, display, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
             display = cv2.cvtColor(display, cv2.COLOR_GRAY2BGR)
@@ -179,6 +213,19 @@ try:
                         (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1,
                         cv2.LINE_AA)
             cv2.imshow(window_names[i], display)
+
+        # waitKey's nominal "1ms" wait is not what it costs in practice --
+        # measured ~2.2ms/call with two windows open on this GTK backend,
+        # which at every-capture-iteration cadence was eating ~69% of the
+        # loop (this was the actual fps bottleneck, not display rendering
+        # or GIL contention between the two cameras -- both measured and
+        # ruled out separately). Throttling it to the same cadence as the
+        # display redraw keeps keyboard response well under human reaction
+        # time while no longer capping capture throughput.
+        now = time.monotonic()
+        if now - last_waitkey_time < DISPLAY_INTERVAL_S:
+            continue
+        last_waitkey_time = now
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):

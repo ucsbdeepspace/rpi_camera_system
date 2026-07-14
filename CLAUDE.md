@@ -433,6 +433,54 @@ All against camera 0 (`i2c@88000` → `/dev/v4l-subdev5`), mode `640x200`
     `/dev/video*`/`/dev/media*` fds via `lsof`), both subdevs reset to
     `y_start=0` afterward.
 
+12. **fps was capped at ~130fps instead of the validated ~527fps ceiling —
+    root-caused and fixed, DONE (2026-07-14).** User noticed the demo's
+    displayed fps (~130) was roughly half the ~280fps stock ceiling and
+    nowhere near the ~527fps `640x200`-binned ceiling this whole ROI effort
+    exists to demonstrate, and asked specifically whether the display was
+    the bottleneck and whether capture/display could be decoupled. Found
+    **two separate real bugs**, isolated one at a time with targeted
+    diagnostics rather than guessing:
+
+    - **`FRAME_DURATION_US` was hardcoded to `6000`** (inherited from the
+      original ROI-move-only demo, never revisited when binning was added)
+      — a hard ~166fps ceiling regardless of mode, already below what was
+      actually being observed. Fixed: per-mode duration from the already-
+      validated floors elsewhere in this file (`1800us`/binned,
+      `3400us`/unbinned), looked up by raw size in `configure_and_start()`.
+    - **Even after that fix, only ~274-306fps** (measured via a throttled-
+      display version and a display-free repro respectively) — short of
+      the ~527fps binned ceiling. Bisected with two standalone diagnostic
+      scripts (not the demo itself, to isolate variables): (1) a bare
+      dual-camera capture loop with **zero** cv2/display code got
+      **~494fps/camera** — ruling out single-process/GIL contention
+      between the two cameras as a meaningful cost (matches solo-camera
+      capture at ~493-496fps almost exactly, i.e. running both cameras in
+      one process barely costs anything by itself); (2) that same loop
+      with `cv2.namedWindow`s created and a **throttled** display added
+      back showed `cv2.waitKey(1)` — called every capture iteration, as
+      the demo originally did — costing **~2.24ms/call measured** (not the
+      nominal "1ms"), consuming **~69% of total loop time** with two
+      windows open on this GTK/Wayland backend. That was the dominant
+      bottleneck, not GTK image rendering (already ruled out by the
+      throttled-display test in item 11) and not GIL contention. Fixed:
+      `cv2.waitKey()` is now called only at the same ~15Hz throttle as the
+      display redraw (`DISPLAY_INTERVAL_S`), not every capture iteration —
+      keyboard response stays well under human reaction time (~67ms worst
+      case) while no longer capping capture throughput.
+
+    **Re-validated on the live display after the fix**: `640x200` binned
+    showed **524.6fps / 531.6fps** (cam1/cam0) — matching the ~527fps
+    floor-sweep ceiling documented in the `MODE_640_200_ROI` section below.
+    `1280x400` unbinned showed a similar jump, cross-checked against a
+    display-free raw-capture measurement at the same duration (**262.2fps
+    both cameras**, matching the ~280fps documented ceiling for that mode
+    within normal run-to-run variance). Keyboard controls (`s`/`r`/`q`)
+    confirmed still fully responsive after the fix via direct subdev
+    reads, not just visually. `tainted` stayed `4096` throughout every
+    test in this investigation, no dmesg anomaly. Both subdevs reset to
+    `y_start=0` afterward.
+
 ## MODE_640_200_ROI — DONE, committed (`d5eb808`, 2026-07-08)
 
 Superseded by the in-progress section above as the active thread, but the
