@@ -1,0 +1,2 @@
+frame_duration_us,requested_fps,run_ok,cam0_fps,cam0_frames,cam0_ms_per_frame,cam1_fps,cam1_frames,cam1_ms_per_frame,note
+1600,625.0,True,511.59,2558,1.955,510.19,2552,1.96,

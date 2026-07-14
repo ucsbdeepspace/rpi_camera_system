@@ -9,6 +9,85 @@ don't let it drift from what's actually true. Full prior conversation history
 (pre-2026-07-08) is archived in `docs/archive/handoff_conversation_2026-07-08.txt`
 for context, but treat *this* file as authoritative, not the archive.
 
+## DONE: quarter-tier ROI modes (`MODE_1280_200_ROI`, `MODE_640_100_ROI`) — validated, NOT YET COMMITTED (2026-07-14)
+
+Pushed the `y_end = height + 15` windowing trick one step past the existing
+400-real-row ROI modes: two new modes added to `supported_modes[]` in
+`kernel_patch/ov9282/ov9282.c`, each cloned register-for-register from its
+400-row sibling with only `y_end` (`0x3806/0x3807`) and `y_output_size`
+(`0x380a/0x380b`) changed, same "unverified until checked against a captured
+frame" caveat as every mode added this way so far:
+
+- `MODE_1280_200_ROI` — unbinned, 200 real rows, rated 542.59fps
+- `MODE_640_100_ROI` — binned, 200 real pre-bin rows → 100 output rows,
+  rated 1071.81fps
+
+`ov9282_set_selection()`'s mode whitelist was extended to include both new
+modes (so runtime `y_start` moves work on them too, same as the existing two
+ROI modes) — explicit whitelist, not a `crop.height != PIXEL_ARRAY_HEIGHT`
+inference (`MODE_1280_720` also has a non-800 crop height and must stay
+non-adjustable).
+
+Built, vermagic/srcversion-matched, `depmod`-installed to
+`/lib/modules/.../updates/ov9282.ko`, and **rebooted in already** — running
+now. `tainted` = `4096` throughout every test below, no dmesg BUG/Oops.
+
+**Frame content — validated clean, both modes, both cameras.** Headless
+capture (no live display needed): all 4 combinations negotiated the correct
+raw size, non-degenerate pixel stats, and visually coherent gradient/noise
+texture with no tearing/banding/garbage (spot-checked all 4 saved PNGs).
+
+**Throughput — real, substantial speed wins over every previously
+characterized mode, floors found for both:**
+
+| mode | rated ceiling | clean floor found | achieved fps at floor | prior best (400-row sibling) |
+|---|---|---|---|---|
+| `MODE_1280_200_ROI` | 542.59fps | ~1600-1825us plateau, no hang found down to 1600us | ~511-514fps | `MODE_1280_400_ROI`: ~282fps (unbinned) |
+| `MODE_640_100_ROI` | 1071.81fps | clean @1050us (**~880fps**), hangs @1000us | **~854-880fps** | `MODE_640_200_ROI`: ~527fps (binned) |
+
+`MODE_640_100_ROI` is now the fastest mode found in this entire project —
+~1.7x the previous ~527fps ceiling. `MODE_1280_200_ROI` didn't hang anywhere
+in the tested range (1600-3400us) — it plateaus around ~511-514fps instead
+(short of its 542.59fps rated ceiling) rather than crashing, unlike every
+other mode swept so far; true hang floor (if one exists above the sensor's
+absolute limit) not found, not chased further since the plateau already
+answers "is there a speed win" (yes). Full sweep CSVs:
+`camera_throughput_sweep_1280x200.csv` (+ `..._floor.csv`, `..._floor2.csv`)
+and `camera_throughput_sweep_640x100.csv` (+ `..._probe.csv`,
+`..._probe2.csv`).
+
+**One real hang hit and recovered from cleanly, same pattern as the
+original 640x200 floor-sweep hang**: `640x100` @ 1000us timed out (20s) and
+was killed by the sweep orchestrator, orphaning two `camera_throughput_test.py`
+multiprocessing workers (parent killed, forked children survive). Checked
+state before acting: `ps -o stat,wchan` showed `Sl`/`futex_do_wait`
+(userspace lock wait, not kernel `D`-state), so `kill -9` on both was
+expected-safe — confirmed via `lsof` that all `/dev/video*`/`/dev/media*`
+fds were released after. Ran a known-good sanity check
+(`camera_throughput_test.py 01 3400`, stock 640x400) afterward: 281.95/281.19fps,
+matching the established baseline exactly. **No reboot needed.** `tainted`
+stayed `4096`, no dmesg BUG/Oops throughout.
+
+`camera_throughput_sweep_subprocess.py` was generalized to take optional CLI
+args (`[WxH] [durations_csv] [output_csv]`) so the same sweep script works
+for any mode — defaults reproduce the original `MODE_640_200_ROI`-only
+behavior exactly, fully backward compatible.
+
+**Not yet done**:
+1. **Commit `ov9282.c`/`ov9282.ko`** — validated but still sitting as
+   uncommitted working-tree changes.
+2. Closed-loop LED round-trip test at these settings (the actual
+   throughput→closed-loop-Hz translation, same as was done for
+   `MODE_640_200_ROI` at 1800µs) hasn't been run for either new mode yet —
+   pure capture throughput is validated, the end-to-end control-relevant
+   number isn't.
+3. Mid-stream `set_selection` write validation (the item-5/8 pattern from
+   the runtime-ROI section below) hasn't been repeated on these two new
+   modes specifically — only the original two ROI modes were covered there.
+4. `camera_preview_roi.py`/`roi_live_demo.py` haven't been driven against
+   these sizes on the live display yet (the CLI already accepts arbitrary
+   `WxH` so this should just work, but hasn't been exercised).
+
 ## DONE: runtime-movable ROI via `set_selection`, live dual-camera demo built (2026-07-14)
 
 **Stop here if picking this up fresh: this whole feature is validated and
@@ -986,7 +1065,13 @@ camera module matching if needed later.
 - `camera_preview.py` — live visual preview, 1 or 2 cameras, for basic sanity
   checks
 - `camera_preview_roi.py` — live visual preview for the patched-driver ROI
-  modes (`MODE_1280_400_ROI`, `MODE_640_200_ROI`), defaults to `640x200`
+  modes (`MODE_1280_400_ROI`, `MODE_640_200_ROI`, and the newer
+  `MODE_1280_200_ROI`/`MODE_640_100_ROI`), defaults to `640x200`
+- `camera_throughput_sweep_subprocess.py` — frame-duration sweep for
+  `camera_throughput_test.py`, fresh subprocess per value (same
+  crash-recovery rationale as `led_dual_camera_sweep_subprocess.py`). Takes
+  optional `[WxH] [durations_csv] [output_csv]` CLI args — defaults
+  reproduce the original `MODE_640_200_ROI`-only sweep.
 - `roi_set_selection.py` — runtime helper for the `set_selection` patch:
   `get_roi_y_start(cam_index)` / `set_roi_y_start(cam_index, y_start)`,
   also runnable as a CLI (`python3 roi_set_selection.py <cam_index>

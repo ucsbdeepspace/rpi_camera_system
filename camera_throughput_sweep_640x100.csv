@@ -1,0 +1,9 @@
+frame_duration_us,requested_fps,run_ok,cam0_fps,cam0_frames,cam0_ms_per_frame,cam1_fps,cam1_frames,cam1_ms_per_frame,note
+3400,294.12,True,282.36,1412,3.542,282.34,1412,3.542,
+3000,333.33,True,319.57,1598,3.129,319.65,1599,3.128,
+2600,384.62,True,369.46,1848,2.707,369.46,1848,2.707,
+2200,454.55,True,435.6,2179,2.296,435.58,2178,2.296,
+1800,555.56,True,531.72,2659,1.881,531.49,2658,1.882,
+1500,666.67,True,631.01,3156,1.585,630.63,3154,1.586,
+1200,833.33,True,790.35,3952,1.265,789.58,3948,1.266,
+1000,1000.0,False,,,,,,,process timed out and was killed -- treat subsequent runs with suspicion

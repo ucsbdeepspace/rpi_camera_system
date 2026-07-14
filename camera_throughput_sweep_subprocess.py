@@ -32,22 +32,28 @@ import sys
 import time
 
 # ── Config ───────────────────────────────────────────────────────────────────
+# All three overridable via CLI so this same sweep can target any ROI mode:
+#   python3 camera_throughput_sweep_subprocess.py [WxH] [durations_csv] [output_csv]
+# Defaults below reproduce the original MODE_640_200_ROI-only behavior exactly.
 SCRIPT_PATH = "camera_throughput_test.py"
 WHICH = "01"  # dual-concurrent, matches the existing 281.8/283.6fps comparisons
-RAW_SIZE_ARG = "640x200"
+RAW_SIZE_ARG = sys.argv[1] if len(sys.argv) > 1 else "640x200"
 
 # Starting from the already-known-stable 3400us point (matches prior modes'
 # comparison baseline), stepping down toward this mode's ~1698us native
 # ceiling. Smaller steps near the bottom, same philosophy as the LED sweep's
 # step pattern -- that's where a request is most likely to fail outright.
-FRAME_DURATION_SWEEP_US = [
-    3400, 3200, 3000, 2800, 2600, 2400, 2200,
-    2000, 1900, 1800, 1750, 1725, 1700,
-]
+if len(sys.argv) > 2:
+    FRAME_DURATION_SWEEP_US = [int(v) for v in sys.argv[2].split(",")]
+else:
+    FRAME_DURATION_SWEEP_US = [
+        3400, 3200, 3000, 2800, 2600, 2400, 2200,
+        2000, 1900, 1800, 1750, 1725, 1700,
+    ]
 
 RUN_TIMEOUT_S = 20.0       # generous margin over the 5s test + camera init
 GAP_BETWEEN_RUNS_S = 2.0   # let camera hardware fully release between processes
-OUTPUT_CSV = "camera_throughput_sweep_640x200.csv"
+OUTPUT_CSV = sys.argv[3] if len(sys.argv) > 3 else f"camera_throughput_sweep_{RAW_SIZE_ARG}.csv"
 
 FPS_RE = re.compile(
     r"cam(\d): (\d+) frames in ([\d.]+)s\s+->\s+([\d.]+) fps\s+\(([\d.]+) ms/frame actual\)"

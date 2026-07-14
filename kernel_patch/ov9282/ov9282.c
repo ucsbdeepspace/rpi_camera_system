@@ -298,6 +298,8 @@ static struct ov9282_reg_list common_regs_list = {
 #define MODE_640_400		2
 #define MODE_1280_400_ROI	3
 #define MODE_640_200_ROI	4
+#define MODE_1280_200_ROI	5
+#define MODE_640_100_ROI	6
 
 #define DEFAULT_MODE		MODE_1280_720
 
@@ -478,6 +480,85 @@ static const struct ov9282_reg mode_640x200_roi_regs[] = {
 	{0x4509, 0x80},
 };
 
+/*
+ * "Quarter" tier: same y_end-shrink trick as the two ROI modes above, one
+ * step further -- 200 real pre-bin rows instead of 400 (y_end = 200 + 15 =
+ * 215 = 0x00d7). Unbinned variant cloned verbatim from
+ * mode_1280x400_roi_regs, changing only y_end (0x3806/0x3807) and
+ * y_output_size (0x380a/0x380b, 400->200); every other register (binning,
+ * ISP offsets, timing) is unchanged from that mode for the same reason the
+ * original two ROI modes cloned rather than re-derived them -- their exact
+ * semantics aren't documented here. UNVALIDATED until checked against an
+ * actual captured frame, same caveat as every mode added this way so far.
+ */
+static const struct ov9282_reg mode_1280x200_roi_regs[] = {
+	{0x3778, 0x00},
+	{0x3800, 0x00},
+	{0x3801, 0x00},
+	{0x3802, 0x00},
+	{0x3803, 0x00},
+	{0x3804, 0x05},
+	{0x3805, 0x0f},
+	{0x3806, 0x00},
+	{0x3807, 0xd7},
+	{0x3808, 0x05},
+	{0x3809, 0x00},
+	{0x380a, 0x00},
+	{0x380b, 0xc8},
+	{0x3810, 0x00},
+	{0x3811, 0x08},
+	{0x3812, 0x00},
+	{0x3813, 0x08},
+	{0x3814, 0x11},
+	{0x3815, 0x11},
+	{OV9282_REG_TIMING_FORMAT_1, 0x3c},
+	{OV9282_REG_TIMING_FORMAT_2, 0x84},
+	{0x4003, 0x40},
+	{0x4008, 0x02},
+	{0x4009, 0x05},
+	{0x400c, 0x00},
+	{0x400d, 0x03},
+	{0x4507, 0x00},
+	{0x4509, 0x80},
+};
+
+/*
+ * Binned "quarter" tier: same 200-row real pre-bin window as
+ * mode_1280x200_roi_regs above (same y_end=0x00d7), cloned from
+ * mode_640x200_roi_regs with only y_end and y_output_size (0x380a/0x380b,
+ * 200->100) changed -- same reasoning as mode_640x200_roi_regs itself.
+ * UNVALIDATED until checked against an actual captured frame.
+ */
+static const struct ov9282_reg mode_640x100_roi_regs[] = {
+	{0x3778, 0x10},
+	{0x3800, 0x00},
+	{0x3801, 0x00},
+	{0x3802, 0x00},
+	{0x3803, 0x00},
+	{0x3804, 0x05},
+	{0x3805, 0x0f},
+	{0x3806, 0x00},
+	{0x3807, 0xd7},
+	{0x3808, 0x02},
+	{0x3809, 0x80},
+	{0x380a, 0x00},
+	{0x380b, 0x64},
+	{0x3810, 0x00},
+	{0x3811, 0x04},
+	{0x3812, 0x00},
+	{0x3813, 0x04},
+	{0x3814, 0x31},
+	{0x3815, 0x22},
+	{OV9282_REG_TIMING_FORMAT_1, 0x60},
+	{OV9282_REG_TIMING_FORMAT_2, 0x01},
+	{0x4008, 0x02},
+	{0x4009, 0x05},
+	{0x400c, 0x00},
+	{0x400d, 0x03},
+	{0x4507, 0x03},
+	{0x4509, 0x80},
+};
+
 /* Supported sensor mode configurations */
 static const struct ov9282_mode supported_modes[] = {
 	[MODE_1280_800] = {
@@ -596,6 +677,57 @@ static const struct ov9282_mode supported_modes[] = {
 		.reg_list = {
 			.num_of_regs = ARRAY_SIZE(mode_640x200_roi_regs),
 			.regs = mode_640x200_roi_regs,
+		},
+	},
+	[MODE_1280_200_ROI] = {
+		.width = 1280,
+		.height = 200,
+		.hblank_min = { 250, 176 },
+		.vblank = 1022,
+		.vblank_min = 41,
+		.vblank_max = 51540,
+		.link_freq_idx = 0,
+		.crop = {
+			/*
+			 * EXPERIMENTAL: "quarter" tier, see mode_1280x200_roi_regs
+			 * comment above. y_end = height + 15 pattern extended one
+			 * step further than MODE_1280_400_ROI (200 real rows
+			 * instead of 400) -- unverified against a captured frame.
+			 */
+			.left = OV9282_PIXEL_ARRAY_LEFT,
+			.top = OV9282_PIXEL_ARRAY_TOP,
+			.width = 1280,
+			.height = 200
+		},
+		.reg_list = {
+			.num_of_regs = ARRAY_SIZE(mode_1280x200_roi_regs),
+			.regs = mode_1280x200_roi_regs,
+		},
+	},
+	[MODE_640_100_ROI] = {
+		.width = 640,
+		.height = 100,
+		.hblank_min = { 890, 816 },
+		.vblank = 1022,
+		.vblank_min = 22,
+		.vblank_max = 51540,
+		.link_freq_idx = 0,
+		.crop = {
+			/*
+			 * EXPERIMENTAL: binned "quarter" tier, see
+			 * mode_640x100_roi_regs comment above. .height here is the
+			 * real (pre-binning) row window (200), not the post-binning
+			 * output height (100) -- same convention as MODE_640_200_ROI,
+			 * unverified against a captured frame.
+			 */
+			.left = OV9282_PIXEL_ARRAY_LEFT,
+			.top = OV9282_PIXEL_ARRAY_TOP,
+			.width = 1280,
+			.height = 200
+		},
+		.reg_list = {
+			.num_of_regs = ARRAY_SIZE(mode_640x100_roi_regs),
+			.regs = mode_640x100_roi_regs,
 		},
 	},
 };
@@ -1188,7 +1320,13 @@ static int ov9282_set_selection(struct v4l2_subdev *sd,
 	mutex_lock(&ov9282->mutex);
 
 	if (ov9282->cur_mode != &supported_modes[MODE_1280_400_ROI] &&
-	    ov9282->cur_mode != &supported_modes[MODE_640_200_ROI]) {
+	    ov9282->cur_mode != &supported_modes[MODE_640_200_ROI] &&
+	    ov9282->cur_mode != &supported_modes[MODE_1280_200_ROI] &&
+	    ov9282->cur_mode != &supported_modes[MODE_640_100_ROI]) {
+		/* Explicit whitelist, not a crop.height != PIXEL_ARRAY_HEIGHT
+		 * inference -- MODE_1280_720 also has crop.height=720 != 800
+		 * and must stay non-adjustable exactly like the two full-frame
+		 * modes, not accidentally picked up here. */
 		sel->r = ov9282->cur_mode->crop;
 		mutex_unlock(&ov9282->mutex);
 		return 0;
