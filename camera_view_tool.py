@@ -3,8 +3,17 @@
 Full-frame / windowed-ROI live camera viewer with beam centroid tracking --
 one or two cameras, raw mono stream. Built for bench alignment work (e.g.
 watching a beam through a beamsplitter): starts on the full sensor field of
-view, and 'h' steps down through the patched driver's windowed ROI modes
-for a tighter, faster-updating view of the beam.
+view, and 'h' steps down through the patched driver's BINNED windowed ROI
+modes for a tighter, faster-updating view of the beam.
+
+Uses the binned ROI modes (MODE_640_200_ROI / MODE_640_100_ROI), not the
+unbinned ones (MODE_1280_400_ROI / MODE_1280_200_ROI) this tool originally
+used -- the unbinned modes were found to invert bright point sources under
+sustained streaming at their validated floor durations (a continuously-
+active internal sensor auto-calibration engine with no register-level fix;
+see CLAUDE.md's "unbinned ROI modes invert bright point sources" section).
+The binned modes are confirmed clean under the same sustained-run test and
+are also faster, so there's no tradeoff in switching.
 
 Each frame's raw pixel values (not the display-normalized 8-bit copy) are
 checked for a confident beam peak -- (max - median) must clear a multiple
@@ -41,16 +50,16 @@ reports no detection at all on the weak one instead of drawing a
 misleading reticle.
 
 Controls:
-  h   cycle ROI height: 800 (full sensor) -> 400 -> 200 -> back to 800.
-      Each step is a full stop/reconfigure/start (a different sensor mode,
-      not a live crop move -- see CLAUDE.md's "Height/size changes are
-      excluded" note on why). 400/200 use the patched driver's
-      MODE_1280_400_ROI / MODE_1280_200_ROI, both runtime-repositionable via
-      set_selection -- every time you cycle into one, this script
-      immediately centers the new (narrower) window on wherever that
-      camera's beam centroid was last seen, no manual re-aiming needed.
-      800 (full sensor) isn't ROI-adjustable, so cycling back to it is just
-      a mode switch with no centering step.
+  h   cycle mode: 1280x800 (full sensor) -> 640x200 (binned) -> 640x100
+      (binned) -> back to full sensor. Each step is a full stop/reconfigure/
+      start (a different sensor mode, not a live crop move -- see CLAUDE.md's
+      "Height/size changes are excluded" note on why). The two binned tiers
+      use the patched driver's MODE_640_200_ROI / MODE_640_100_ROI, both
+      runtime-repositionable via set_selection -- every time you cycle into
+      one, this script immediately centers the new (narrower) window on
+      wherever that camera's beam centroid was last seen, no manual
+      re-aiming needed. Full sensor isn't ROI-adjustable, so cycling back to
+      it is just a mode switch with no centering step.
   q   quit
 
 Capture runs unconditionally every loop iteration (this is what the fps
@@ -60,7 +69,7 @@ display never caps real capture throughput (same fix applied to
 roi_live_demo.py after its fps turned out to be display-bound -- see
 CLAUDE.md's "runtime-movable ROI" section, item 12).
 
-Requires the patched ov9282 module (MODE_1280_400_ROI / MODE_1280_200_ROI)
+Requires the patched ov9282 module (MODE_640_200_ROI / MODE_640_100_ROI)
 to be loaded -- see CLAUDE.md.
 
 Usage:
@@ -82,13 +91,19 @@ RAW_FORMAT = "R8"
 EXPOSURE_US = 1500
 ANALOGUE_GAIN = 4.0
 
-WIDTH = 1280
-PIXEL_ARRAY_HEIGHT = 800  # full sensor -- HEIGHTS[0], not ROI-adjustable
-HEIGHTS = [800, 400, 200]  # 'h' cycle order: full sensor -> half tier -> quarter tier -> full
-FRAME_DURATION_US_BY_HEIGHT = {
-    800: 6000,   # full sensor -- conservative, floor not characterized
-    400: 3400,   # MODE_1280_400_ROI validated floor (CLAUDE.md)
-    200: 1775,   # MODE_1280_200_ROI validated floor (CLAUDE.md)
+PIXEL_ARRAY_HEIGHT = 800  # full sensor height, in real sensor rows -- used for
+                            # centering math regardless of mode; unaffected by
+                            # horizontal binning since these modes never bin
+                            # vertically (only 0x3814/0x3815 subsample columns)
+# 'h' cycle order: full sensor -> half-tier binned -> quarter-tier binned -> full.
+# Binned (640-wide), not unbinned (1280-wide) -- the unbinned windowed-crop
+# modes invert bright point sources under sustained streaming (see CLAUDE.md),
+# the binned ones are confirmed clean and are also faster.
+SIZES = [(1280, 800), (640, 200), (640, 100)]
+FRAME_DURATION_US_BY_SIZE = {
+    (1280, 800): 6000,  # full sensor -- conservative, floor not characterized
+    (640, 200): 1800,   # MODE_640_200_ROI validated floor (CLAUDE.md)
+    (640, 100): 1050,   # MODE_640_100_ROI validated floor (CLAUDE.md)
 }
 
 MIN_BLOB_AREA_PX = 15  # ignore contours smaller than this -- rejects single
@@ -136,7 +151,7 @@ def configure_and_start(cam, index, raw_size):
 
     cam.start()
 
-    frame_duration_us = FRAME_DURATION_US_BY_HEIGHT[raw_size[1]]
+    frame_duration_us = FRAME_DURATION_US_BY_SIZE[raw_size]
     controls = {
         "FrameDurationLimits": (frame_duration_us, frame_duration_us),
         "AeEnable": False,
@@ -153,7 +168,7 @@ def configure_and_start(cam, index, raw_size):
 
 def make_camera(index):
     cam = Picamera2(index)
-    configure_and_start(cam, index, (WIDTH, HEIGHTS[0]))
+    configure_and_start(cam, index, SIZES[0])
     return cam
 
 
@@ -177,14 +192,14 @@ def apply_y_start(index, target):
 
 
 def cycle_height():
-    """Step to the next ROI height, reconfiguring every camera, then --
-    for the two ROI-adjustable heights -- center each camera's new window
+    """Step to the next mode/size, reconfiguring every camera, then --
+    for the two ROI-adjustable tiers -- center each camera's new window
     on wherever ITS OWN beam centroid was last seen (falling back to the
     sensor center if no beam has been detected yet this session)."""
-    global height_idx
-    height_idx = (height_idx + 1) % len(HEIGHTS)
-    new_height = HEIGHTS[height_idx]
-    new_size = (WIDTH, new_height)
+    global size_idx
+    size_idx = (size_idx + 1) % len(SIZES)
+    new_size = SIZES[size_idx]
+    new_height = new_size[1]
 
     for i, cam in zip(indices, cams):
         cam.stop()
@@ -202,7 +217,7 @@ def cycle_height():
         apply_y_start(i, int(round(center - new_height / 2)))
 
     tag = "full sensor" if new_height == PIXEL_ARRAY_HEIGHT else "centered on last beam position"
-    print(f"ROI height -> {new_height} ({tag})  y_starts={y_starts}")
+    print(f"mode -> {new_size[0]}x{new_size[1]} ({tag})  y_starts={y_starts}")
 
 
 def find_beam_blob(frame):
@@ -273,16 +288,16 @@ def draw_reticle(img, center, radius):
     stroke(cv2.circle, (cx, cy), 3, color=dot_color, thickness=-1)
 
 
-print(f"\nOpening {len(indices)} camera(s)... RAW_SIZE={(WIDTH, HEIGHTS[0])}")
+print(f"\nOpening {len(indices)} camera(s)... RAW_SIZE={SIZES[0]}")
 cams = [make_camera(i) for i in indices]
 
-window_names = [f"Camera {i} -- h: cycle ROI height, q: quit" for i in indices]
+window_names = [f"Camera {i} -- h: cycle mode, q: quit" for i in indices]
 for i, name in zip(indices, window_names):
     cv2.namedWindow(name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(name, WIDTH, HEIGHTS[0])
+    cv2.resizeWindow(name, *SIZES[0])
 
-height_idx = 0
-raw_sizes = {i: (WIDTH, HEIGHTS[0]) for i in indices}
+size_idx = 0
+raw_sizes = {i: SIZES[0] for i in indices}
 y_starts = {i: 0 for i in indices}
 last_centroid_abs_y = {i: None for i in indices}  # real sensor row, updated
                                                      # whenever a blob is found
@@ -290,7 +305,7 @@ fps_history = {i: deque(maxlen=FPS_WINDOW) for i in indices}
 last_display_time = {i: 0.0 for i in indices}
 last_waitkey_time = 0.0
 
-print("Streaming -- 'h' cycles ROI height (800 -> 400 -> 200 -> 800), 'q' quits.\n")
+print("Streaming -- 'h' cycles mode (1280x800 -> 640x200 -> 640x100 -> 1280x800), 'q' quits.\n")
 
 try:
     while True:
@@ -317,8 +332,9 @@ try:
             if found is not None:
                 cx, cy, radius = found
                 # y_starts[i] maps frame-local row -> real sensor row --
-                # valid 1:1 since every mode here is unbinned at full
-                # 1280 width, only the vertical window offset changes.
+                # valid 1:1 regardless of horizontal binning, since these
+                # modes never bin vertically, only the window's y offset
+                # changes.
                 last_centroid_abs_y[i] = y_starts[i] + cy
 
                 marker_pt = (int(round(cx)), int(round(cy)))
