@@ -1079,6 +1079,22 @@ Also note: 2 spare Raspberry Pis + 2 spare cameras have been ordered. Ribbon
 cable is printed "HBV-Raspberry-160FPC" — useful search string for exact
 camera module matching if needed later.
 
+**New finding (2026-07-15): camera 0 (`i2c@88000`) failed to probe at this
+boot.** While testing `camera_view_tool.py` on the bench, `rpicam-hello
+--list-cameras` and `Picamera2.global_camera_info()` both showed only one
+camera (`i2c@80000`, the previously-flaky one — now enumerating fine and
+renumbered to index 0 in its absence). `dmesg` showed, from very early in
+this boot (~4s in, i.e. not triggered by anything this session did):
+`ov9282 10-0060: fail to write MIPI_CTRL00` / `failed to power-on the
+sensor` / `probe with driver ov9282 failed with error -5` — an I2C
+communication failure at probe time for the sensor on the `i2c@88000`
+controller. `tainted` stayed `4096` throughout (no BUG/Oops), so this is
+almost certainly the same class of marginal-connection issue documented
+above for `i2c@80000` (loose/marginal ribbon seating), just affecting the
+other port/camera this time. Not yet re-seated or rebooted to confirm
+recovery — do that before trusting any single-camera test result as "only
+one camera works now" rather than "only one camera came up THIS boot."
+
 ## Scripts (all at repo root)
 
 - `led_dual_camera_closed_loop_test_mp.py` — **main validated test**, takes
@@ -1104,6 +1120,16 @@ camera module matching if needed later.
   [y_start]`). Clamps `y_start` client-side before it reaches the driver —
   see the "runtime-movable ROI" section above for a driver-side clamp bug
   this fixed.
+- `camera_view_tool.py` — bench alignment viewer: full-sensor (1280x800) or
+  windowed-ROI (1280x400/1280x200) live view with beam centroid tracking.
+  Detects the beam via a raw-value adaptive threshold with a confidence
+  gate (NOT Otsu-on-normalized-8-bit -- that broke down in the narrower ROI
+  crops on the real bench signal, see "Beam detection note" in the script's
+  own docstring for the full story), overlays a reticle (ring + tick marks
+  + center dot) at the intensity-weighted centroid, and shows a live
+  per-camera fps counter. `h` cycles ROI height (800 -> 400 -> 200 -> 800,
+  each a full stop/reconfigure/start) and auto-centers each new window on
+  wherever that camera's beam was last confidently seen. `q` quits.
 - `roi_live_demo.py` — interactive live demo: both camera ROI feeds side by
   side with a live fps overlay, independent per-camera control (`1`/`2`
   picks the active camera, `w`/`s` move its ROI while streaming, `r`
