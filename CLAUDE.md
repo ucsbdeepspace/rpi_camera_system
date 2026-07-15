@@ -9,6 +9,331 @@ don't let it drift from what's actually true. Full prior conversation history
 (pre-2026-07-08) is archived in `docs/archive/handoff_conversation_2026-07-08.txt`
 for context, but treat *this* file as authoritative, not the archive.
 
+## RESOLVED (practically, not root-caused to a fix): unbinned ROI modes invert bright point sources — root cause pinpointed, use binned modes instead (2026-07-15)
+
+**Skip to "Practical resolution" below for the bottom line: use
+`MODE_640_200_ROI`/`MODE_640_100_ROI` (binned), not the unbinned ROI modes,
+for all real work.** The mechanism is now understood (a continuously-active
+internal sensor auto-calibration engine, triggered by locked frame duration
+near the unbinned windowed-crop modes' rated ceiling) but is not fixable via
+register override — see "Root cause pinpointed" and "Practical resolution"
+below for the full investigation. Original bug report preserved below for
+history.
+
+**While using `camera_view_tool.py` on the bench against a real laser beam
+(through a beamsplitter), the user noticed every mode except full-sensor
+looked visibly inverted and noisier.** Confirmed and isolated with a direct
+diagnostic (captured full-sensor + each ROI mode, both at `y_start=0` and
+at a `y_start` moved to bracket the beam's known row, cam 0 only —
+`i2c@88000`/cam 1 unavailable this session, see "Hardware status"):
+
+- **`MODE_640_200_ROI` and `MODE_640_100_ROI` (binned, 640-wide) are
+  clean** even with `y_start` moved onto the beam: the beam shows up
+  correctly as a bright peak (max 65280 / 60416, matching the full-sensor
+  peak scale) at the column its binned (2:1) position predicts (~col
+  426-427, i.e. full-sensor col ~852 halved) — no inversion, background
+  stays at a normal, flat level.
+- **`MODE_1280_400_ROI` and `MODE_1280_200_ROI` (unbinned, 1280-wide) show
+  a real inversion once the window is moved onto the beam's actual row**:
+  the column where the beam physically sits (confirmed via full-sensor
+  capture: peak at row 409, col 851) becomes the **darkest** feature in the
+  frame instead of the brightest — e.g. `1280x200` at `y_start=288`: that
+  column's mean drops to 448 while the surrounding background sits around
+  4057. At `y_start=0` (beam not in that window) no such feature appears,
+  so this needed a moved window bracketing the real beam row to catch —
+  the earlier per-mode "frame content validated clean" checks (see the
+  `MODE_1280_400_ROI` and quarter-tier sections below) used gradient/room
+  scenes and LED blinks, never a genuinely saturating focused point
+  source, which is almost certainly why this was never caught until now.
+  Background noise (`std`) is also elevated relative to a true flat
+  background in these two modes, matching the user's "noisier" observation.
+- **Root cause not yet found** — prime suspects are the ISP registers
+  already flagged as "copied verbatim from stock `1280x720`, unverified"
+  when these two modes were first added (`TIMING_FORMAT_1/2`,
+  `0x4008/0x4009`, `0x400c/0x400d`, `0x4507/0x4509` — see the
+  `MODE_1280_400_ROI` section below), most likely a black-level-clamp or
+  defect-pixel-correction register misbehaving on a genuinely saturating
+  highlight in the unbinned (not binned) readout path specifically. Not
+  yet root-caused to a specific register or fixed.
+
+**Practical implication until this is fixed**: prefer `MODE_640_200_ROI` /
+`MODE_640_100_ROI` (binned) over `MODE_1280_400_ROI` / `MODE_1280_200_ROI`
+(unbinned) for any real beam-tracking work — the binned modes are
+confirmed clean against an actual bright point source, the unbinned ones
+are not. All four modes' throughput/closed-loop numbers documented
+elsewhere in this file are still accurate as *timing* measurements (LED
+on/off transitions aren't affected by this pixel-value inversion), but the
+unbinned modes' "frame content validated clean" claims should be
+considered superseded by this finding until root-caused.
+
+Diagnostic scripts/frames are in the scratchpad, not committed
+(`diag_inversion.py`/`diag_inversion2.py`, `inv_*.npy`) — rerun against
+cam 0 if re-investigating; cam 1 not yet checked at all for this issue.
+
+### Attempted fix #1 (`TIMING_FORMAT_2` re-latch) — TRIED, CONFIRMED NOT SUFFICIENT (2026-07-15)
+
+Working theory was a stale internal calibration (auto black-level or similar)
+keyed to the window's position at last full mode-select. `ov9282_apply_roi_y_start()`
+was changed (`kernel_patch/ov9282/ov9282.c`, **still uncommitted**) to
+read-modify-write `OV9282_REG_TIMING_FORMAT_2` (unchanged value, just
+re-latched) immediately after every `y_start`/`y_end` write, on both the
+initial-stream path and the live mid-stream `set_selection` path. This was
+based on a manual raw-i2c bisection (bypassing the driver, against an
+already-running stream) that appeared to clear the inversion by rewriting
+that one register.
+
+Built, vermagic/srcversion-matched, depmod-installed, **rebooted in**.
+`tainted` stayed `4096` throughout, no dmesg BUG/Oops.
+
+**Result: does NOT fix it.** User re-tested live with `camera_view_tool.py`
+(which only ever exercises the two unbinned 1280-wide modes via its `h`
+cycle — it has no binned-mode option at all, so "all ROI sizes" in that
+tool *are* the two known-bad modes) and still saw the inversion. Verified
+independently and quantitatively (headless, `i2c@80000` — the only camera
+enumerating this boot, `i2c@88000` failed to probe again, see "Hardware
+status"): with the exact settled-config controls (`ExposureTime=1500`,
+`AnalogueGain=4.0`, `AeEnable=False`, `NoiseReductionMode=0` — **matching
+these exactly turned out to matter**, see caveat below), captured full
+sensor (peak: row 389, col 852, max 49920), then centered `1280x400`
+(`y_start=188`) and `1280x200` (`y_start=288`) on that row:
+
+| mode | y_start | col 852 mean | frame median | frame max |
+|---|---|---|---|---|
+| `1280x400` | 188 | 2368 | 3840 | 5632 |
+| `1280x200` | 288 | 938 | 3840 | 5632 |
+
+Both **still inverted** (the beam column reads darker than background) —
+essentially the same signature as the original finding (`y_start=288`
+matches the original report exactly; col 852 vs. the original's col 851).
+Fix confirmed ineffective, not just "unconfirmed."
+
+**Methodology caveat, worth remembering for next attempt**: an initial
+version of this same headless recheck left camera controls at their
+Picamera2 defaults (auto-exposure on) instead of the settled
+`ExposureTime`/`AnalogueGain`/`AeEnable=False` config, and came back
+"bright (ok)" for both modes — a false negative. Only after matching the
+exact controls `camera_view_tool.py` actually uses did the inversion
+reproduce. **Any future recheck of this bug must fix exposure/gain/AE
+exactly as above** — auto-exposure alone is enough to mask it.
+
+**Not yet tried** (superseded by the root-cause reframing below, see
+"Attempt #2" and "Root cause reframed" — kept here for the historical
+record of what attempt #1 left open): the other flagged-unverified registers
+(`TIMING_FORMAT_1`, `0x4008/0x4009`, `0x400c/0x400d`, `0x4507/0x4509`);
+an edge-triggered write (0 then back to original, rather than a same-value
+rewrite) in case whatever internal routine needs a transition, not just a
+rewrite; and re-confirming the original manual raw-i2c bisection that
+seemed to implicate `TIMING_FORMAT_2` in the first place, in case that was
+a confound rather than a real signal. A working, fast, quantitative
+headless repro now exists (this recheck script, scratchpad-only, rebuild
+per the pattern above) — future bisection attempts should use it instead
+of relying on live visual inspection through `camera_view_tool.py`, and
+must include the exact control set noted above. `i2c@88000` (the camera
+the original bug was found on) has still never been tested against this
+fix at all — only `i2c@80000` has, since that's the only camera that
+enumerated this boot.
+
+### Attempted fix #2 (`TIMING_FORMAT_1` re-latch, isolated from `_2`) — TRIED, CONFIRMED NOT SUFFICIENT (2026-07-15)
+
+Found already implemented in the working tree at the start of this session
+(uncommitted, `kernel_patch/ov9282/ov9282.c` ~line 1299,
+`ov9282_apply_roi_y_start()`): replaced the `TIMING_FORMAT_2` relatch from
+attempt #1 with a read-modify-write of `OV9282_REG_TIMING_FORMAT_1` instead,
+same call site, same "re-latch after every y_start/y_end write" idea. Built,
+vermagic/srcversion-matched, depmod-installed, **rebooted in** (this is the
+build that was live when this session started). `tainted` stayed `4096`
+throughout, no dmesg BUG/Oops. `i2c@88000` (the camera the bug was
+originally found on) still fails to probe this boot (`fail to write
+MIPI_CTRL00` at ~3.3s in dmesg) — this fix has still never been tested
+against that camera, only `i2c@80000`.
+
+**User re-tested live with `camera_view_tool.py` after rebooting and still
+saw the inversion.** Initial quantitative headless rechecks (single capture
+1-2 frames after a pre-stream or mid-stream `y_start` move, same pattern as
+attempt #1's recheck) came back clean (bright, not inverted) on both
+`1280x400` and `1280x200` — an apparent contradiction with the live
+observation. Screenshotting the actual live `camera_view_tool.py` process
+(launched on the real display, driven with `xdotool`, same method used to
+validate `roi_live_demo.py`) resolved it: the live tool's window showed a
+clear dark blob (the beam, inverted) at `1280x400`/`y_start=200` — the bug
+was real and reproducing, the headless single-frame recheck was just not
+long-running enough to catch it. See "Root cause reframed" below for what
+actually explains the discrepancy.
+
+### Root cause reframed: NOT about `y_start`/window position at all (2026-07-15)
+
+Both attempted fixes were built on the theory that something is "stale,
+keyed to the window's position at last full mode-select" — i.e. that
+*moving* the crop is what breaks the calibration. **That theory is now
+disproven.** Isolating the discrepancy between the clean single-frame
+headless recheck and the inverted live-tool screenshot (both against the
+identical attempt-#2-patched build, camera 0/`i2c@80000`) found:
+
+- The inversion is **not immediate** — it's a transient that develops over
+  a handful of frames. Capturing continuously after a mode/ROI change:
+  frames 0-4 read correctly bright (matching the full-sensor peak), then by
+  frame ~5 the signal collapses to near-background and **stays collapsed**
+  for as long as capture continues (tested to 40 consecutive frames).
+- **The trigger is a locked `FrameDurationLimits` control** (`(N, N)`,
+  i.e. min==max), not the ROI move. Isolated with paired tests (same mode,
+  same beam, only this one control toggled): unbinned windowed-crop modes
+  stay clean indefinitely (tested to 60 consecutive frames) with
+  `FrameDurationLimits` left unset (free-running), and reliably collapse by
+  frame ~5 with it locked to the mode's own validated floor duration
+  (`3400µs` for `1280x400`, matching what `camera_view_tool.py` and every
+  throughput/closed-loop test script in this project actually sets). The
+  presence/absence of a second (`main`) ISP-processed stream alongside the
+  raw stream made no difference either way — ruled out as a factor.
+- **Moving `y_start` is not required to trigger it at all.** Confirmed
+  directly: `1280x400` left at its untouched compile-time-default
+  `y_start=0` (which already brackets the bench beam's actual row, ~386-389,
+  since 0 < 400) — no `set_selection` call made, ever — still collapses by
+  frame ~5 once `FrameDurationLimits` is locked (35/40 frames inverted in
+  one run). This is the same signature, same magnitude, as every
+  `y_start`-moved case previously documented. The entire "keyed to last
+  mode-select position" framing behind both attempted fixes was addressing
+  a mechanism that isn't actually what's happening.
+- **Confirmed specific to the windowed-crop unbinned modes, not "any
+  unbinned mode."** The stock, uncropped `1280x800` mode (fully unbinned,
+  full sensor height, no shrunk-window register set) does **not** collapse
+  even after ~2s/hundreds of frames with `FrameDurationLimits` locked —
+  ruling out "unbinned readout in general" as the trigger. This points back
+  at something specific to the windowed-crop register set shared by
+  `MODE_1280_400_ROI`/`MODE_1280_200_ROI` (the same registers flagged
+  "copied verbatim from `1280x720`, unverified" when these modes were first
+  added), not at unbinned readout as a general concept.
+- **Binned modes remain genuinely clean, now under a much more sustained
+  check than before.** `MODE_640_200_ROI` at its own validated floor
+  (`1800µs`, locked `FrameDurationLimits`) stayed bright/correct across 60
+  consecutive frames, 0 inverted — the existing "prefer binned modes"
+  guidance holds and is now validated against sustained running, not just
+  the original single-frame-after-a-move check.
+- Attempt #2's `TIMING_FORMAT_1` relatch does **not** prevent this — it was
+  active (installed, loaded) throughout every test above that showed the
+  collapse.
+
+**Practical implication, updated**: the "prefer binned modes" guidance from
+the original bug-found note stands, now on stronger evidence. For anyone
+touching the unbinned ROI modes: the failure mode is specifically "run it
+for more than a few frames at a locked/fixed frame duration" — a quick
+single-frame sanity check (as most of this project's earlier "frame content
+validated clean" checks were) will **not** catch this; a sustained
+multi-frame check with `FrameDurationLimits` actually locked is required to
+see it at all. Since essentially every real usage in this project (any
+throughput sweep, any closed-loop test, `camera_view_tool.py`,
+`roi_live_demo.py`) locks `FrameDurationLimits` to hit a target fps and runs
+for much longer than 5 frames, **this bug has almost certainly been present
+in every unbinned-ROI-mode run in this project's history**, silently, just
+never caught because those tests only check LED on/off timing deltas, never
+absolute frame content.
+
+### Root cause pinpointed via register-diff diagnostic — mechanism identified, NOT fixable by register override (2026-07-15)
+
+Rather than continue guessing which register to rewrite (both prior
+attempts did exactly that and failed), built a diagnostic that reads the
+sensor's own register values via raw i2c (bypassing the driver, `smbus2`
+burst reads on bus 11 addr 0x60 — `i2c@80000`) before and after the
+collapse, and diffs them. Any register that changes value on its own is
+either the mechanism or directly downstream of it — this is real signal, not
+a guess.
+
+**Methodology pitfall found and fixed first**: an initial version of this
+diff was contaminated — the "before" snapshot was taken too soon after
+`cam.start()`/reconfigure, catching the sensor still mid mode-transition
+(the already-documented "`cam.start()` can return before the driver
+finishes settling into the new pad format" quirk, same one
+`roi_live_demo.py`'s `apply_y_start` retry-loop works around). That first
+diff showed ~22 "changed" registers, almost all of which were just old-mode
+vs. new-mode differences, not genuine runtime drift. Fixed by polling
+`0x380a`/`0x380b` (output height) until it actually read back the new
+mode's value before trusting the "before" dump. With that fix:
+
+- **None of the previously-flagged registers actually drift.**
+  `TIMING_FORMAT_1`/`_2`, `0x4008/0x4009`, `0x400c/0x400d`, `0x4507/0x4509`
+  hold constant between the genuinely-settled "before" state and the
+  collapsed "after" state — continuing to bisect that list would have been
+  chasing artifacts of the settling bug, not the real mechanism. (They also
+  never appeared as real drift once decontaminated, which is consistent
+  with the two full attempts of re-latching `TIMING_FORMAT_2`/`_1` doing
+  nothing.)
+- **The real drift**: `0x380e`/`0x380f` (VTS, frame length) drops from
+  `0x038e` (910, matching the mode's native/rated-max-fps value) to `0x01bc`
+  (444) partway through streaming — consistent with `FrameDurationLimits`
+  landing a few frames after `start()` (normal libcamera control-queueing
+  lag) and the driver/ISP recomputing VTS to match. `TIMING_FORMAT_1`/`_2`
+  and `0x3830`/`0x3831` change alongside it, most likely as an automatic
+  side effect of VTS changing (same bit pattern shift in both timing-format
+  registers), not independently significant.
+- **The actual smoking gun**: `0x4061, 0x4063, 0x4065, 0x4067, 0x4069,
+  0x406b, 0x406d, 0x406f` (and `0x4073`) go from all-zero to populated with
+  real, non-zero values at exactly the same moment the image collapses —
+  the signature of an internal auto-calibration engine (black-level or
+  defect-pixel correction, matching the sensor's own product-brief language)
+  computing and writing its output for the first time.
+
+**Tested whether this is fixable by direct override — it is not**:
+
+- **`0x4061` is read-only in practice.** Wrote `0x00` to it while streaming;
+  the *immediate* readback (before another frame could even elapse) already
+  showed `0x40` again — confirmed this isn't a timing artifact by also
+  checking one frame later (still `0x40`). The sensor's internal engine is
+  continuously re-driving this register's value; it is a live status/output
+  register, not a configuration register writable via i2c poke.
+- **`0x380e`/`0x380f` (VTS) writes DO land and hold** (confirmed: write
+  `0x038e`, immediate and one-frame-later readback both `0x038e`) — but
+  forcibly pinning VTS to its native value does **not** prevent the
+  collapse (tested standalone and combined with zeroing the correction
+  block; image still collapsed at frame ~5 in every combination). VTS
+  changing is a correlated symptom, not the lever.
+- Net: the mechanism is a genuine, continuously-active internal
+  auto-calibration engine specific to the windowed-crop unbinned register
+  set, triggered by running near the mode's rated frame-duration ceiling,
+  and its output cannot be overridden from outside — there would need to be
+  a separate enable/disable bit for the engine itself, and nothing in the
+  scanned register blocks (`0x3800-0x38ff`, `0x4000-0x40ff`,
+  `0x4500-0x45ff`) is it. Finding such a bit with no datasheet would mean an
+  untargeted scan of the sensor's full register space with no more specific
+  leads than "somewhere else, unknown" — materially worse odds than the
+  targeted search just completed. **This is the point of diminishing
+  returns for a register-level fix**, absent a real OmniVision datasheet or
+  vendor contact.
+
+### Practical resolution: safe-duration envelope exists but isn't competitive with binned modes — use binned modes (2026-07-15)
+
+Since the trigger is specifically "locked frame duration near the mode's
+rated ceiling," swept `MODE_1280_200_ROI` (the only unbinned ROI mode that
+was ever a genuine speed win — `MODE_1280_400_ROI` was already documented
+as no faster than stock) across a range of locked durations, checking 20
+consecutive frames for inversion at each:
+
+| duration | rated fps | 20-frame result |
+|---|---|---|
+| 1775µs (documented floor) | 563.4 | **collapsed from frame 0** (20/20) |
+| 2000µs | 500.0 | clean |
+| 2200-6000µs | 454.5-166.7 | clean |
+
+So a genuinely safe operating point does exist (≥2000µs) — but it's not
+useful in practice: real measured throughput at 2000µs (`camera_throughput_test.py`,
+solo) is **478.26fps**, *slower* than the already-clean, already-validated
+`MODE_640_200_ROI` (binned) at its own floor (**~527-531fps achieved**,
+1800µs). The entire value proposition of the unbinned quarter-tier mode —
+being faster than the binned alternative — evaporates once it's restricted
+to a duration slow enough to avoid this bug. There is no setting where
+`MODE_1280_200_ROI` is simultaneously bug-free and faster than
+`MODE_640_200_ROI`.
+
+**Verdict**: don't chase a safe-but-competitive unbinned setting further.
+Use the binned modes (`MODE_640_200_ROI`, `MODE_640_100_ROI`) for all real
+beam-tracking work — they're faster *and* clean, with no caveats needed.
+The unbinned windowed-crop modes (`MODE_1280_400_ROI`, `MODE_1280_200_ROI`)
+should be treated as validated-broken-at-useful-speeds and not used for
+real work; kept in the driver for reference/future investigation only.
+
+Diagnostic scripts from this session (register-diff, intervention tests,
+duration sweeps) are scratchpad-only, not committed — rerun against camera
+0 (`i2c@80000`) if re-investigating; `i2c@88000` still not tested at all
+(fails to probe this boot).
+
 ## DONE: quarter-tier ROI modes (`MODE_1280_200_ROI`, `MODE_640_100_ROI`) — validated, NOT YET COMMITTED (2026-07-14)
 
 Pushed the `y_end = height + 15` windowing trick one step past the existing
