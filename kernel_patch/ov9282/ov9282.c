@@ -1259,7 +1259,7 @@ static int ov9282_get_selection(struct v4l2_subdev *sd,
  * ov9282_apply_roi_y_start() - Push the current roi_y_start to the sensor
  * @ov9282: pointer to ov9282 device
  *
- * Writes only the two registers that encode vertical window position
+ * Writes the two registers that encode vertical window position
  * (0x3802/0x3803 y_start, 0x3806/0x3807 y_end), leaving every other
  * mode register (binning, output size, ISP offsets, timing) exactly as
  * ov9282_start_streaming() already wrote them for cur_mode. Reuses the
@@ -1269,6 +1269,29 @@ static int ov9282_get_selection(struct v4l2_subdev *sd,
  * y_start here is a new, hardware-unverified extrapolation of that
  * pattern until checked against a captured frame.
  *
+ * Also re-latches OV9282_REG_TIMING_FORMAT_1 (read back, write back
+ * unchanged) after the move -- second candidate in an ongoing bisection of
+ * a stale-calibration bug (2026-07-15, against a real saturating laser
+ * beam on the bench): moving y_start live via only the two window
+ * registers above left something keyed to the window's position at the
+ * last full mode select, causing genuinely bright columns to invert to
+ * near-black once the window moved away from y_start=0. A prior attempt
+ * re-latched TIMING_FORMAT_2 instead (informally believed to work from a
+ * manual raw-i2c poke against a running stream) but was quantitatively
+ * retested with a headless repro script under the exact settled-config
+ * controls (ExposureTime=1500, AnalogueGain=4.0, AeEnable=False,
+ * NoiseReductionMode=0 -- matching these turned out to matter, an
+ * auto-exposure default masked the bug entirely in one retest) and
+ * confirmed NOT sufficient -- see CLAUDE.md's "Attempted fix #1" note.
+ * This is attempt #2, testing TIMING_FORMAT_1 in isolation (not combined
+ * with _2) for a clean bisection result. Exact internal mechanism is
+ * undocumented (no public OV9281/OV9282 register-level datasheet -- only
+ * product briefs mentioning "automatic black level calibration" in
+ * general terms). Read-modify-write (not a hardcoded mode default) so
+ * this doesn't clobber a separately applied V4L2_CID_VFLIP setting, which
+ * lives in the same register (OV9282_FLIP_BIT) -- see
+ * ov9282_set_ctrl_vflip().
+ *
  * Must be called with ov9282->mutex held and the sensor powered on.
  *
  * Return: 0 if successful, error code otherwise.
@@ -1277,13 +1300,24 @@ static int ov9282_apply_roi_y_start(struct ov9282 *ov9282)
 {
 	u32 y_start = ov9282->roi_y_start;
 	u32 y_end = y_start + ov9282->cur_mode->crop.height + 15;
+	u32 timing_format_1;
 	int ret;
 
 	ret = ov9282_write_reg(ov9282, 0x3802, 2, y_start);
 	if (ret)
 		return ret;
 
-	return ov9282_write_reg(ov9282, 0x3806, 2, y_end);
+	ret = ov9282_write_reg(ov9282, 0x3806, 2, y_end);
+	if (ret)
+		return ret;
+
+	ret = ov9282_read_reg(ov9282, OV9282_REG_TIMING_FORMAT_1, 1,
+			      &timing_format_1);
+	if (ret)
+		return ret;
+
+	return ov9282_write_reg(ov9282, OV9282_REG_TIMING_FORMAT_1, 1,
+				timing_format_1);
 }
 
 /**
