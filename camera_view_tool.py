@@ -60,13 +60,20 @@ Controls:
       wherever that camera's beam centroid was last seen, no manual
       re-aiming needed. Full sensor isn't ROI-adjustable, so cycling back to
       it is just a mode switch with no centering step.
-  t   toggle auto-track: while on, every TRACK_EVERY_N_FRAMES confident
-      detections the ROI is re-centered on the current centroid (a live
-      set_selection push, same mechanism as the initial mode-switch
-      centering, just repeated continuously instead of once). Has no effect
-      in full-sensor mode (nothing to move). Gated on the ~15Hz throttled
-      analysis loop, not raw capture rate -- each recenter is a v4l2-ctl
-      subprocess round-trip, far too slow to do at full capture fps.
+  t   toggle auto-track: while on, the ROI is re-centered on the current
+      centroid at most every ANALYSIS_INTERVAL_S (a live set_selection
+      push, same mechanism as the initial mode-switch centering, just
+      repeated continuously instead of once). Has no effect in full-sensor
+      mode (nothing to move). Detection and recentering both run on their
+      own ~20Hz throttle, decoupled from both the raw capture rate
+      (find_beam_blob is too expensive to run on every one of 500-900
+      frames/sec) and the ~15Hz display throttle (tying auto-track to that
+      was the original "why is this so slow" bug). Each recenter blocks the
+      capture loop for ~7-10ms (a v4l2-ctl subprocess call), so tracking
+      does cost some fps while active -- measured ~525fps -> ~220-230fps at
+      the old 50Hz rate; 20Hz keeps that hit much smaller. See
+      ANALYSIS_INTERVAL_S if you want to trade responsiveness for fps or
+      vice versa.
   q   quit
 
 Capture runs unconditionally every loop iteration (this is what the fps
@@ -98,15 +105,27 @@ RAW_FORMAT = "R8"
 EXPOSURE_US = 1500
 ANALOGUE_GAIN = 4.0
 
-PIXEL_ARRAY_HEIGHT = 800  # full sensor height, in real sensor rows -- used for
-                            # centering math regardless of mode; unaffected by
-                            # horizontal binning since these modes never bin
-                            # vertically (only 0x3814/0x3815 subsample columns)
+PIXEL_ARRAY_HEIGHT = 800  # full sensor height, in real (pre-bin) sensor rows
+
 # 'h' cycle order: full sensor -> half-tier binned -> quarter-tier binned -> full.
 # Binned (640-wide), not unbinned (1280-wide) -- the unbinned windowed-crop
 # modes invert bright point sources under sustained streaming (see CLAUDE.md),
 # the binned ones are confirmed clean and are also faster.
 SIZES = [(1280, 800), (640, 200), (640, 100)]
+# The 640-wide modes bin 2:1 in BOTH dimensions, not just horizontally --
+# confirmed empirically (not assumed): rpicam-hello itself reports 640x200's
+# real sensor crop as 1280x400 (double the output in each axis), and a
+# direct y_start-shift test measured output-row displacement at ~half the
+# requested pre-bin row shift for both 640x200 and 640x100 (ratio 1.94 and
+# 2.00 respectively). This matters because y_start (from roi_set_selection)
+# is in pre-bin sensor rows while a detected centroid's row is in the
+# captured (post-bin) frame's coordinate space -- converting between them
+# needs this ratio, or centering math silently mismatches units by 2x.
+V_BIN_RATIO_BY_SIZE = {
+    (1280, 800): 1,  # full sensor, not ROI-adjustable, ratio unused
+    (640, 200): 2,
+    (640, 100): 2,
+}
 FRAME_DURATION_US_BY_SIZE = {
     (1280, 800): 6000,  # full sensor -- conservative, floor not characterized
     (640, 200): 1800,   # MODE_640_200_ROI validated floor (CLAUDE.md)
@@ -127,10 +146,32 @@ MASK_THRESH_K = 3.0  # once a frame passes the confidence gate, flag pixels
                        # >= median + this * std as part of the beam blob
 FPS_WINDOW = 30
 DISPLAY_INTERVAL_S = 1 / 15  # redraw + poll keys at ~15Hz regardless of capture rate
-TRACK_EVERY_N_FRAMES = 5  # auto-track re-centers after this many confident
-                            # detections (counted in the throttled ~15Hz
-                            # analysis loop, so this is ~every 1/3s at the
-                            # default, not every raw capture frame)
+ANALYSIS_INTERVAL_S = 0.05  # beam detection + auto-track recenter run at most
+                              # this often (~20Hz) -- gated on wall-clock time,
+                              # decoupled from both the raw capture rate
+                              # (500-900fps -- find_beam_blob's median/std/
+                              # contour work is NOT cheap enough to run on
+                              # every one of those frames; measured live:
+                              # doing so dropped 640x200 from ~530fps to
+                              # ~339fps on its own) and from the ~15Hz
+                              # DISPLAY_INTERVAL_S (tying auto-track to the
+                              # display throttle was the original "why is
+                              # this so slow" bug -- ~333ms/correction).
+                              #
+                              # This is a real throughput/responsiveness
+                              # trade-off, not a free decoupling: each
+                              # recenter blocks the single capture loop for
+                              # set_roi_y_start's measured ~7-10ms subprocess
+                              # cost. At 50Hz (0.02s) that's up to ~45% of
+                              # the loop's time when the beam is tracked
+                              # continuously -- measured live, it dropped
+                              # 640x200 from ~525fps to ~220-230fps. 20Hz
+                              # keeps the fps hit much smaller while still
+                              # recentering ~16x faster than the original
+                              # ~333ms bug -- plenty responsive for a bench
+                              # alignment/monitoring tool. Lower this if
+                              # faster tracking matters more than fps for a
+                              # given use, higher if the reverse.
 
 # ── Detect available cameras ────────────────────────────────────────────────
 info = Picamera2.global_camera_info()
@@ -193,6 +234,16 @@ def apply_y_start(index, target):
     """
     max_y_start = get_max_y_start(index)
     expected = max(0, min(target, max_y_start))
+    expected -= expected % 4  # driver rounds down to a 4-row boundary --
+                                # match that here, or a non-aligned target
+                                # (the normal case for a centroid-derived
+                                # value) never matches `expected` and this
+                                # burns all 10 retries (~500ms) every single
+                                # call. Harmless as an occasional one-off
+                                # (cycle_height calls this once per mode
+                                # switch) but catastrophic once auto-track
+                                # started calling it continuously -- found
+                                # live, tanked fps from ~530 to ~6.
     for _ in range(10):
         y_starts[index] = set_roi_y_start(index, target)
         if y_starts[index] == expected:
@@ -218,7 +269,8 @@ def cycle_height():
         raw_sizes[i] = new_size
         cv2.resizeWindow(window_names[i], max(new_size[0], 480), max(new_size[1], 200))
         fps_history[i].clear()
-        track_frame_count[i] = 0
+        last_analysis_time[i] = 0.0
+        last_found[i] = None
 
     for i in indices:
         if new_height == PIXEL_ARRAY_HEIGHT:
@@ -226,7 +278,11 @@ def cycle_height():
             continue
         center = last_centroid_abs_y[i] if last_centroid_abs_y[i] is not None \
             else PIXEL_ARRAY_HEIGHT // 2
-        apply_y_start(i, int(round(center - new_height / 2)))
+        # Half the PRE-BIN crop height, not half the output height -- the
+        # window spans new_height * V_BIN_RATIO real sensor rows even
+        # though only new_height rows come out the other end.
+        pre_bin_height = new_height * V_BIN_RATIO_BY_SIZE[new_size]
+        apply_y_start(i, int(round(center - pre_bin_height / 2)))
 
     tag = "full sensor" if new_height == PIXEL_ARRAY_HEIGHT else "centered on last beam position"
     print(f"mode -> {new_size[0]}x{new_size[1]} ({tag})  y_starts={y_starts}")
@@ -317,7 +373,13 @@ fps_history = {i: deque(maxlen=FPS_WINDOW) for i in indices}
 last_display_time = {i: 0.0 for i in indices}
 last_waitkey_time = 0.0
 auto_track = False
-track_frame_count = {i: 0 for i in indices}
+last_analysis_time = {i: 0.0 for i in indices}
+last_found = {i: None for i in indices}  # most recent find_beam_blob() result
+                                            # per camera, so the (throttled)
+                                            # display block always has
+                                            # something to draw even on
+                                            # iterations where detection
+                                            # itself didn't run
 
 print("Streaming -- 'h' cycles mode (1280x800 -> 640x200 -> 640x100 -> 1280x800), "
       "'t' toggles auto-track, 'q' quits.\n")
@@ -332,6 +394,34 @@ try:
             now = time.monotonic()
             fps_history[i].append(now)
 
+            # Beam detection + auto-track recenter run on their own ~20Hz
+            # throttle (ANALYSIS_INTERVAL_S) -- fast enough to keep up with
+            # a moving beam, but decoupled from both the raw capture rate
+            # (find_beam_blob is too expensive to run on every one of
+            # 500-900 frames/sec, measured live) and the ~15Hz display
+            # throttle below (tying auto-track to that was the original
+            # "why is this so slow" bug: ~333ms/correction).
+            if now - last_analysis_time[i] >= ANALYSIS_INTERVAL_S:
+                last_analysis_time[i] = now
+                last_found[i] = find_beam_blob(frame)
+                if last_found[i] is not None:
+                    cx, cy, radius = last_found[i]
+                    # cy is in the captured (post-bin) frame's row space;
+                    # y_starts[i] is in real pre-bin sensor rows. The
+                    # 640-wide modes bin 2:1 vertically as well as
+                    # horizontally (confirmed empirically, see
+                    # V_BIN_RATIO_BY_SIZE), so cy must be scaled up to
+                    # pre-bin rows before adding -- treating them as the
+                    # same unit was a real bug (silently off by 2x) until
+                    # this was checked.
+                    v_bin = V_BIN_RATIO_BY_SIZE[raw_sizes[i]]
+                    last_centroid_abs_y[i] = y_starts[i] + cy * v_bin
+
+                    if auto_track and raw_sizes[i][1] != PIXEL_ARRAY_HEIGHT:
+                        pre_bin_height = raw_sizes[i][1] * v_bin
+                        target = int(round(last_centroid_abs_y[i] - pre_bin_height / 2))
+                        apply_y_start(i, target)
+
             if now - last_display_time[i] < DISPLAY_INTERVAL_S:
                 continue
             last_display_time[i] = now
@@ -343,27 +433,13 @@ try:
             cv2.normalize(frame, norm, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
             display = cv2.cvtColor(norm, cv2.COLOR_GRAY2BGR)
 
-            found = find_beam_blob(frame)
-            if found is not None:
-                cx, cy, radius = found
-                # y_starts[i] maps frame-local row -> real sensor row --
-                # valid 1:1 regardless of horizontal binning, since these
-                # modes never bin vertically, only the window's y offset
-                # changes.
-                last_centroid_abs_y[i] = y_starts[i] + cy
-
+            if last_found[i] is not None:
+                cx, cy, radius = last_found[i]
                 marker_pt = (int(round(cx)), int(round(cy)))
                 draw_reticle(display, marker_pt, radius)
                 cv2.putText(display, f"({cx:.1f}, {cy:.1f})",
                             (marker_pt[0] + 12, marker_pt[1] - 12),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
-
-                if auto_track and raw_sizes[i][1] != PIXEL_ARRAY_HEIGHT:
-                    track_frame_count[i] += 1
-                    if track_frame_count[i] >= TRACK_EVERY_N_FRAMES:
-                        track_frame_count[i] = 0
-                        target = int(round(last_centroid_abs_y[i] - raw_sizes[i][1] / 2))
-                        apply_y_start(i, target)
 
             hist = fps_history[i]
             fps = (len(hist) - 1) / (hist[-1] - hist[0]) if len(hist) > 1 and hist[-1] != hist[0] else 0.0
@@ -403,7 +479,7 @@ try:
             elif key == ord('t'):
                 auto_track = not auto_track
                 for i in indices:
-                    track_frame_count[i] = 0
+                    last_analysis_time[i] = 0.0
                 print(f"auto-track {'ON' if auto_track else 'OFF'}")
         if quit_requested:
             break
