@@ -44,23 +44,25 @@ Nucleo hardware (none present this session):
   subprocess overhead, ~7-10ms/call elsewhere in this project, is fine for
   an occasional ROI move but not a per-frame tracking send).
 
-**Blocking issue: no header I2C bus is enabled on this Pi yet.**
-Confirmed 2026-07-15 via `ls /sys/bus/i2c/devices/` — only the two camera
-control buses (`i2c@88000`/`i2c@80000`) and two RP1-internal buses exist.
-`NUCLEO_I2C_BUS`/`NUCLEO_I2C_ADDR` in `nucleo_i2c_sender.py` are
-placeholders. To bring a general-purpose bus up: add `dtparam=i2c_arm=on`
-under `[all]` in `/boot/firmware/config.txt`, reboot, then confirm the
-actual bus number with `i2cdetect -l` — RP1 renumbers things, so it may
-not be the classic `/dev/i2c-1` (the cameras enumerate as i2c-10/11 here).
-Must not reuse the camera buses — those are owned by the kernel camera
-driver and this must not contend with them.
+**Header I2C bus — RESOLVED, already enabled, no reboot needed
+(2026-07-15).** The earlier note here ("no header I2C bus is enabled
+yet") turned out to be stale — `dtparam=i2c_arm=on` was already
+uncommented (top-of-file, global scope) in `/boot/firmware/config.txt`,
+and the bus is live *right now*: `/dev/i2c-1` exists, backed by RP1's
+`i2c@74000` controller (confirmed via
+`/proc/device-tree/aliases/i2c1`), and `sudo i2cdetect -y 1` scans clean
+(responds, no devices — expected with no Nucleo wired up). Despite RP1
+renumbering the camera buses to i2c-10/11, the header bus kept the
+classic `i2c-1` number. `NUCLEO_I2C_BUS = 1` in `nucleo_i2c_sender.py` is
+now confirmed correct, not a placeholder — updated in-file.
+`NUCLEO_I2C_ADDR` is still a placeholder pending real Nucleo firmware.
 
-**Next steps**: (1) enable the header I2C bus and find its real number,
-(2) get real Nucleo hardware into a session and update the placeholder
-bus/addr, (3) validate `NucleoLink.send_position` against it (the
+**Next steps**: (1) get real Nucleo hardware into a session and set the
+real `NUCLEO_I2C_ADDR` to match its firmware's configured slave address,
+(2) validate `NucleoLink.send_position` against it (the
 `__main__` block in `nucleo_i2c_sender.py` sends a slowly-orbiting fake
 position for exactly this — no real beam needed to smoke-test the link),
-(4) implement/confirm the matching packet parser on the Nucleo firmware
+(3) implement/confirm the matching packet parser on the Nucleo firmware
 side (checksum, packet layout, and stale-timeout policy must match this
 Python side exactly — not written yet, out of scope of this repo).
 

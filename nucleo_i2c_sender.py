@@ -29,16 +29,18 @@ tracking send.
 
 Requires a GENERAL-PURPOSE i2c bus, not the camera control buses
 (i2c@88000/i2c@80000) -- those are owned by the kernel camera driver and
-this must not contend with it. On this Pi 5, no header I2C bus is enabled
-yet (confirmed 2026-07-15: only the two camera buses and two RP1-internal
-buses exist, `ls /sys/bus/i2c/devices/`). To bring one up: add
-`dtparam=i2c_arm=on` under the `[all]` section of /boot/firmware/config.txt,
-reboot, then confirm the actual bus number with `i2cdetect -l` -- it may
-not be /dev/i2c-1 as on older Pis, since RP1 renumbers things (the cameras
-enumerate as i2c-10/11 here, not the classic i2c-0/1).
+this must not contend with it. On this Pi 5, the header I2C bus is enabled
+via `dtparam=i2c_arm=on` (already uncommented, top-of-file/global scope,
+in /boot/firmware/config.txt) and confirmed live at `/dev/i2c-1` (backed
+by RP1's `i2c@74000` controller, per
+`/proc/device-tree/aliases/i2c1` -- despite RP1 renumbering the camera
+buses to i2c-10/11, the header bus kept the classic `i2c-1` number).
+Confirmed 2026-07-15 with `sudo i2cdetect -y 1`: bus responds, scans clean
+(no devices -- expected with no Nucleo wired up yet).
 
-NUCLEO_I2C_BUS/NUCLEO_I2C_ADDR below are placeholders -- update them once
-the bus is enabled and the Nucleo firmware's own address is fixed.
+NUCLEO_I2C_ADDR below is still a placeholder -- update it once the Nucleo
+firmware's own I2C slave address is fixed. NUCLEO_I2C_BUS=1 is now
+confirmed correct, not a placeholder.
 
 Not yet tested against real hardware -- no Nucleo in this session to
 validate against. Sketch/reference implementation; the checksum, packet
@@ -50,8 +52,7 @@ import time
 
 from smbus2 import SMBus, i2c_msg
 
-NUCLEO_I2C_BUS = 1       # placeholder -- confirm with `i2cdetect -l` after
-                           # enabling dtparam=i2c_arm=on (see module docstring)
+NUCLEO_I2C_BUS = 1       # confirmed 2026-07-15 -- header bus, see module docstring
 NUCLEO_I2C_ADDR = 0x42   # placeholder 7-bit address -- must match the
                            # Nucleo firmware's own I2C slave address config
 
