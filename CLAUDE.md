@@ -9,6 +9,61 @@ don't let it drift from what's actually true. Full prior conversation history
 (pre-2026-07-08) is archived in `docs/archive/handoff_conversation_2026-07-08.txt`
 for context, but treat *this* file as authoritative, not the archive.
 
+## IN PROGRESS: streaming beam position to an STM32 Nucleo over I2C — sketch committed, UNTESTED against real hardware (2026-07-15)
+
+First step past pure characterization: closing the loop out to an external
+controller. Two new scripts, both committed but not yet run against real
+Nucleo hardware (none present this session):
+
+- **`beam_position_streamer.py`** — headless companion to
+  `camera_view_tool.py`: capture → detect beam centroid → send, no display,
+  no GTK. Reuses `roi_set_selection.py`'s `apply_y_start`-retry pattern.
+  Beam detection (`find_beam_blob`) is intentionally duplicated from
+  `camera_view_tool.py` rather than imported (that script has no
+  `__main__` guard, so importing it would launch its live viewer) — if the
+  confidence-gate constants are retuned in one script, mirror the change
+  in the other. Measured live on the bench (no display, no ROI writes):
+  **~335fps at 640x200**, no artificial throttle needed — faster than
+  `camera_view_tool.py`'s auto-track mode, which was dominated by its
+  subprocess-based ROI-repositioning cost rather than detection itself.
+  Coordinates sent are real, absolute full-sensor pixels (0-1280/0-800),
+  scaled by each mode's binning ratio, so the Nucleo doesn't need to know
+  which ROI window is active. `--dry-run` mode (detect + print, skip the
+  actual I2C send) **is validated live**; the real-send path is not.
+- **`nucleo_i2c_sender.py`** — the I2C sender: Pi as master, Nucleo as
+  slave (Pi's I2C controllers have weak/awkward slave-mode support, so
+  this direction was chosen deliberately). Small fixed register-mapped
+  packet mirroring the OV9281 driver's own "register pointer + data"
+  convention: `seq` (u8, wraps, lets the Nucleo detect a stale link),
+  `status` (u8, bit0 = beam confidently detected this cycle), `x`/`y`
+  (s16 each), `checksum` (u8, additive sum mod 256 — catches link noise
+  the per-byte I2C ACK wouldn't). `valid=False` still sends a packet
+  (last-known position) rather than going silent, so "beam lost" is an
+  explicit signal, not something the Nucleo can only infer after a
+  timeout. Uses `smbus2` directly, not a `v4l2-ctl` subprocess (that
+  subprocess overhead, ~7-10ms/call elsewhere in this project, is fine for
+  an occasional ROI move but not a per-frame tracking send).
+
+**Blocking issue: no header I2C bus is enabled on this Pi yet.**
+Confirmed 2026-07-15 via `ls /sys/bus/i2c/devices/` — only the two camera
+control buses (`i2c@88000`/`i2c@80000`) and two RP1-internal buses exist.
+`NUCLEO_I2C_BUS`/`NUCLEO_I2C_ADDR` in `nucleo_i2c_sender.py` are
+placeholders. To bring a general-purpose bus up: add `dtparam=i2c_arm=on`
+under `[all]` in `/boot/firmware/config.txt`, reboot, then confirm the
+actual bus number with `i2cdetect -l` — RP1 renumbers things, so it may
+not be the classic `/dev/i2c-1` (the cameras enumerate as i2c-10/11 here).
+Must not reuse the camera buses — those are owned by the kernel camera
+driver and this must not contend with them.
+
+**Next steps**: (1) enable the header I2C bus and find its real number,
+(2) get real Nucleo hardware into a session and update the placeholder
+bus/addr, (3) validate `NucleoLink.send_position` against it (the
+`__main__` block in `nucleo_i2c_sender.py` sends a slowly-orbiting fake
+position for exactly this — no real beam needed to smoke-test the link),
+(4) implement/confirm the matching packet parser on the Nucleo firmware
+side (checksum, packet layout, and stale-timeout policy must match this
+Python side exactly — not written yet, out of scope of this repo).
+
 ## RESOLVED (practically, not root-caused to a fix): unbinned ROI modes invert bright point sources — root cause pinpointed, use binned modes instead (2026-07-15)
 
 **Skip to "Practical resolution" below for the bottom line: use
@@ -1465,6 +1520,16 @@ one camera works now" rather than "only one camera came up THIS boot."
   (`DISPLAY=:0` — this Pi has a real desktop session via `labwc`), not
   runnable headless. `python3 roi_live_demo.py [WxH] [step]`, defaults
   `640x200`, step=20 rows.
+- `beam_position_streamer.py` — headless capture -> detect -> stream to an
+  STM32 Nucleo over I2C, no display. `python3 beam_position_streamer.py
+  [WxH] [--y-start N] [--dry-run]`, defaults to full-sensor 1280x800.
+  Untested against real hardware — see the "streaming beam position"
+  section above.
+- `nucleo_i2c_sender.py` — `NucleoLink` class used by
+  `beam_position_streamer.py` to send the register-mapped position packet
+  over I2C; also runnable standalone for a smoke test (sends a fake
+  orbiting position). Untested against real hardware — see the "streaming
+  beam position" section above.
 - `led_dual_camera_closed_loop_test_single_process.py`,
   `led_dual_camera_closed_loop_test_mp_buf1.py` — comparison baselines,
   already answered their questions, probably don't need to run again
