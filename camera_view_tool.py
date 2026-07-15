@@ -60,6 +60,13 @@ Controls:
       wherever that camera's beam centroid was last seen, no manual
       re-aiming needed. Full sensor isn't ROI-adjustable, so cycling back to
       it is just a mode switch with no centering step.
+  t   toggle auto-track: while on, every TRACK_EVERY_N_FRAMES confident
+      detections the ROI is re-centered on the current centroid (a live
+      set_selection push, same mechanism as the initial mode-switch
+      centering, just repeated continuously instead of once). Has no effect
+      in full-sensor mode (nothing to move). Gated on the ~15Hz throttled
+      analysis loop, not raw capture rate -- each recenter is a v4l2-ctl
+      subprocess round-trip, far too slow to do at full capture fps.
   q   quit
 
 Capture runs unconditionally every loop iteration (this is what the fps
@@ -120,6 +127,10 @@ MASK_THRESH_K = 3.0  # once a frame passes the confidence gate, flag pixels
                        # >= median + this * std as part of the beam blob
 FPS_WINDOW = 30
 DISPLAY_INTERVAL_S = 1 / 15  # redraw + poll keys at ~15Hz regardless of capture rate
+TRACK_EVERY_N_FRAMES = 5  # auto-track re-centers after this many confident
+                            # detections (counted in the throttled ~15Hz
+                            # analysis loop, so this is ~every 1/3s at the
+                            # default, not every raw capture frame)
 
 # ── Detect available cameras ────────────────────────────────────────────────
 info = Picamera2.global_camera_info()
@@ -207,6 +218,7 @@ def cycle_height():
         raw_sizes[i] = new_size
         cv2.resizeWindow(window_names[i], max(new_size[0], 480), max(new_size[1], 200))
         fps_history[i].clear()
+        track_frame_count[i] = 0
 
     for i in indices:
         if new_height == PIXEL_ARRAY_HEIGHT:
@@ -291,7 +303,7 @@ def draw_reticle(img, center, radius):
 print(f"\nOpening {len(indices)} camera(s)... RAW_SIZE={SIZES[0]}")
 cams = [make_camera(i) for i in indices]
 
-window_names = [f"Camera {i} -- h: cycle mode, q: quit" for i in indices]
+window_names = [f"Camera {i} -- h: cycle mode, t: auto-track, q: quit" for i in indices]
 for i, name in zip(indices, window_names):
     cv2.namedWindow(name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(name, *SIZES[0])
@@ -304,8 +316,11 @@ last_centroid_abs_y = {i: None for i in indices}  # real sensor row, updated
 fps_history = {i: deque(maxlen=FPS_WINDOW) for i in indices}
 last_display_time = {i: 0.0 for i in indices}
 last_waitkey_time = 0.0
+auto_track = False
+track_frame_count = {i: 0 for i in indices}
 
-print("Streaming -- 'h' cycles mode (1280x800 -> 640x200 -> 640x100 -> 1280x800), 'q' quits.\n")
+print("Streaming -- 'h' cycles mode (1280x800 -> 640x200 -> 640x100 -> 1280x800), "
+      "'t' toggles auto-track, 'q' quits.\n")
 
 try:
     while True:
@@ -343,11 +358,19 @@ try:
                             (marker_pt[0] + 12, marker_pt[1] - 12),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
 
+                if auto_track and raw_sizes[i][1] != PIXEL_ARRAY_HEIGHT:
+                    track_frame_count[i] += 1
+                    if track_frame_count[i] >= TRACK_EVERY_N_FRAMES:
+                        track_frame_count[i] = 0
+                        target = int(round(last_centroid_abs_y[i] - raw_sizes[i][1] / 2))
+                        apply_y_start(i, target)
+
             hist = fps_history[i]
             fps = (len(hist) - 1) / (hist[-1] - hist[0]) if len(hist) > 1 and hist[-1] != hist[0] else 0.0
             h = raw_sizes[i][1]
             roi_tag = "full sensor" if h == PIXEL_ARRAY_HEIGHT else f"y_start={y_starts[i]}"
-            cv2.putText(display, f"cam {i}: {raw_sizes[i][0]}x{h}  {roi_tag}  {fps:.1f}fps",
+            track_tag = "  [TRACK]" if auto_track and h != PIXEL_ARRAY_HEIGHT else ""
+            cv2.putText(display, f"cam {i}: {raw_sizes[i][0]}x{h}  {roi_tag}  {fps:.1f}fps{track_tag}",
                         (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
 
             cv2.imshow(window_names[i], display)
@@ -377,6 +400,11 @@ try:
                 break
             elif key == ord('h'):
                 cycle_height()
+            elif key == ord('t'):
+                auto_track = not auto_track
+                for i in indices:
+                    track_frame_count[i] = 0
+                print(f"auto-track {'ON' if auto_track else 'OFF'}")
         if quit_requested:
             break
 
