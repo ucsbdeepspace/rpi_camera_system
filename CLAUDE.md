@@ -9,11 +9,28 @@ don't let it drift from what's actually true. Full prior conversation history
 (pre-2026-07-08) is archived in `docs/archive/handoff_conversation_2026-07-08.txt`
 for context, but treat *this* file as authoritative, not the archive.
 
-## IN PROGRESS: streaming beam position to an STM32 Nucleo over I2C — sketch committed, UNTESTED against real hardware (2026-07-15)
+**Repo now lives on GitHub, multi-device work starts here (2026-07-16)**:
+`https://github.com/ucsbdeepspace/rpi_camera_system` (pushed from this Pi,
+`master` branch). This Pi has a deploy key with write access
+(`~/.ssh/id_ed25519_deepspace`, configured for `Host github.com` in
+`~/.ssh/config`) — a **different** device (e.g. the laptop doing Nucleo
+firmware work below) needs its own key/credential added separately, this
+one doesn't transfer. Claude Code conversations and memory are local to
+each device/directory, not synced — this file is the intended hand-off
+mechanism between them. Anyone picking this project up on a new machine
+should clone the repo and start fresh here, not expect prior-conversation
+context to carry over.
+
+## IN PROGRESS: streaming beam position to an STM32 Nucleo over I2C — Pi side done and pushed, Nucleo firmware not started (2026-07-16)
 
 First step past pure characterization: closing the loop out to an external
-controller. Two new scripts, both committed but not yet run against real
-Nucleo hardware (none present this session):
+controller. **Pi-side hardware now exists**: a NUCLEO-L432KC board and a
+laptop (for flashing firmware via STM32CubeIDE) are available as of
+2026-07-16 — the earlier "no Nucleo in this session" blocker is gone, but
+firmware work is expected to happen from the laptop, not this Pi (no
+CubeIDE here). Two Pi-side scripts, both committed but still not run
+against the real board (that validation is the very next step, likely
+easiest done once someone is at the laptop + Nucleo together):
 
 - **`beam_position_streamer.py`** — headless companion to
   `camera_view_tool.py`: capture → detect beam centroid → send, no display,
@@ -57,14 +74,30 @@ classic `i2c-1` number. `NUCLEO_I2C_BUS = 1` in `nucleo_i2c_sender.py` is
 now confirmed correct, not a placeholder — updated in-file.
 `NUCLEO_I2C_ADDR` is still a placeholder pending real Nucleo firmware.
 
-**Next steps**: (1) get real Nucleo hardware into a session and set the
-real `NUCLEO_I2C_ADDR` to match its firmware's configured slave address,
-(2) validate `NucleoLink.send_position` against it (the
-`__main__` block in `nucleo_i2c_sender.py` sends a slowly-orbiting fake
-position for exactly this — no real beam needed to smoke-test the link),
-(3) implement/confirm the matching packet parser on the Nucleo firmware
-side (checksum, packet layout, and stale-timeout policy must match this
-Python side exactly — not written yet, out of scope of this repo).
+**Next steps (2026-07-16)**, expected to happen from the laptop side using
+the NUCLEO-L432KC + STM32CubeIDE:
+1. **Write the Nucleo firmware** — does not exist yet at all, this is the
+   real blocker. Needs: CubeMX I2C1 config as a **slave** (not the
+   default master template), a chosen 7-bit slave address (update
+   `NUCLEO_I2C_ADDR` in `nucleo_i2c_sender.py` on the Pi side to match —
+   currently placeholder `0x42`), and a receive handler that parses the
+   fixed 7-byte packet defined in `nucleo_i2c_sender.py`'s docstring
+   (`seq, status, x_lo, x_hi, y_lo, y_hi, checksum` after the register-
+   pointer byte — `x`/`y` are little-endian s16, checksum is an additive
+   sum of the 6 data bytes mod 256) and verifies the checksum before
+   trusting a packet.
+2. **Wire it up**: Nucleo I2C slave pins (L432KC default I2C1: PB6=SCL,
+   PB7=SDA, but confirm against whatever CubeMX pinout is actually used)
+   to the Pi's header I2C1 (physical pins 5=SCL/GPIO3, 3=SDA/GPIO2), plus
+   a shared ground. Bus is already confirmed live on the Pi side at
+   `/dev/i2c-1` (see below) — no Pi-side config left to do.
+3. **Smoke-test the link without the camera**: run `nucleo_i2c_sender.py`
+   directly on the Pi (its `__main__` sends a slowly-orbiting fake
+   position) and confirm the Nucleo firmware receives sane, checksum-valid
+   values — e.g. blink an LED or print over USB-serial back to the laptop.
+4. **Only then** run `beam_position_streamer.py` for real — `--dry-run`
+   first to reconfirm detection still works on whatever hardware state
+   the cameras are in, then live against the Nucleo.
 
 ## RESOLVED (practically, not root-caused to a fix): unbinned ROI modes invert bright point sources — root cause pinpointed, use binned modes instead (2026-07-15)
 
