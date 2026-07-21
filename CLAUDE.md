@@ -21,6 +21,18 @@ mechanism between them. Anyone picking this project up on a new machine
 should clone the repo and start fresh here, not expect prior-conversation
 context to carry over.
 
+**Laptop is now set up (2026-07-21)**: repo cloned there, ready to start
+the Nucleo firmware work below via STM32CubeIDE. Push access from the
+laptop still needs its own credential (a second deploy key or the user's
+personal GitHub access — the Pi's deploy key doesn't transfer, see above).
+Physical wiring between the Pi's header I2C1 (physical pin 5=SCL/GPIO3,
+pin 3=SDA/GPIO2, plus any GND pin — already confirmed live at
+`/dev/i2c-1`) and the Nucleo's I2C1 pins (PB6/PB7 by CubeMX default, but
+confirm against the L432KC's actual Nucleo-32 header pinout in CubeMX's
+Pinout View before connecting, since this board's connector doesn't match
+the bigger Nucleo-64 Arduino/Morpho layout) hasn't been done yet — no
+level shifter needed, both boards are 3.3V logic.
+
 ## IN PROGRESS: streaming beam position to an STM32 Nucleo over I2C — Pi side done and pushed, Nucleo firmware not started (2026-07-16)
 
 First step past pure characterization: closing the loop out to an external
