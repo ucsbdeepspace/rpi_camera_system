@@ -59,11 +59,19 @@ def main():
 
     print(f"Opening {port_name} @ {BAUD} -- Ctrl+C to stop")
     with serial.Serial(port_name, BAUD, timeout=1) as ser:
+        idle_seconds = 0
         try:
             while True:
                 line = ser.readline()
                 if not line:
-                    continue  # read timeout, no data yet -- keep waiting
+                    # readline's 1s timeout expired with nothing received --
+                    # print an occasional heartbeat so "no data yet" is
+                    # distinguishable from the script having hung.
+                    idle_seconds += 1
+                    if idle_seconds % 5 == 0:
+                        print(f"... no data received in {idle_seconds}s")
+                    continue
+                idle_seconds = 0
                 ts = time.strftime("%H:%M:%S")
                 print(f"[{ts}] {line.decode('ascii', errors='replace').rstrip()}")
         except KeyboardInterrupt:
