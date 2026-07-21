@@ -76,6 +76,23 @@ Controls:
       vice versa.
   q   quit
 
+Full-speed streaming (--stream): normally this tool throttles beam
+detection to ANALYSIS_INTERVAL_S (~20Hz) because find_beam_blob is too
+expensive to run on every one of 500-900 frames/sec -- fine for a human
+watching the display, but not fast enough for a real tracking loop. When
+--stream targets a camera, that throttle is bypassed for that camera only:
+find_beam_blob and the I2C send to the Nucleo (via nucleo_i2c_sender.py's
+NucleoLink) run on every captured frame -- the same ~339fps cost
+beam_position_streamer.py already measures and accepts for exactly this
+reason. The on-screen view of that camera's centroid still only refreshes
+at the ~15Hz DISPLAY_INTERVAL_S rate -- full-speed transmission and a
+human-readable decimated view are independent, they don't have to share a
+rate. Auto-track recentering (if 't' is also on) stays gated at the slower
+ANALYSIS_INTERVAL_S cadence regardless, since its cost is the ~7-10ms
+set_roi_y_start subprocess call, not detection -- recentering on every
+streamed frame would tank fps the same way the original
+auto-track-at-50Hz bug did (see ANALYSIS_INTERVAL_S's own comment).
+
 Capture runs unconditionally every loop iteration (this is what the fps
 counter reflects); the heavier per-frame work -- normalize, threshold,
 contour/centroid, imshow, waitKey -- is throttled to ~15Hz so a slow
@@ -87,11 +104,22 @@ Requires the patched ov9282 module (MODE_640_200_ROI / MODE_640_100_ROI)
 to be loaded -- see CLAUDE.md.
 
 Usage:
-  python3 camera_view_tool.py
+  python3 camera_view_tool.py [--stream] [--stream-cam N] [--dry-run]
+    --stream        stream camera N's (default 0) detected centroid to an
+                     STM32 Nucleo over I2C at full capture speed -- see
+                     "Full-speed streaming" above. Requires
+                     nucleo_i2c_sender.py's NucleoLink (smbus2 + a wired,
+                     running Nucleo) unless --dry-run is also given.
+    --stream-cam N  which camera index to stream (default 0), only
+                     meaningful with --stream.
+    --dry-run       with --stream, skip the actual I2C send -- same
+                     convention as beam_position_streamer.py, for testing
+                     without a Nucleo attached.
 
 Install:  pip install opencv-python numpy
           (picamera2 is pre-installed on RPi OS Bookworm)
 """
+import sys
 import time
 from collections import deque
 
@@ -172,6 +200,22 @@ ANALYSIS_INTERVAL_S = 0.05  # beam detection + auto-track recenter run at most
                               # alignment/monitoring tool. Lower this if
                               # faster tracking matters more than fps for a
                               # given use, higher if the reverse.
+STREAM_STATUS_INTERVAL = 200  # print a send-rate summary every this many
+                                # streamed frames -- printing every frame at
+                                # ~339fps would flood the terminal
+
+
+def parse_args():
+    args = sys.argv[1:]
+    stream_enabled = "--stream" in args
+    dry_run = "--dry-run" in args
+    stream_cam_index = 0
+    if "--stream-cam" in args:
+        stream_cam_index = int(args[args.index("--stream-cam") + 1])
+    return stream_enabled, dry_run, stream_cam_index
+
+
+STREAM_ENABLED, STREAM_DRY_RUN, STREAM_CAM_INDEX = parse_args()
 
 # ── Detect available cameras ────────────────────────────────────────────────
 info = Picamera2.global_camera_info()
@@ -356,10 +400,19 @@ def draw_reticle(img, center, radius):
     stroke(cv2.circle, (cx, cy), 3, color=dot_color, thickness=-1)
 
 
+if STREAM_ENABLED and STREAM_CAM_INDEX not in indices:
+    print(f"WARNING: --stream-cam {STREAM_CAM_INDEX} is not a detected camera "
+          f"index {indices} -- streaming disabled.")
+    STREAM_ENABLED = False
+
 print(f"\nOpening {len(indices)} camera(s)... RAW_SIZE={SIZES[0]}")
 cams = [make_camera(i) for i in indices]
 
-window_names = [f"Camera {i} -- h: cycle mode, t: auto-track, q: quit" for i in indices]
+window_names = [
+    f"Camera {i} -- h: cycle mode, t: auto-track, q: quit"
+    + ("  [STREAMING]" if STREAM_ENABLED and i == STREAM_CAM_INDEX else "")
+    for i in indices
+]
 for i, name in zip(indices, window_names):
     cv2.namedWindow(name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(name, *SIZES[0])
@@ -380,6 +433,20 @@ last_found = {i: None for i in indices}  # most recent find_beam_blob() result
                                             # something to draw even on
                                             # iterations where detection
                                             # itself didn't run
+last_stream_xy = {i: (0, 0) for i in indices}  # last (x, y) sent/would-send,
+                                                  # absolute full-sensor pixels
+n_streamed = 0
+t_stream_start = time.monotonic()
+
+link = None
+if STREAM_ENABLED and not STREAM_DRY_RUN:
+    from nucleo_i2c_sender import NucleoLink
+    link = NucleoLink()
+    print(f"Streaming cam{STREAM_CAM_INDEX}'s centroid to the Nucleo over I2C "
+          f"(full speed, decoupled from the display).")
+elif STREAM_ENABLED and STREAM_DRY_RUN:
+    print(f"Streaming cam{STREAM_CAM_INDEX}'s centroid in --dry-run mode "
+          f"(no I2C send).")
 
 print("Streaming -- 'h' cycles mode (1280x800 -> 640x200 -> 640x100 -> 1280x800), "
       "'t' toggles auto-track, 'q' quits.\n")
@@ -393,34 +460,78 @@ try:
             frame = cam.capture_array("raw").view(np.uint16)
             now = time.monotonic()
             fps_history[i].append(now)
+            v_bin = V_BIN_RATIO_BY_SIZE[raw_sizes[i]]
 
-            # Beam detection + auto-track recenter run on their own ~20Hz
-            # throttle (ANALYSIS_INTERVAL_S) -- fast enough to keep up with
-            # a moving beam, but decoupled from both the raw capture rate
-            # (find_beam_blob is too expensive to run on every one of
-            # 500-900 frames/sec, measured live) and the ~15Hz display
-            # throttle below (tying auto-track to that was the original
-            # "why is this so slow" bug: ~333ms/correction).
-            if now - last_analysis_time[i] >= ANALYSIS_INTERVAL_S:
-                last_analysis_time[i] = now
+            streaming_this_cam = STREAM_ENABLED and i == STREAM_CAM_INDEX
+            if streaming_this_cam:
+                # Full-speed path: detection runs on every captured frame,
+                # not throttled to ANALYSIS_INTERVAL_S -- that throttle
+                # exists purely to save fps for a merely-displayed camera,
+                # but a real tracking send needs a fresh centroid every
+                # frame. Same ~530->339fps cost beam_position_streamer.py
+                # already measures and accepts for this exact reason.
                 last_found[i] = find_beam_blob(frame)
                 if last_found[i] is not None:
                     cx, cy, radius = last_found[i]
-                    # cy is in the captured (post-bin) frame's row space;
-                    # y_starts[i] is in real pre-bin sensor rows. The
-                    # 640-wide modes bin 2:1 vertically as well as
-                    # horizontally (confirmed empirically, see
-                    # V_BIN_RATIO_BY_SIZE), so cy must be scaled up to
-                    # pre-bin rows before adding -- treating them as the
-                    # same unit was a real bug (silently off by 2x) until
-                    # this was checked.
-                    v_bin = V_BIN_RATIO_BY_SIZE[raw_sizes[i]]
+                    # See the non-streaming branch below for why cy needs
+                    # v_bin scaling before use.
                     last_centroid_abs_y[i] = y_starts[i] + cy * v_bin
+                    last_stream_xy[i] = (int(round(cx * v_bin)),
+                                          int(round(last_centroid_abs_y[i])))
+                    beam_valid = True
+                else:
+                    beam_valid = False  # send the last known position, not
+                                          # silence -- see NucleoLink.send_position
 
-                    if auto_track and raw_sizes[i][1] != PIXEL_ARRAY_HEIGHT:
-                        pre_bin_height = raw_sizes[i][1] * v_bin
-                        target = int(round(last_centroid_abs_y[i] - pre_bin_height / 2))
-                        apply_y_start(i, target)
+                stream_x, stream_y = last_stream_xy[i]
+                if link is not None:
+                    link.send_position(stream_x, stream_y, valid=beam_valid)
+                n_streamed += 1
+                if n_streamed % STREAM_STATUS_INTERVAL == 0:
+                    rate = n_streamed / (time.monotonic() - t_stream_start)
+                    print(f"streamed {n_streamed} ({rate:.1f}/s average)  "
+                          f"last=({stream_x},{stream_y}) valid={beam_valid}")
+
+                # Auto-track recentering stays on the slower ANALYSIS_INTERVAL_S
+                # cadence regardless -- its cost is the ~7-10ms
+                # set_roi_y_start subprocess call, not detection, so
+                # recentering on every streamed frame would tank fps the
+                # same way the original auto-track-at-50Hz bug did (see
+                # ANALYSIS_INTERVAL_S's own comment).
+                if (auto_track and raw_sizes[i][1] != PIXEL_ARRAY_HEIGHT
+                        and last_found[i] is not None
+                        and now - last_analysis_time[i] >= ANALYSIS_INTERVAL_S):
+                    last_analysis_time[i] = now
+                    pre_bin_height = raw_sizes[i][1] * v_bin
+                    target = int(round(last_centroid_abs_y[i] - pre_bin_height / 2))
+                    apply_y_start(i, target)
+            else:
+                # Beam detection + auto-track recenter run on their own ~20Hz
+                # throttle (ANALYSIS_INTERVAL_S) -- fast enough to keep up with
+                # a moving beam, but decoupled from both the raw capture rate
+                # (find_beam_blob is too expensive to run on every one of
+                # 500-900 frames/sec, measured live) and the ~15Hz display
+                # throttle below (tying auto-track to that was the original
+                # "why is this so slow" bug: ~333ms/correction).
+                if now - last_analysis_time[i] >= ANALYSIS_INTERVAL_S:
+                    last_analysis_time[i] = now
+                    last_found[i] = find_beam_blob(frame)
+                    if last_found[i] is not None:
+                        cx, cy, radius = last_found[i]
+                        # cy is in the captured (post-bin) frame's row space;
+                        # y_starts[i] is in real pre-bin sensor rows. The
+                        # 640-wide modes bin 2:1 vertically as well as
+                        # horizontally (confirmed empirically, see
+                        # V_BIN_RATIO_BY_SIZE), so cy must be scaled up to
+                        # pre-bin rows before adding -- treating them as the
+                        # same unit was a real bug (silently off by 2x) until
+                        # this was checked.
+                        last_centroid_abs_y[i] = y_starts[i] + cy * v_bin
+
+                        if auto_track and raw_sizes[i][1] != PIXEL_ARRAY_HEIGHT:
+                            pre_bin_height = raw_sizes[i][1] * v_bin
+                            target = int(round(last_centroid_abs_y[i] - pre_bin_height / 2))
+                            apply_y_start(i, target)
 
             if now - last_display_time[i] < DISPLAY_INTERVAL_S:
                 continue
@@ -446,7 +557,9 @@ try:
             h = raw_sizes[i][1]
             roi_tag = "full sensor" if h == PIXEL_ARRAY_HEIGHT else f"y_start={y_starts[i]}"
             track_tag = "  [TRACK]" if auto_track and h != PIXEL_ARRAY_HEIGHT else ""
-            cv2.putText(display, f"cam {i}: {raw_sizes[i][0]}x{h}  {roi_tag}  {fps:.1f}fps{track_tag}",
+            stream_tag = (f"  [STREAM->({last_stream_xy[i][0]},{last_stream_xy[i][1]})]"
+                          if streaming_this_cam else "")
+            cv2.putText(display, f"cam {i}: {raw_sizes[i][0]}x{h}  {roi_tag}  {fps:.1f}fps{track_tag}{stream_tag}",
                         (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
 
             cv2.imshow(window_names[i], display)
@@ -488,3 +601,5 @@ finally:
     cv2.destroyAllWindows()
     for cam in cams:
         cam.stop()
+    if link is not None:
+        link.close()
