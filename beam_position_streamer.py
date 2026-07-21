@@ -230,16 +230,21 @@ def main():
                 # Real, absolute sensor coordinates -- both axes scaled by
                 # the same 2:1 binning ratio these modes use in width and
                 # height alike (empirically confirmed, see
-                # camera_view_tool.py's V_BIN_RATIO_BY_SIZE).
-                last_abs_x = int(round(cx * v_bin))
-                last_abs_y = int(round(y_start + cy * v_bin))
+                # camera_view_tool.py's V_BIN_RATIO_BY_SIZE). Kept as float,
+                # NOT rounded to int here -- find_beam_blob's centroid is
+                # sub-pixel, and NucleoLink.send_position does its own
+                # fixed-point scaling (POSITION_SCALE) to preserve that
+                # precision on the wire; rounding to a whole pixel here
+                # would throw it away before it ever got there.
+                last_abs_x = cx * v_bin
+                last_abs_y = y_start + cy * v_bin
                 valid = True
             else:
                 valid = False  # keep last_abs_x/y -- Nucleo decides what
                                  # to do with a stale-but-flagged position
 
             if dry_run:
-                print(f"x={last_abs_x} y={last_abs_y} valid={valid}")
+                print(f"x={last_abs_x:.1f} y={last_abs_y:.1f} valid={valid}")
             else:
                 link.send_position(last_abs_x, last_abs_y, valid=valid)
 

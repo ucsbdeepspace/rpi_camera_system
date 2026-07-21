@@ -11,9 +11,19 @@ see kernel_patch/ov9282/ov9282.c's OV9282_REG_* pattern):
   reg 0x00        seq       (u8)  increments every send, wraps 0-255 --
                                     lets the Nucleo detect a stale/stuck link
   reg 0x01        status    (u8)  bit0 = beam confidently detected this cycle
-  reg 0x02-0x03   x         (s16, little-endian) centroid column
-  reg 0x04-0x05   y         (s16, little-endian) centroid row
+  reg 0x02-0x03   x         (s16, little-endian) centroid column * POSITION_SCALE
+  reg 0x04-0x05   y         (s16, little-endian) centroid row * POSITION_SCALE
   reg 0x06        checksum  (u8)  additive sum of regs 0x00-0x05, mod 256
+
+x/y are fixed-point, not raw integer pixels: find_beam_blob() computes a
+sub-pixel (intensity-weighted) centroid, and sending it pre-rounded to the
+nearest whole pixel silently threw that precision away. Scaling by
+POSITION_SCALE (10) before packing into the same s16 field preserves one
+decimal digit without widening the packet -- the sensor's 1280x800 extent
+scales to +-12800/+-8000, comfortably inside s16's +-32767 range.
+**Firmware must divide the received x/y by POSITION_SCALE to recover real
+pixel coordinates** -- this is a wire-format change, old firmware reading
+these fields as raw pixels will see values 10x too large.
 
 7 data bytes + 1 register-pointer byte = 8 bytes/write, well under any I2C
 transaction size limit and fast even at Standard Mode (100kHz). No
@@ -38,14 +48,15 @@ buses to i2c-10/11, the header bus kept the classic `i2c-1` number).
 Confirmed 2026-07-15 with `sudo i2cdetect -y 1`: bus responds, scans clean
 (no devices -- expected with no Nucleo wired up yet).
 
-NUCLEO_I2C_ADDR below is still a placeholder -- update it once the Nucleo
-firmware's own I2C slave address is fixed. NUCLEO_I2C_BUS=1 is now
-confirmed correct, not a placeholder.
+NUCLEO_I2C_BUS=1 and NUCLEO_I2C_ADDR=0x42 are both confirmed correct
+against the real Nucleo firmware (camera_centroid_receiver, see
+CLAUDE.md) -- not placeholders.
 
-Not yet tested against real hardware -- no Nucleo in this session to
-validate against. Sketch/reference implementation; the checksum, packet
-layout, and stale-timeout policy must match the firmware side exactly (see
-the companion STM32 sketch).
+End-to-end link confirmed live 2026-07-21 (seq/pkts in lockstep, zero
+checksum errors) against the PRE-fixed-point protocol (whole-pixel x/y).
+The POSITION_SCALE change above has not yet been validated against real
+firmware -- the Nucleo side must be updated to divide by POSITION_SCALE
+before that's true again.
 """
 import struct
 import time
@@ -53,13 +64,17 @@ import time
 from smbus2 import SMBus, i2c_msg
 
 NUCLEO_I2C_BUS = 1       # confirmed 2026-07-15 -- header bus, see module docstring
-NUCLEO_I2C_ADDR = 0x42   # placeholder 7-bit address -- must match the
-                           # Nucleo firmware's own I2C slave address config
+NUCLEO_I2C_ADDR = 0x42   # confirmed against the real Nucleo firmware
+                           # (camera_centroid_receiver), not a placeholder
 
 REG_POINTER = 0x00  # single fixed packet shape, no real addressable
                       # register file on the Nucleo side -- kept for
                       # convention-consistency with the OV9281 protocol,
                       # not because anything reads this back
+
+POSITION_SCALE = 10  # x/y are sent as round(real_pixel_value * POSITION_SCALE)
+                       # -- see module docstring's "x/y are fixed-point" note.
+                       # Firmware must divide by this to recover real pixels.
 
 
 def _checksum(payload):
@@ -81,11 +96,16 @@ class NucleoLink:
         self._seq = 0
 
     def send_position(self, x, y, valid=True):
-        """Push the latest centroid. `x`/`y` are whatever coordinate space
-        the Nucleo firmware expects (e.g. real full-sensor pixel rows/
-        columns) -- pick one convention and keep both sides consistent,
-        this module doesn't care which. Safe to call every tracking cycle:
-        each write is 9 bytes total, well under 1ms at Fast Mode (400kHz).
+        """Push the latest centroid. `x`/`y` are REAL PIXEL coordinates
+        (float or int, e.g. a sub-pixel centroid straight out of
+        find_beam_blob) in whatever coordinate space the Nucleo firmware
+        expects (e.g. full-sensor rows/columns) -- pick one convention and
+        keep both sides consistent, this module doesn't care which. This
+        method scales by POSITION_SCALE and rounds to the nearest int16
+        internally, so callers should NOT pre-round -- doing so throws away
+        the sub-pixel precision this scaling exists to preserve. Safe to
+        call every tracking cycle: each write is 9 bytes total, well under
+        1ms at Fast Mode (400kHz).
 
         `valid=False` still sends a packet (with whatever x/y is passed,
         e.g. the last known position) rather than skipping the send -- the
@@ -96,7 +116,9 @@ class NucleoLink:
         """
         self._seq = (self._seq + 1) % 256
         status = 1 if valid else 0
-        payload = struct.pack('<BB', self._seq, status) + struct.pack('<hh', x, y)
+        x_scaled = int(round(x * POSITION_SCALE))
+        y_scaled = int(round(y * POSITION_SCALE))
+        payload = struct.pack('<BB', self._seq, status) + struct.pack('<hh', x_scaled, y_scaled)
         checksum = _checksum(payload)
         write = i2c_msg.write(self.addr, [REG_POINTER] + list(payload) + [checksum])
         self.bus.i2c_rdwr(write)

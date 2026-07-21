@@ -76,11 +76,11 @@ Controls:
       vice versa.
   q   quit
 
-Full-speed streaming (--stream): normally this tool throttles beam
-detection to ANALYSIS_INTERVAL_S (~20Hz) because find_beam_blob is too
-expensive to run on every one of 500-900 frames/sec -- fine for a human
-watching the display, but not fast enough for a real tracking loop. When
---stream targets a camera, that throttle is bypassed for that camera only:
+Full-speed streaming to the Nucleo (ON BY DEFAULT, camera 0): normally
+this tool throttles beam detection to ANALYSIS_INTERVAL_S (~20Hz) because
+find_beam_blob is too expensive to run on every one of 500-900 frames/sec
+-- fine for a human watching the display, but not fast enough for a real
+tracking loop. For the streamed camera, that throttle is bypassed:
 find_beam_blob and the I2C send to the Nucleo (via nucleo_i2c_sender.py's
 NucleoLink) run on every captured frame -- the same ~339fps cost
 beam_position_streamer.py already measures and accepts for exactly this
@@ -93,6 +93,13 @@ set_roi_y_start subprocess call, not detection -- recentering on every
 streamed frame would tank fps the same way the original
 auto-track-at-50Hz bug did (see ANALYSIS_INTERVAL_S's own comment).
 
+If the Nucleo link can't be opened, or an individual send fails (e.g. a
+NACK/timeout -- the same TimeoutError smbus2 raises on a dead/unwired
+bus), this is reported as a WARNING and the viewer keeps running --
+detection and display are unaffected, only the send itself is best-effort.
+Pass --no-stream to skip attempting the link entirely (pure bench-viewer
+mode, the old default).
+
 Capture runs unconditionally every loop iteration (this is what the fps
 counter reflects); the heavier per-frame work -- normalize, threshold,
 contour/centroid, imshow, waitKey -- is throttled to ~15Hz so a slow
@@ -104,17 +111,17 @@ Requires the patched ov9282 module (MODE_640_200_ROI / MODE_640_100_ROI)
 to be loaded -- see CLAUDE.md.
 
 Usage:
-  python3 camera_view_tool.py [--stream] [--stream-cam N] [--dry-run]
-    --stream        stream camera N's (default 0) detected centroid to an
-                     STM32 Nucleo over I2C at full capture speed -- see
-                     "Full-speed streaming" above. Requires
-                     nucleo_i2c_sender.py's NucleoLink (smbus2 + a wired,
-                     running Nucleo) unless --dry-run is also given.
-    --stream-cam N  which camera index to stream (default 0), only
-                     meaningful with --stream.
-    --dry-run       with --stream, skip the actual I2C send -- same
-                     convention as beam_position_streamer.py, for testing
-                     without a Nucleo attached.
+  python3 camera_view_tool.py [--no-stream] [--stream-cam N] [--dry-run]
+    (default)       streams camera 0's detected centroid to the Nucleo
+                     over I2C at full capture speed -- see "Full-speed
+                     streaming" above. A missing/unresponsive Nucleo is a
+                     warning, not a crash (see above).
+    --no-stream     disable streaming entirely -- pure bench-viewer mode,
+                     no NucleoLink/smbus2 involved at all.
+    --stream-cam N  which camera index to stream (default 0).
+    --dry-run       skip the actual I2C send, just compute + report --
+                     same convention as beam_position_streamer.py, for
+                     testing without a Nucleo attached.
 
 Install:  pip install opencv-python numpy
           (picamera2 is pre-installed on RPi OS Bookworm)
@@ -207,7 +214,12 @@ STREAM_STATUS_INTERVAL = 200  # print a send-rate summary every this many
 
 def parse_args():
     args = sys.argv[1:]
-    stream_enabled = "--stream" in args
+    stream_enabled = "--no-stream" not in args  # streaming defaults ON --
+                                                    # this tool's whole point
+                                                    # now includes feeding the
+                                                    # Nucleo, not just bench
+                                                    # viewing; pass --no-stream
+                                                    # to go back to view-only
     dry_run = "--dry-run" in args
     stream_cam_index = 0
     if "--stream-cam" in args:
@@ -436,14 +448,23 @@ last_found = {i: None for i in indices}  # most recent find_beam_blob() result
 last_stream_xy = {i: (0, 0) for i in indices}  # last (x, y) sent/would-send,
                                                   # absolute full-sensor pixels
 n_streamed = 0
+n_stream_errors = 0
 t_stream_start = time.monotonic()
 
 link = None
 if STREAM_ENABLED and not STREAM_DRY_RUN:
     from nucleo_i2c_sender import NucleoLink
-    link = NucleoLink()
-    print(f"Streaming cam{STREAM_CAM_INDEX}'s centroid to the Nucleo over I2C "
-          f"(full speed, decoupled from the display).")
+    try:
+        link = NucleoLink()
+        print(f"Streaming cam{STREAM_CAM_INDEX}'s centroid to the Nucleo over I2C "
+              f"(full speed, decoupled from the display).")
+    except OSError as e:
+        # e.g. the I2C bus itself doesn't exist/isn't accessible -- a
+        # missing/unresponsive NUCLEO (no ACK, a bad wire) surfaces later,
+        # per-send, not here; opening the bus handle itself rarely fails.
+        print(f"WARNING: could not open the Nucleo I2C link ({e}) -- "
+              f"detection/display will run normally, nothing will be sent. "
+              f"Pass --no-stream to silence this.")
 elif STREAM_ENABLED and STREAM_DRY_RUN:
     print(f"Streaming cam{STREAM_CAM_INDEX}'s centroid in --dry-run mode "
           f"(no I2C send).")
@@ -474,10 +495,14 @@ try:
                 if last_found[i] is not None:
                     cx, cy, radius = last_found[i]
                     # See the non-streaming branch below for why cy needs
-                    # v_bin scaling before use.
+                    # v_bin scaling before use. Kept as float, NOT rounded
+                    # to int here -- find_beam_blob's centroid is sub-pixel,
+                    # and NucleoLink.send_position does its own fixed-point
+                    # scaling (POSITION_SCALE) to preserve that precision on
+                    # the wire; rounding to a whole pixel here would throw
+                    # it away before it ever got there.
                     last_centroid_abs_y[i] = y_starts[i] + cy * v_bin
-                    last_stream_xy[i] = (int(round(cx * v_bin)),
-                                          int(round(last_centroid_abs_y[i])))
+                    last_stream_xy[i] = (cx * v_bin, last_centroid_abs_y[i])
                     beam_valid = True
                 else:
                     beam_valid = False  # send the last known position, not
@@ -485,12 +510,26 @@ try:
 
                 stream_x, stream_y = last_stream_xy[i]
                 if link is not None:
-                    link.send_position(stream_x, stream_y, valid=beam_valid)
+                    try:
+                        link.send_position(stream_x, stream_y, valid=beam_valid)
+                    except OSError as e:
+                        # e.g. the TimeoutError smbus2 raises when the
+                        # Nucleo doesn't ACK (dead link, bad wiring, wrong
+                        # address) -- don't let a send failure crash
+                        # detection/display, just keep retrying every frame.
+                        n_stream_errors += 1
+                        if n_stream_errors == 1 or n_stream_errors % STREAM_STATUS_INTERVAL == 0:
+                            print(f"WARNING: I2C send to Nucleo failed ({e}) -- "
+                                  f"{n_stream_errors} failures so far, still "
+                                  f"retrying every frame. A failing send blocks "
+                                  f"on the kernel's I2C timeout, so this will "
+                                  f"also cap capture fps until the link recovers.")
                 n_streamed += 1
                 if n_streamed % STREAM_STATUS_INTERVAL == 0:
                     rate = n_streamed / (time.monotonic() - t_stream_start)
-                    print(f"streamed {n_streamed} ({rate:.1f}/s average)  "
-                          f"last=({stream_x},{stream_y}) valid={beam_valid}")
+                    print(f"streamed {n_streamed} ({rate:.1f}/s average, "
+                          f"{n_stream_errors} send failures)  "
+                          f"last=({stream_x:.1f},{stream_y:.1f}) valid={beam_valid}")
 
                 # Auto-track recentering stays on the slower ANALYSIS_INTERVAL_S
                 # cadence regardless -- its cost is the ~7-10ms
@@ -557,7 +596,7 @@ try:
             h = raw_sizes[i][1]
             roi_tag = "full sensor" if h == PIXEL_ARRAY_HEIGHT else f"y_start={y_starts[i]}"
             track_tag = "  [TRACK]" if auto_track and h != PIXEL_ARRAY_HEIGHT else ""
-            stream_tag = (f"  [STREAM->({last_stream_xy[i][0]},{last_stream_xy[i][1]})]"
+            stream_tag = (f"  [STREAM->({last_stream_xy[i][0]:.1f},{last_stream_xy[i][1]:.1f})]"
                           if streaming_this_cam else "")
             cv2.putText(display, f"cam {i}: {raw_sizes[i][0]}x{h}  {roi_tag}  {fps:.1f}fps{track_tag}{stream_tag}",
                         (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
