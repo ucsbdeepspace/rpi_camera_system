@@ -34,6 +34,7 @@ Usage as a module:
   from roi_set_selection import get_roi_y_start, set_roi_y_start
   actual = set_roi_y_start(0, 200)
 """
+import re
 import subprocess
 import sys
 
@@ -42,21 +43,57 @@ from picamera2 import Picamera2
 PIXEL_ARRAY_HEIGHT = 800  # full sensor height every ROI mode crops within
 TOP_BASE = 8  # fixed ISP offset, independent of y_start (same at every stock mode)
 
+# Which CFE media device each camera's i2c control bus feeds -- THIS is
+# stable across boots/camera population (a physical/electrical association,
+# confirmed via libcamera's own startup log: "Registered camera
+# .../i2c@88000/... to CFE device /dev/media0"). Unlike the ov9281 entity's
+# own v4l-subdevN device-node NUMBER within that graph (see
+# _subdev_for_camera below), which is NOT stable.
+_CFE_MEDIA_BY_I2C_LABEL = {
+    "i2c@88000": "/dev/media0",
+    "i2c@80000": "/dev/media1",
+}
+
 
 def _subdev_for_camera(cam_index):
-    """Map a Picamera2 camera index to its V4L2 subdev path.
+    """Map a Picamera2 camera index to its V4L2 subdev path by querying the
+    media graph directly, rather than a hardcoded subdev device-node number.
 
-    Mapping confirmed via Picamera2.global_camera_info(): index 0 is always
-    i2c@88000 -> /dev/v4l-subdev5, index 1 is always i2c@80000 ->
-    /dev/v4l-subdev2, on this specific board/media-graph enumeration.
+    v4l2 subdev NUMBERS (e.g. /dev/v4l-subdev5) are NOT stable across boots
+    -- they depend on total probe order system-wide, not just this camera.
+    Found live (2026-07-21): with only i2c@88000 enumerating this boot (the
+    already-documented intermittent i2c@80000 dropout -- see CLAUDE.md's
+    "Hardware status"), its ov9281 sensor landed at /dev/v4l-subdev2 -- the
+    exact number a two-camera boot had previously assigned to i2c@80000's
+    sensor instead. The old hardcoded {"i2c@88000": "/dev/v4l-subdev5", ...}
+    table silently pointed at the wrong device whenever camera population
+    differed from whatever boot it was last confirmed against -- v4l2-ctl
+    fails with a flat "Cannot open device", indistinguishable at a glance
+    from a genuine contention/exclusivity problem (this cost real
+    debugging time chasing the wrong theory before the stale mapping was
+    found to be the actual cause).
+
+    Fix: the CFE media device (/dev/mediaN) is stable (see
+    _CFE_MEDIA_BY_I2C_LABEL), so query THAT device's own topology for its
+    ov9281 entity's device node, instead of hardcoding the node number.
     """
     info = Picamera2.global_camera_info()
     cam_id = info[cam_index]["Id"]
-    if "i2c@88000" in cam_id:
-        return "/dev/v4l-subdev5"
-    if "i2c@80000" in cam_id:
-        return "/dev/v4l-subdev2"
-    raise ValueError(f"unrecognized camera Id, can't map to subdev: {cam_id}")
+    media_dev = next((path for label, path in _CFE_MEDIA_BY_I2C_LABEL.items()
+                       if label in cam_id), None)
+    if media_dev is None:
+        raise ValueError(f"unrecognized camera Id, can't map to CFE media device: {cam_id}")
+
+    out = subprocess.run(["media-ctl", "-d", media_dev, "-p"],
+                          capture_output=True, text=True, check=True).stdout
+    lines = out.splitlines()
+    for i, line in enumerate(lines):
+        if re.match(r"- entity \d+: ov9281\b", line.strip()):
+            for follow in lines[i:i + 4]:
+                if "device node name" in follow:
+                    return follow.split()[-1]
+    raise RuntimeError(f"no ov9281 entity found in {media_dev}'s topology "
+                        f"for camera {cam_index} ({cam_id})")
 
 
 def _get_crop(cam_index):

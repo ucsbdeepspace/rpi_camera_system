@@ -100,6 +100,20 @@ detection and display are unaffected, only the send itself is best-effort.
 Pass --no-stream to skip attempting the link entirely (pure bench-viewer
 mode, the old default).
 
+Starts directly in DEFAULT_STREAM_ROI (640x200, the validated ~527fps
+binned floor) whenever streaming, instead of the old full-sensor default
+-- high-speed tracking/transmission shouldn't require a manual 'h' press
+first. Since there's no prior detection to center on yet at startup, the
+initial window is centered on the sensor's vertical middle (same fallback
+cycle_height() itself uses for a camera that's never seen a beam this
+session) -- re-center manually ('t' then let it track, or 'w'/'s') if the
+beam isn't near the middle. auto-track ('t') also starts ON by default
+whenever streaming, since a narrow high-speed window that never re-centers
+will simply lose the beam as soon as it drifts. Pass --roi WxH to start in
+a different mode (e.g. --roi 1280x800 for the old wide/full-sensor start),
+or --no-stream for the old view-only defaults (full sensor, auto-track
+off).
+
 Capture runs unconditionally every loop iteration (this is what the fps
 counter reflects); the heavier per-frame work -- normalize, threshold,
 contour/centroid, imshow, waitKey -- is throttled to ~15Hz so a slow
@@ -111,21 +125,26 @@ Requires the patched ov9282 module (MODE_640_200_ROI / MODE_640_100_ROI)
 to be loaded -- see CLAUDE.md.
 
 Usage:
-  python3 camera_view_tool.py [--no-stream] [--stream-cam N] [--dry-run]
-    (default)       streams camera 0's detected centroid to the Nucleo
+  python3 camera_view_tool.py [--no-stream] [--stream-cam N] [--dry-run] [--roi WxH]
+    (default)       starts in 640x200 (binned, ~527fps) with auto-track ON,
+                     streaming camera 0's detected centroid to the Nucleo
                      over I2C at full capture speed -- see "Full-speed
                      streaming" above. A missing/unresponsive Nucleo is a
                      warning, not a crash (see above).
     --no-stream     disable streaming entirely -- pure bench-viewer mode,
-                     no NucleoLink/smbus2 involved at all.
+                     no NucleoLink/smbus2 involved at all, starts at full
+                     sensor with auto-track off (the old defaults).
     --stream-cam N  which camera index to stream (default 0).
     --dry-run       skip the actual I2C send, just compute + report --
                      same convention as beam_position_streamer.py, for
                      testing without a Nucleo attached.
+    --roi WxH       override the starting mode (1280x800, 640x200, or
+                     640x100) instead of the streaming-dependent default.
 
 Install:  pip install opencv-python numpy
           (picamera2 is pre-installed on RPi OS Bookworm)
 """
+import subprocess
 import sys
 import time
 from collections import deque
@@ -212,6 +231,15 @@ STREAM_STATUS_INTERVAL = 200  # print a send-rate summary every this many
                                 # ~339fps would flood the terminal
 
 
+DEFAULT_STREAM_ROI = (640, 200)  # validated ~527fps binned floor (CLAUDE.md)
+                                    # -- the fast mode this tool now starts in
+                                    # by default whenever streaming, so
+                                    # high-speed tracking/transmission
+                                    # doesn't require a manual 'h' press
+                                    # first. Full sensor is one 'h' press
+                                    # away if a wider view is needed.
+
+
 def parse_args():
     args = sys.argv[1:]
     stream_enabled = "--no-stream" not in args  # streaming defaults ON --
@@ -224,10 +252,25 @@ def parse_args():
     stream_cam_index = 0
     if "--stream-cam" in args:
         stream_cam_index = int(args[args.index("--stream-cam") + 1])
-    return stream_enabled, dry_run, stream_cam_index
+    roi_override = None
+    if "--roi" in args:
+        w, h = args[args.index("--roi") + 1].lower().split("x")
+        roi_override = (int(w), int(h))
+    return stream_enabled, dry_run, stream_cam_index, roi_override
 
 
-STREAM_ENABLED, STREAM_DRY_RUN, STREAM_CAM_INDEX = parse_args()
+STREAM_ENABLED, STREAM_DRY_RUN, STREAM_CAM_INDEX, ROI_OVERRIDE = parse_args()
+
+if ROI_OVERRIDE is not None:
+    INITIAL_SIZE = ROI_OVERRIDE
+elif STREAM_ENABLED:
+    INITIAL_SIZE = DEFAULT_STREAM_ROI  # start fast + narrow for tracking
+else:
+    INITIAL_SIZE = (1280, 800)  # old bench-viewer default: start wide
+
+if INITIAL_SIZE not in SIZES:
+    print(f"Unsupported --roi size {INITIAL_SIZE}. Supported: {SIZES}")
+    raise SystemExit(1)
 
 # ── Detect available cameras ────────────────────────────────────────────────
 info = Picamera2.global_camera_info()
@@ -274,9 +317,9 @@ def configure_and_start(cam, index, raw_size):
     cam.set_controls(controls)
 
 
-def make_camera(index):
+def make_camera(index, initial_size):
     cam = Picamera2(index)
-    configure_and_start(cam, index, SIZES[0])
+    configure_and_start(cam, index, initial_size)
     return cam
 
 
@@ -284,29 +327,46 @@ def apply_y_start(index, target):
     """Push index's y_start and verify it actually landed, retrying briefly.
 
     Needed because cam.start() can return before the driver has fully
-    settled into a freshly-selected pad format, so a set_selection pushed
-    immediately after can silently no-op (same issue found and worked
-    around in roi_live_demo.py's apply_y_start).
+    settled into a freshly-selected pad format -- and that race hits BOTH
+    the initial get_max_y_start() read and the set_roi_y_start() write:
+    a v4l2-ctl call issued too soon after start() can fail outright
+    (CalledProcessError, not just a silent no-op). Found live: calling
+    this immediately after make_camera() (no cycle_height()-style delay
+    from looping over multiple cameras/windows first) hit the read's
+    CalledProcessError directly, uncaught, since only the write used to be
+    retried here -- so the whole operation, read included, is retried now.
     """
-    max_y_start = get_max_y_start(index)
-    expected = max(0, min(target, max_y_start))
-    expected -= expected % 4  # driver rounds down to a 4-row boundary --
-                                # match that here, or a non-aligned target
-                                # (the normal case for a centroid-derived
-                                # value) never matches `expected` and this
-                                # burns all 10 retries (~500ms) every single
-                                # call. Harmless as an occasional one-off
-                                # (cycle_height calls this once per mode
-                                # switch) but catastrophic once auto-track
-                                # started calling it continuously -- found
-                                # live, tanked fps from ~530 to ~6.
+    last_err = None
     for _ in range(10):
-        y_starts[index] = set_roi_y_start(index, target)
-        if y_starts[index] == expected:
-            return
+        try:
+            max_y_start = get_max_y_start(index)
+            expected = max(0, min(target, max_y_start))
+            expected -= expected % 4  # driver rounds down to a 4-row
+                                        # boundary -- match that here, or a
+                                        # non-aligned target (the normal
+                                        # case for a centroid-derived
+                                        # value) never matches `expected`
+                                        # and this burns all 10 retries
+                                        # (~500ms) every single call.
+                                        # Harmless as an occasional one-off
+                                        # (cycle_height calls this once per
+                                        # mode switch) but catastrophic
+                                        # once auto-track started calling
+                                        # it continuously -- found live,
+                                        # tanked fps from ~530 to ~6.
+            y_starts[index] = set_roi_y_start(index, target)
+            if y_starts[index] == expected:
+                return
+        except subprocess.CalledProcessError as e:
+            # Surface the actual v4l2-ctl failure on final exhaustion below
+            # -- silently swallowing this made a PERSISTENT failure (every
+            # one of the 10 attempts) look identical to a transient
+            # settling race, which it may not be.
+            last_err = (e.stderr or str(e)).strip()
         time.sleep(0.05)
+    err_tag = f"  (last error: {last_err})" if last_err else ""
     print(f"WARNING camera {index}: y_start did not settle at {target}, "
-          f"landed at {y_starts[index]}")
+          f"landed at {y_starts[index]}{err_tag}")
 
 
 def cycle_height():
@@ -417,8 +477,8 @@ if STREAM_ENABLED and STREAM_CAM_INDEX not in indices:
           f"index {indices} -- streaming disabled.")
     STREAM_ENABLED = False
 
-print(f"\nOpening {len(indices)} camera(s)... RAW_SIZE={SIZES[0]}")
-cams = [make_camera(i) for i in indices]
+print(f"\nOpening {len(indices)} camera(s)... RAW_SIZE={INITIAL_SIZE}")
+cams = [make_camera(i, INITIAL_SIZE) for i in indices]
 
 window_names = [
     f"Camera {i} -- h: cycle mode, t: auto-track, q: quit"
@@ -427,17 +487,35 @@ window_names = [
 ]
 for i, name in zip(indices, window_names):
     cv2.namedWindow(name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(name, *SIZES[0])
+    cv2.resizeWindow(name, *INITIAL_SIZE)
 
-size_idx = 0
-raw_sizes = {i: SIZES[0] for i in indices}
+size_idx = SIZES.index(INITIAL_SIZE)
+raw_sizes = {i: INITIAL_SIZE for i in indices}
 y_starts = {i: 0 for i in indices}
+
+if INITIAL_SIZE[1] != PIXEL_ARRAY_HEIGHT:
+    # Starting directly in a narrow ROI (not via cycle_height(), which
+    # centers on a known last-seen centroid) -- there's no prior detection
+    # yet to center on, so fall back to the sensor's vertical middle, same
+    # fallback cycle_height() itself uses when a camera has never seen a
+    # beam this session.
+    v_bin_initial = V_BIN_RATIO_BY_SIZE[INITIAL_SIZE]
+    pre_bin_height = INITIAL_SIZE[1] * v_bin_initial
+    center_target = int(round(PIXEL_ARRAY_HEIGHT / 2 - pre_bin_height / 2))
+    for i in indices:
+        apply_y_start(i, center_target)
+    print(f"Centered initial ROI on sensor middle: y_starts={y_starts}")
+
 last_centroid_abs_y = {i: None for i in indices}  # real sensor row, updated
                                                      # whenever a blob is found
 fps_history = {i: deque(maxlen=FPS_WINDOW) for i in indices}
 last_display_time = {i: 0.0 for i in indices}
 last_waitkey_time = 0.0
-auto_track = False
+auto_track = STREAM_ENABLED  # start locked onto the beam automatically when
+                                # streaming -- a narrow high-speed ROI would
+                                # otherwise lose the beam as soon as it
+                                # drifts out of a static window. Press 't' to
+                                # turn it off if that's not wanted.
 last_analysis_time = {i: 0.0 for i in indices}
 last_found = {i: None for i in indices}  # most recent find_beam_blob() result
                                             # per camera, so the (throttled)
