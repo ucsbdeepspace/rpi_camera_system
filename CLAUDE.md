@@ -21,19 +21,38 @@ mechanism between them. Anyone picking this project up on a new machine
 should clone the repo and start fresh here, not expect prior-conversation
 context to carry over.
 
-**Laptop is now set up (2026-07-21)**: repo cloned there, ready to start
-the Nucleo firmware work below via STM32CubeIDE. Push access from the
-laptop still needs its own credential (a second deploy key or the user's
-personal GitHub access — the Pi's deploy key doesn't transfer, see above).
-Physical wiring between the Pi's header I2C1 (physical pin 5=SCL/GPIO3,
-pin 3=SDA/GPIO2, plus any GND pin — already confirmed live at
-`/dev/i2c-1`) and the Nucleo's I2C1 pins (PB6/PB7 by CubeMX default, but
-confirm against the L432KC's actual Nucleo-32 header pinout in CubeMX's
-Pinout View before connecting, since this board's connector doesn't match
-the bigger Nucleo-64 Arduino/Morpho layout) hasn't been done yet — no
-level shifter needed, both boards are 3.3V logic.
+**Laptop is now set up (2026-07-21)**: repo cloned there. Push access from
+this laptop works via HTTPS + Git Credential Manager (`credential.helper =
+manager`), confirmed — no separate deploy key was needed, unlike the
+original assumption below.
 
-## IN PROGRESS: streaming beam position to an STM32 Nucleo over I2C — Pi side done and pushed, Nucleo firmware not started (2026-07-16)
+**Nucleo firmware bring-up done from the laptop (2026-07-21)** — see the
+"IN PROGRESS" section below for full detail. Summary: CubeIDE project
+`camera_centroid_receiver` (workspace
+`STM32CubeIDE/workspace_1.14.0/camera_centroid_receiver` on the laptop)
+configures I2C1 as a slave at address `0x42` and receives/checksums the
+8-byte packet from `nucleo_i2c_sender.py`, with a USART2→ST-Link VCP debug
+print added for visibility. **Important gap: this CubeIDE project is NOT
+part of this git repo** — it's a separate workspace living only on this
+one laptop, unlike every other artifact this file tracks. If the laptop is
+lost/reimaged, that firmware work is gone. Worth deciding later whether to
+fold it into this repo (e.g. as a subdirectory, with build artifacts
+gitignored) or a separate repo — not done yet, flagging so it isn't
+forgotten.
+
+Physical wiring between the Pi's header I2C1 (physical pin 5=SCL/GPIO3,
+pin 3=SDA/GPIO2, plus GND) and the Nucleo's I2C1 pins (board silkscreen
+labels `D5`=PB6=SCL, `D4`=PB7=SDA, confirmed against CubeMX's own PB6/PB7
+pin assignment) is **done** — no level shifter needed, both boards are
+3.3V logic, Pi's I2C1 header pins have built-in pull-ups. **End-to-end
+validation is in progress, not yet confirmed**: `nucleo_serial_monitor.py`
+(new laptop-side script, this repo) reads the Nucleo's VCP debug line
+stream while `nucleo_i2c_sender.py` runs on the Pi, but no one has yet
+reported back an actual observed `seq=... x=... y=... errs=0` stream
+proving a full round trip — treat the link as wired and code-complete but
+**not yet hardware-validated** until that's confirmed.
+
+## IN PROGRESS: streaming beam position to an STM32 Nucleo over I2C — Pi side done and pushed, Nucleo firmware built, hardware validation pending (2026-07-21)
 
 First step past pure characterization: closing the loop out to an external
 controller. **Pi-side hardware now exists**: a NUCLEO-L432KC board and a
@@ -110,6 +129,75 @@ the NUCLEO-L432KC + STM32CubeIDE:
 4. **Only then** run `beam_position_streamer.py` for real — `--dry-run`
    first to reconfirm detection still works on whatever hardware state
    the cameras are in, then live against the Nucleo.
+
+### Nucleo firmware built, wiring done, hardware validation pending (2026-07-21)
+
+Steps 1-3 above are now done (step 4, the real camera-driven streamer, is
+still not started — only the fake-orbit smoke test in step 3 has been
+attempted). Built via STM32CubeIDE on the laptop, project
+`camera_centroid_receiver` (**not part of this git repo** — see the note
+near the top of this file).
+
+**CubeMX config**: I2C1 as slave, PB6/PB7 (SCL/SDA, matches
+`nucleo_i2c_sender.py`'s expectation), address `0x42`, NVIC event+error
+interrupts enabled, clock stretching allowed (`NoStretchMode` disabled).
+USART2 added for a VCP debug print: PA2=TX (correct, ST-Link default) —
+**PA15 should be RX but CubeMX auto-picked PA3 instead and this was never
+corrected**; harmless for now since the firmware only transmits, never
+receives, but fix it in the Pinout view (reset PA3, assign PA15 to
+`USART2_RX`) before anyone needs real two-way serial.
+
+**Real bug found and fixed**: CubeMX's own address-entry field
+("Primary Slave Address" in I2C1's Parameter Settings) wants the **raw**
+7-bit address (`0x42`), not pre-shifted — entering the pre-shifted value
+(`0x84`) gets silently rejected/reset to 0 by the GUI's own validation.
+CubeMX then correctly emits the shifted value (`hi2c1.Init.OwnAddress1 =
+132`, i.e. `0x84`) into generated code itself — confirmed by inspecting
+the regenerated `main.c`. This matters because STM32's `HAL_I2C_Init()`
+writes `OwnAddress1` straight into the `OAR1` register with no shift of
+its own (bit 0 is reserved in 7-bit mode) — so *some* layer has to apply
+the `<<1`, and it turns out to be CubeMX's code generator, not HAL, and
+the GUI field expects the un-shifted input. Get this backwards (as an
+early hand-edit here briefly did) and the slave silently never ACKs the
+right address.
+
+**Firmware behavior**: `HAL_I2C_Slave_Receive_IT` arms an 8-byte one-shot
+reception matching `nucleo_i2c_sender.py`'s exact wire format
+(`reg_ptr, seq, status, x_lo, x_hi, y_lo, y_hi, checksum`).
+`HAL_I2C_SlaveRxCpltCallback` validates the additive checksum, drops the
+packet silently on mismatch (counted in `g_checksum_error_count`, never
+trusted into `g_latest_beam`), and re-arms for the next transaction;
+`HAL_I2C_ErrorCallback` also re-arms so a NACK/bus glitch can't leave the
+slave stuck waiting forever. PB3 (LD3, per the L432KC user manual —
+**not independently hardware-verified**, board uses a bare MCU selection
+not a board file) toggles on every valid packet as an at-a-glance
+heartbeat. The ISR itself stays short — it just parses, checksums, and
+sets a flag; the actual VCP print (`seq=.. status=.. x=.. y=.. pkts=..
+errs=..`, via `HAL_UART_Transmit`) happens from the main loop polling
+that flag, specifically to avoid a blocking UART call from interrupt
+context.
+
+**Physical wiring — done**: Pi header physical pin 5 (SCL/GPIO3) ↔ Nucleo
+`D5` (PB6/SCL); Pi physical pin 3 (SDA/GPIO2) ↔ Nucleo `D4` (PB7/SDA); a
+Pi GND pin ↔ a Nucleo GND pin. No level shifter or external pull-ups
+needed (3.3V both sides, Pi header already has pull-ups).
+
+**Laptop-side tooling**: `nucleo_serial_monitor.py` (new, this repo) opens
+the Nucleo's ST-Link VCP port (auto-detected via `pyserial`'s
+`list_ports`, matching on "STLink"/"STMicroelectronics" in the USB
+description) and timestamps each line. Needs `pyserial` installed into
+*whichever* Python interpreter actually runs it — on this laptop that
+tripped a `ModuleNotFoundError` once already because `pip install
+pyserial` and the VS Code run button resolved to different Python
+installs (3.11 vs. the Windows Store 3.10 vs. an Anaconda env); fixed by
+installing explicitly into the one VS Code runs (`py -3.11 -m pip install
+pyserial`). Worth remembering if this bites again on another machine.
+
+**Not yet confirmed**: no one has reported back an actual observed
+`seq=... x=... y=... errs=0` stream while `nucleo_i2c_sender.py` runs on
+the Pi — the link is wired and both sides' code is believed correct, but
+this is still an untested claim, not a validated one, until that's seen
+live.
 
 ## RESOLVED (practically, not root-caused to a fix): unbinned ROI modes invert bright point sources — root cause pinpointed, use binned modes instead (2026-07-15)
 
