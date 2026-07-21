@@ -56,7 +56,7 @@ both sides individually looking plausible. See "Nucleo firmware built,
 wiring done" below for the full firmware detail; that section's earlier
 "not yet hardware-validated" caveat is now resolved.
 
-## IN PROGRESS: streaming beam position to an STM32 Nucleo over I2C — Pi side done and pushed, Nucleo firmware built and hardware-validated, real camera streaming not yet started (2026-07-21)
+## IN PROGRESS: streaming beam position to an STM32 Nucleo over I2C — camera_view_tool.py now streams real centroids by default, sub-pixel precision fix needs a matching firmware update, live end-to-end not yet reconfirmed (2026-07-21)
 
 First step past pure characterization: closing the loop out to an external
 controller. **Pi-side hardware now exists**: a NUCLEO-L432KC board and a
@@ -225,7 +225,73 @@ throughout, `x`/`y` smoothly traced the sender's sine/cosine orbit, and
 **Next step**: run `beam_position_streamer.py` for real (item 4 in the
 numbered list above) — `--dry-run` first to reconfirm beam detection
 still works on whatever hardware state the cameras are in, then live
-against the Nucleo. Not started yet.
+against the Nucleo. Not started yet — superseded in practice by
+`camera_view_tool.py` gaining its own streaming path, below, which is what
+actually got exercised first.
+
+### `camera_view_tool.py` gains built-in full-speed I2C streaming; sub-pixel centroid precision fixed (2026-07-21)
+
+Prompted by a real user session: running `camera_view_tool.py` against the
+wired-up Nucleo and seeing nothing arrive on `nucleo_serial_monitor.py` —
+turned out streaming was never wired into that script at all, only into
+`beam_position_streamer.py` (which had never actually been run for real).
+Rather than chase that one gap, gave `camera_view_tool.py` — the tool
+actually being used on the bench — its own streaming path directly,
+independent of `beam_position_streamer.py`:
+
+- **Full-speed streaming, decoupled from the display.** Beam detection
+  normally throttles to ~20Hz (`ANALYSIS_INTERVAL_S`) to save fps for a
+  merely-displayed camera; for whichever camera is streaming, that
+  throttle is bypassed entirely — `find_beam_blob` and the I2C send run on
+  every captured frame (the same ~339fps cost `beam_position_streamer.py`
+  already pays and accepts), while the on-screen view still only redraws
+  at ~15Hz (`DISPLAY_INTERVAL_S`). Auto-track recentering (if `t` is also
+  on) stays gated at the slower ~20Hz cadence regardless, since its real
+  cost is the `set_roi_y_start` subprocess call, not detection —
+  recentering on every streamed frame would reintroduce the original
+  auto-track-at-50Hz fps-collapse bug documented elsewhere in this file.
+- **Streaming is ON BY DEFAULT (camera 0)**, no flag needed — first cut
+  made it opt-in (`--stream`), then flipped to default-on after exactly
+  the "why isn't anything arriving" confusion above. `--no-stream` goes
+  back to pure bench-viewer mode (no `NucleoLink`/`smbus2` touched at
+  all); `--stream-cam N` picks a different camera; `--dry-run` computes
+  and reports without actually sending.
+- **A missing/unresponsive Nucleo is now a warning, not a crash.** Both
+  opening the link and each individual send are wrapped: a failed
+  `NucleoLink()` construction, or a per-frame `OSError` (e.g. the
+  `TimeoutError` smbus2 raises on a dead/unwired bus — the exact symptom
+  hit earlier this session during Nucleo bring-up), prints `WARNING: I2C
+  send to Nucleo failed (...)` with a running failure count and keeps the
+  viewer running — detection/display are unaffected, only the send itself
+  is best-effort. Worth knowing: a failing send blocks on the kernel's I2C
+  timeout, so a dead link will also visibly cap capture fps until it
+  recovers, not just silently drop sends.
+- **Fixed a real precision bug: sub-pixel centroids were being thrown away
+  before they reached the wire.** `find_beam_blob` computes an
+  intensity-weighted (sub-pixel) centroid, but both `camera_view_tool.py`
+  and `beam_position_streamer.py` were rounding to a whole pixel *before*
+  calling `NucleoLink.send_position` — the fractional part never had a
+  chance to be sent. Fixed by moving the rounding into
+  `NucleoLink.send_position` itself: it now takes real (float) pixel
+  coordinates and scales by a new `POSITION_SCALE = 10` before packing
+  into the existing `s16` field — no packet growth, no float-on-the-wire
+  endianness/alignment fragility (max real coordinate 1280/800 scales to
+  ±12800/±8000, comfortably inside `s16`'s ±32767 ceiling). Verified the
+  encode/decode math directly (mocking the I2C write, no hardware
+  involved): `585.37` sent → decodes back to `585.4`.
+  **The Nucleo firmware (outside this repo, not yet updated) must divide
+  received x/y by `POSITION_SCALE` (10) to recover real pixels — this is a
+  wire-format change, not backward compatible with the firmware described
+  above as-is.**
+- Committed and pushed to `origin/master`: `c67013e` (opt-in `--stream`),
+  `7c60805` (default-on + failure resilience + `POSITION_SCALE` fix).
+- **Not yet confirmed**: no live report of `camera_view_tool.py`
+  successfully streaming real detected positions to the Nucleo and being
+  seen on `nucleo_serial_monitor.py`. The default-on flip addresses the
+  original "nothing arrives" symptom, but that fix plus the
+  `POSITION_SCALE` change together haven't been confirmed live against the
+  real Nucleo — and can't be, fully, until the firmware's own divide-by-10
+  update is made on the laptop side.
 
 ## RESOLVED (practically, not root-caused to a fix): unbinned ROI modes invert bright point sources — root cause pinpointed, use binned modes instead (2026-07-15)
 
@@ -1672,7 +1738,12 @@ one camera works now" rather than "only one camera came up THIS boot."
   + center dot) at the intensity-weighted centroid, and shows a live
   per-camera fps counter. `h` cycles ROI height (800 -> 400 -> 200 -> 800,
   each a full stop/reconfigure/start) and auto-centers each new window on
-  wherever that camera's beam was last confidently seen. `q` quits.
+  wherever that camera's beam was last confidently seen. `q` quits. **Also
+  streams camera 0's centroid to the Nucleo over I2C by default** (full
+  capture speed, decoupled from the ~15Hz display -- see the "gains
+  built-in full-speed I2C streaming" section above); `--no-stream` for
+  pure bench-viewer mode, `--stream-cam N`, `--dry-run`. Live end-to-end
+  streaming not yet reconfirmed (see that section).
 - `roi_live_demo.py` — interactive live demo: both camera ROI feeds side by
   side with a live fps overlay, independent per-camera control (`1`/`2`
   picks the active camera, `w`/`s` move its ROI while streaming, `r`
@@ -1685,14 +1756,20 @@ one camera works now" rather than "only one camera came up THIS boot."
   `640x200`, step=20 rows.
 - `beam_position_streamer.py` — headless capture -> detect -> stream to an
   STM32 Nucleo over I2C, no display. `python3 beam_position_streamer.py
-  [WxH] [--y-start N] [--dry-run]`, defaults to full-sensor 1280x800.
-  Untested against real hardware — see the "streaming beam position"
-  section above.
-- `nucleo_i2c_sender.py` — `NucleoLink` class used by
-  `beam_position_streamer.py` to send the register-mapped position packet
-  over I2C; also runnable standalone for a smoke test (sends a fake
-  orbiting position). Untested against real hardware — see the "streaming
-  beam position" section above.
+  [WxH] [--y-start N] [--dry-run]`, defaults to full-sensor 1280x800. The
+  fake-orbit I2C link itself is confirmed live end-to-end (see "streaming
+  beam position" section above), but this script's own real camera-driven
+  send has still never been run for real — `camera_view_tool.py`'s
+  built-in streaming got exercised first instead.
+- `nucleo_i2c_sender.py` — `NucleoLink` class used by both
+  `beam_position_streamer.py` and `camera_view_tool.py` to send the
+  register-mapped position packet over I2C; also runnable standalone for
+  a smoke test (sends a fake orbiting position). `send_position(x, y)`
+  takes real (float) pixel coordinates and internally scales by
+  `POSITION_SCALE` (10) to preserve one decimal digit of sub-pixel
+  centroid precision in the wire's `s16` field — the Nucleo firmware
+  (outside this repo) must divide by `POSITION_SCALE` to match, not yet
+  done. See "gains built-in full-speed I2C streaming" above.
 - `led_dual_camera_closed_loop_test_single_process.py`,
   `led_dual_camera_closed_loop_test_mp_buf1.py` — comparison baselines,
   already answered their questions, probably don't need to run again
