@@ -56,6 +56,180 @@ both sides individually looking plausible. See "Nucleo firmware built,
 wiring done" below for the full firmware detail; that section's earlier
 "not yet hardware-validated" caveat is now resolved.
 
+## IN PROGRESS: FTA position calibration — DAC setpoint → camera centroid, `fta_calibration.py` built, not yet run against hardware (2026-07-23)
+
+Motivating idea (user): to close the loop out to an actual servo, sweep the
+FTA over a grid of actuator setpoints, record where each one puts the beam
+centroid, fit a matrix that captures the transform (including offset), then
+invert it to command a desired centroid position. Settled on a 3x3
+homogeneous affine (2x2 gain block + offset) for a single camera/2-axis
+actuator, not a 4x4 — a 2-camera version (4 observed numbers, 2 actuator
+inputs, overdetermined least-squares) was discussed as a later "average out
+per-camera noise" idea, not built yet.
+
+**Wrong turn, corrected**: initially assumed the FTA-driving Nucleo would
+need a *new* I2C actuator-command packet, and started extending
+`nucleo_i2c_sender.py` (`REG_POINTER_ACTUATOR`, `NucleoLink.set_actuator()`)
+based on the wrong reference repo (`ucsbdeepspace/fta_calibration`, an old
+pyboard-driven rig). **Fully reverted** (`git checkout --`) once the actual
+reference repo was found: `ucsbdeepspace/7-element-array`, branch
+`lock_in_2` (private). `nucleo_i2c_sender.py` is unchanged from before this
+session.
+
+**What that repo actually shows** (an "FTA Controller" STM32L432 CubeIDE
+project — matches this project's NUCLEO-L432KC): the FTA is driven over
+**USB-serial, not I2C** — an ASCII line-command protocol at **460800 baud**
+(matches `FTA_GUI_PID.py`, an existing PyQt host GUI already using this
+exact protocol) straight to two `DAC1` channels, 12-bit (`0`-`4095`,
+firmware's own default safety clamp is **95-4000**, not the full range).
+Direct commands `set_x <n>` / `set_y <n>` snap to an absolute setpoint
+instantly; there's also a full PID framework (`set_kp_x`/`ki_x`/`kd_x`
+etc., currently driving a lock-in/photodiode dither-and-gradient-ascent
+tracker — matches the `lock_in_2` branch name, a different sensing
+modality than this project's camera). Most useful find: an **already-working
+`grid_scan x1 y1 x2 y2` command** that smoothly microsteps through a grid
+(deliberately avoiding backlash/shock — NOT the same as repeated
+instant `set_x`/`set_y` jumps) and streams one `SD <adc> <x_center>
+<y_center>\n` line per sampled point (sampled only on the downward Y pass,
+to avoid up/down hysteresis asymmetry). The `<adc>` field is that
+firmware's own onboard photodiode reading — a different physical sensor
+than this project's camera, not used by our fit but logged in case
+cross-referencing it is ever useful. There's also an ISR-level hard
+emergency-stop: sending a bare `!` byte (bypasses the line parser
+entirely) sets `stop_requested` immediately.
+
+**Repo access**: this repo's existing deploy key
+(`~/.ssh/id_ed25519_deepspace`) could not be reused — GitHub only allows a
+given public key to be a deploy key on one repo, and this one was already
+attached to `rpi_camera_system`. Generated a second keypair,
+`~/.ssh/id_ed25519_7element_array`, with a matching `~/.ssh/config` `Host
+github.com-7element-array` alias, added as a **read-only** deploy key on
+`ucsbdeepspace/7-element-array`. Cloned `lock_in_2` (shallow) into
+scratchpad for reference only — not part of this repo, not committed here.
+
+**Clipboard wrinkle worth remembering**: pasting the deploy-key public key
+into GitHub's web UI silently failed via `xsel` even though the command
+reported success — this Pi's desktop (`labwc`/Wayland) runs Firefox as a
+**native Wayland client**, and `xsel` only reaches X11/XWayland clients, so
+it was setting a clipboard Firefox never saw. Fix: `sudo apt-get install -y
+wl-clipboard`, then `wl-copy` — that's the one that actually landed in
+Firefox's paste. `xdotool` (used successfully elsewhere in this project,
+e.g. `roi_live_demo.py` validation) has the same X11-only limitation and
+also could not reach Firefox.
+
+**Built `fta_calibration.py`** (committed `4827072`, pushed to
+`origin/master`): reuses the firmware's own `grid_scan` command as-is (no
+firmware changes) rather than driving individual `set_x`/`set_y` calls
+per point from the Pi — this was a deliberate choice (user-confirmed) to
+inherit the firmware's already-validated smooth/backlash-aware travel and
+settle timing instead of reinventing it. Listens for `SD` lines purely as
+a per-grid-point capture trigger; on each one, captures and averages
+`--frames-per-point` (default 3) camera centroids via `find_beam_blob`
+(duplicated from `camera_view_tool.py`/`beam_position_streamer.py` per
+this project's established convention, not imported). After the sweep,
+fits the 3x3 affine via least-squares — **forward direction (DAC →
+centroid)**, deliberately: DAC setpoints are commanded exactly (noise-free
+independent variable) while centroids are noisy measurements, matching
+ordinary least-squares' assumption of where the noise lives. Inverts the
+fitted matrix for future centroid → DAC lookups, warns if the 2x2 gain
+block is near-singular (axes not independently moving the centroid) or if
+RMS residual is large (nonlinearity/hysteresis/bad point), and saves the
+raw sweep + both matrices to `results/fta_calibration_<UTC
+timestamp>.npz`. Sends the firmware's `!` emergency-stop byte on
+Ctrl-C/any abort so an interrupted run doesn't leave the FTA mid-scan.
+`--dry-run` captures/detects repeatedly without touching the Nucleo, to
+validate the camera pipeline alone. **Fit math validated against synthetic
+data only** (recovers a known matrix to within injected noise, inverse
+round-trips exactly) — script has never been run against real hardware.
+
+**Open architecture question, not yet resolved**: the FTA Controller
+Nucleo's USB will plug directly into this Pi (user-confirmed, no laptop
+hop for this link) — but whether that's the *same* physical Nucleo
+already wired for I2C centroid-receiving (running `camera_centroid_receiver`
+firmware, see below) or a second board is undecided. A single MCU can only
+run one firmware image at a time, so if it's the same board,
+`camera_centroid_receiver`'s and "FTA Controller"'s functionality will
+eventually need consolidating into one firmware image (or the I2C
+centroid-streaming role gets dropped in favor of driving the FTA directly
+from a Pi-computed setpoint) — flagging so it isn't forgotten, not
+decided yet.
+
+**Control law, not yet resolved**: once a trusted calibration matrix
+exists, the natural next step is a PI feedback loop using the fitted gain
+as the pixel-error → actuator-command conversion — NOT a single
+open-loop inverse-and-command, which wouldn't reject the 10-20Hz beacon
+disturbance this project's spec targets and wouldn't correct for
+calibration drift/hysteresis over time. Not designed or implemented yet.
+
+**Next steps**: (1) physically connect the Nucleo's USB to this Pi and
+confirm `fta_calibration.py --dry-run` finds the beam via the camera path;
+(2) resolve the one-board-vs-two-board question, then flash/confirm the
+right firmware; (3) run a real, conservative (narrow-range) first sweep,
+not the firmware's full 95-4000 default; (4) design the PI control law
+once a trusted calibration matrix exists.
+
+### Serial-vs-I2C latency estimated, then a real hardware check found the Nucleo needs reflashing first (2026-07-23)
+
+Asked to estimate the closed-loop performance hit of USB-serial (the FTA
+Controller's actual link) vs. I2C (this project's existing
+`nucleo_i2c_sender.py` link) before committing to the architecture.
+Physics-based estimate (not yet measured): raw wire-bit-time is
+comparable either way (~0.2-0.3ms), but USB-CDC's extra layers (1ms USB
+Full-Speed frame interval, `cdc_acm` driver buffering) likely add
+**~1-4ms of round-trip latency I2C doesn't have** — probably still inside
+Phil's 10ms budget if the real-time path is fire-and-forget (no waiting
+for the firmware's per-command ack line), but no longer "basically free"
+the way I2C was.
+
+Built `fta_serial_latency_test.py` (not yet committed) to replace that
+estimate with real numbers: three non-destructive modes —
+`ping` (round trip via read-only `get_status`), `setpos` (round trip via
+`set_x` re-sent with the FTA's OWN current position, so nothing actually
+moves, but exercises the real wait-for-ack command shape), and `burst`
+(fires N `set_x` commands back-to-back with zero waiting, then diffs the
+firmware's own `cmdq_stats` drop counter — a real 64-deep command queue,
+`CMD_Q_SIZE`/`cmd_q_dropped` in `main.c` — before vs. after, to check for
+genuine command loss at that send rate instead of guessing).
+
+**Tried to run it — the physical Nucleo now connected to this Pi's USB is
+still running `camera_centroid_receiver`, not "FTA Controller."**
+Verified directly, not assumed: at 460800 baud (the FTA Controller's
+rate), `get_status` produced garbage bytes — a baud-rate mismatch
+signature, not silence. Dropping to 115200 baud immediately revealed the
+old firmware's `heartbeat uptime=Ns pkts=N errs=N` line, exactly as
+documented in the "Nucleo firmware built" section further below. **This
+also resolves the one-board-vs-two-board question above: it's the same
+physical board** — flashing "FTA Controller" onto it will retire its I2C
+centroid-receiving role until the two are consolidated or it's reflashed
+back.
+
+**Handoff to the laptop, so this becomes runnable:**
+1. Unplug the Nucleo's USB from this Pi, plug it into the laptop.
+2. Clone (or pull) `ucsbdeepspace/7-element-array`, branch `lock_in_2`,
+   on the laptop. Try the laptop's existing HTTPS + Git Credential
+   Manager access first — same as already works for this repo,
+   `rpi_camera_system`, no separate deploy key needed there. Only fall
+   back to a laptop-specific deploy key (mirroring this Pi's
+   `id_ed25519_7element_array`, see above) if that account doesn't
+   already have access to this private repo.
+3. In STM32CubeIDE, **import the existing "FTA Controller" project**
+   (File → Import → Existing Projects into Workspace, point at the
+   cloned repo's `FTA Controller` folder) — it's a complete, already-built
+   project, nothing to create from scratch this time.
+4. Build, then flash with **Run, not Debug** — Debug halts at program
+   entry until Resume is pressed, which reads identically to a hang on
+   first boot (see the `camera_centroid_receiver` bring-up notes below
+   for this exact gotcha, hit once already on this project).
+5. Sanity-check from the laptop before moving the USB back: open a serial
+   terminal at **460800 baud**, send `get_status\n`, expect a `status:...`
+   reply. (This firmware has no idle heartbeat print, unlike the old
+   one — silence at idle is normal, it only replies to a sent command.)
+6. Move the USB back to this Pi, then:
+   `python3 fta_serial_latency_test.py --mode ping` (real round-trip
+   latency, replaces the estimate above) and
+   `python3 fta_calibration.py --dry-run` (camera pipeline check) before
+   a real sweep.
+
 ## IN PROGRESS: streaming beam position to an STM32 Nucleo over I2C — camera_view_tool.py now streams real centroids by default, sub-pixel precision fix needs a matching firmware update, live end-to-end not yet reconfirmed (2026-07-21)
 
 First step past pure characterization: closing the loop out to an external
@@ -1770,6 +1944,23 @@ one camera works now" rather than "only one camera came up THIS boot."
   centroid precision in the wire's `s16` field — the Nucleo firmware
   (outside this repo) must divide by `POSITION_SCALE` to match, not yet
   done. See "gains built-in full-speed I2C streaming" above.
+- `fta_calibration.py` — sweeps the FTA over a grid of DAC setpoints via
+  the (separate, USB-serial-driven) "FTA Controller" Nucleo's own
+  `grid_scan` command, pairs each sampled point with a camera centroid,
+  and fits a 3x3 DAC↔centroid affine (plus its inverse). `python3
+  fta_calibration.py X1 Y1 X2 Y2 [--grid-step N] [--raw-size WxH]
+  [--y-start N] [--port PORT] [--frames-per-point N] [--out PATH]
+  [--dry-run]`. Talks over serial (460800 baud), NOT the I2C link
+  `nucleo_i2c_sender.py`/`NucleoLink` use — see "FTA position calibration"
+  section above. Not yet run against real hardware.
+- `fta_serial_latency_test.py` — measures real round-trip latency
+  (`--mode ping`/`setpos`) and fire-and-forget burst throughput
+  (`--mode burst`, checks the firmware's own `cmdq_stats` drop counter)
+  to the "FTA Controller" Nucleo over serial, to replace the physics-based
+  estimate in "Serial-vs-I2C latency estimated" above with real numbers.
+  All modes non-destructive (re-sends the FTA's own current position, or
+  is read-only). Not yet committed, not yet run — blocked on reflashing
+  the Nucleo (see that section).
 - `led_dual_camera_closed_loop_test_single_process.py`,
   `led_dual_camera_closed_loop_test_mp_buf1.py` — comparison baselines,
   already answered their questions, probably don't need to run again
