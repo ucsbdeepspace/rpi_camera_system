@@ -502,6 +502,33 @@ trials once implementing the real controller, since 3 small-step repeats
 is not a lot of statistical confidence on the overshoot number
 specifically.
 
+**Repeated on `--axis y`, same protocol — pattern holds (2026-07-23):**
+
+| step | dominant axis | delta (px) | delta (µm) | rise time | overshoot | settling (2px / 6µm tol) |
+|---|---|---|---|---|---|---|
+| 95 → 2000 (large, 1905 counts) | cx | -121.3px | -364µm | unresolved | 0.0% | **1183ms** |
+| 2000 → 2100 (small, 100 counts) | cx | -6.5px | -20µm | unresolved | 0.0% | **83ms** |
+| 2100 → 2000 (small, reverse) | cx | 5.4px | 16µm | unresolved | 34.4% | **144ms** |
+| 2000 → 2100 (small, repeat) | cx | -5.4px | -16µm | unresolved | 0.0% | **22ms** |
+
+Dominant axis confirms `cx` for DAC-y steps, as expected from the ~90°
+rotation (not a fluke of testing DAC-x only). Same big-vs-small-step
+pattern holds: large step settled >10x slower (1183ms) than any small
+step (22-144ms) — corroborating evidence across both actuator axes that
+the slow big-step numbers are slew-rate/large-signal limiting, not a
+fundamental actuator speed limit. **One new wrinkle**: y-axis small-step
+settling times spread wider (22-144ms) than x-axis's tighter 45-80ms
+cluster — worth another look (more repeats, or check whether y's
+mechanical path has different damping/mass) before assuming both axes
+can share one `Kp`/`Ki` pair; may need per-axis gains rather than a
+single symmetric tuning.
+
+Combined 8-run dataset (4 per axis) published as an interactive artifact
+with hover tooltips, both axes' panels, and the full data table — see
+`fta_step_response.html` build (not checked into this repo, published via
+Claude's Artifact feature; regenerate from the `results/fta_step_response_*.npz`
+files if needed).
+
 ## IN PROGRESS: streaming beam position to an STM32 Nucleo over I2C — camera_view_tool.py now streams real centroids by default, sub-pixel precision fix needs a matching firmware update, live end-to-end not yet reconfirmed (2026-07-21)
 
 First step past pure characterization: closing the loop out to an external
