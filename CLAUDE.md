@@ -203,32 +203,46 @@ physical board** — flashing "FTA Controller" onto it will retire its I2C
 centroid-receiving role until the two are consolidated or it's reflashed
 back.
 
-**Handoff to the laptop, so this becomes runnable:**
-1. Unplug the Nucleo's USB from this Pi, plug it into the laptop.
-2. Clone (or pull) `ucsbdeepspace/7-element-array`, branch `lock_in_2`,
-   on the laptop. Try the laptop's existing HTTPS + Git Credential
-   Manager access first — same as already works for this repo,
-   `rpi_camera_system`, no separate deploy key needed there. Only fall
-   back to a laptop-specific deploy key (mirroring this Pi's
-   `id_ed25519_7element_array`, see above) if that account doesn't
-   already have access to this private repo.
-3. In STM32CubeIDE, **import the existing "FTA Controller" project**
-   (File → Import → Existing Projects into Workspace, point at the
-   cloned repo's `FTA Controller` folder) — it's a complete, already-built
-   project, nothing to create from scratch this time.
-4. Build, then flash with **Run, not Debug** — Debug halts at program
-   entry until Resume is pressed, which reads identically to a hang on
-   first boot (see the `camera_centroid_receiver` bring-up notes below
-   for this exact gotcha, hit once already on this project).
-5. Sanity-check from the laptop before moving the USB back: open a serial
-   terminal at **460800 baud**, send `get_status\n`, expect a `status:...`
-   reply. (This firmware has no idle heartbeat print, unlike the old
-   one — silence at idle is normal, it only replies to a sent command.)
-6. Move the USB back to this Pi, then:
-   `python3 fta_serial_latency_test.py --mode ping` (real round-trip
-   latency, replaces the estimate above) and
-   `python3 fta_calibration.py --dry-run` (camera pipeline check) before
-   a real sweep.
+**Handoff to the laptop — DONE (2026-07-23).**
+1. ~~Unplug the Nucleo's USB from this Pi, plug it into the laptop.~~ Done.
+2. ~~Clone (or pull) `ucsbdeepspace/7-element-array`, branch
+   `lock_in_2`~~ — turned out **already done**, from an earlier,
+   unrelated session: already cloned on the laptop, already on
+   `lock_in_2`, even 2 commits ahead of `origin` (a prior local build).
+   No cloning or credential work needed after all.
+3. ~~Import the existing "FTA Controller" project~~ — also **already
+   done**: it (and a sibling `PWM FTA Driver` project) already showed up
+   in the same STM32CubeIDE workspace used for `camera_centroid_receiver`
+   (`workspace_1.14.0`), registered from that same earlier session. No
+   File → Import needed.
+4. **Built and flashed with Run (not Debug) — done, no issues.**
+5. **Sanity-checked — confirmed alive and healthy.** Sent `get_status\n`
+   at 460800 baud, got back `status:0,0,0,0,0,39269,0,0,0,0,0`. Decoded
+   against the field order in `FTA Controller/Core/Src/main.c` (~line
+   1058 — `controller_mode,x,y,amp_enabled,drv_enabled,uptime_ms,
+   adc_stale_cnt,adc_total_cnt,isr_overrun_cnt,isr_max_cycles,
+   cmd_q_dropped`): `MODE_IDLE`, amp/driver both off (safe default),
+   `uptime_ms=39269` consistent with a board freshly flashed and running,
+   every error/drop counter at zero. A genuinely healthy idle boot, not
+   garbage bytes or a stale/crashed reply.
+6. **Nucleo's USB moved back to this Pi.** Not yet run from here:
+   `python3 fta_serial_latency_test.py --mode ping` and
+   `python3 fta_calibration.py --dry-run` — both still the actual next
+   step, nothing beyond the sanity check above has been exercised yet.
+
+**Board is now running "FTA Controller" firmware, not
+`camera_centroid_receiver`** — the I2C centroid-receiving role documented
+in the section below is retired until the two get consolidated or it's
+reflashed back (see "one-board-vs-two-board question," now resolved,
+above). While `camera_centroid_receiver` was still open on the laptop (but
+**before** reflashing over it), a real bug was fixed in its *source* —
+see "sub-pixel precision fix needs a matching firmware update" below —
+but that fix was **deliberately never flashed**, since the board was
+about to be overwritten with "FTA Controller" anyway and reflashing twice
+in a row would have been pure waste. **If `camera_centroid_receiver` is
+ever put back on this board, remember it needs a rebuild+reflash first**
+— the currently-installed image on any board running that firmware
+predates the `POSITION_SCALE` divide-by-10 fix.
 
 ## IN PROGRESS: streaming beam position to an STM32 Nucleo over I2C — camera_view_tool.py now streams real centroids by default, sub-pixel precision fix needs a matching firmware update, live end-to-end not yet reconfirmed (2026-07-21)
 
