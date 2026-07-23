@@ -21,25 +21,34 @@ Three independent, standalone measurements (pick with --mode):
     control would use). Represents the wait-for-ack pattern
     FTA_GUI_PID.py's existing host driver uses.
 
-  burst -- fire-and-forget throughput: sends --burst-n `set_x <current
-    x_center>` commands back-to-back with NO waiting between them (true
-    fire-and-forget, no ack read), then diffs the firmware's own
-    `cmdq_stats` drop counter (a 64-deep command queue, see main.c's
-    cmd_q_dropped/CMD_Q_SIZE) before vs. after to check whether any were
-    lost at that send rate. A synthetic per-command estimate can't answer
-    "how fast can we drive this without loss" -- only the firmware's own
-    queue-depth telemetry can.
+  burst -- fire-and-forget throughput AT MAX SPEED: sends --burst-n `set_x
+    <current x_center>` commands back-to-back with NO waiting between them
+    (true fire-and-forget, no ack read, no pacing), then diffs the
+    firmware's own `cmdq_stats` drop counter (a 64-deep command queue, see
+    main.c's cmd_q_dropped/CMD_Q_SIZE) before vs. after to check whether
+    any were lost. Proves "too fast" but doesn't find the safe ceiling --
+    see `sweep` for that.
+
+  sweep -- paced fire-and-forget at a list of candidate fixed rates
+    (--sweep-rates, Hz, default spans 100-2500), --sweep-n commands at
+    each rate, checking cmdq_stats drops (before/after diff, same as
+    burst) at every rate to find the highest one with zero drops. Reports
+    BOTH the requested and actually-achieved send rate per row -- at high
+    requested rates Python's own loop/timing overhead can itself become
+    the limit before the firmware does, so a requested rate whose achieved
+    rate falls well short of it isn't really testing what it claims.
 
 For ping/setpos, reports min/mean/median/p95/p99/max round-trip time in
 milliseconds over --trials repeats (default 300).
 
-All three modes are non-destructive by design: get_status is read-only,
-and set_x is always re-sent with its OWN currently-read value, so the FTA
+All modes are non-destructive by design: get_status is read-only, and
+set_x is always re-sent with its OWN currently-read value, so the FTA
 never actually moves -- safe to run against real hardware repeatedly.
 
 Usage:
-  python3 fta_serial_latency_test.py [--mode ping|setpos|burst]
-      [--trials N] [--burst-n N] [--port PORT] [--baud BAUD]
+  python3 fta_serial_latency_test.py [--mode ping|setpos|burst|sweep]
+      [--trials N] [--burst-n N] [--sweep-rates R1,R2,...] [--sweep-n N]
+      [--port PORT] [--baud BAUD]
 
 Requires the Nucleo's USB connected directly to this Pi (not the laptop).
 Not yet run against real hardware -- written from the firmware source in
@@ -102,18 +111,26 @@ def get_current_x(ser):
     raise RuntimeError("No get_status reply -- check the serial link/firmware.")
 
 
-def get_cmdq_stats(ser):
-    ser.reset_input_buffer()
-    ser.write(b"cmdq_stats\n")
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline:
-        raw = ser.readline()
-        if not raw:
-            continue
-        m = CMDQ_STATS_RE.match(raw.decode(errors="replace").strip())
-        if m:
-            return int(m.group(1)), int(m.group(2))
-    raise RuntimeError("No cmdq_stats reply -- check the serial link/firmware.")
+def get_cmdq_stats(ser, retries=3):
+    """A single query occasionally gets no reply within the deadline when
+    called right after a fast burst (observed live during sweep testing,
+    root cause not fully pinned down -- possibly a residual ack from the
+    prior burst still in flight). Retried rather than treated as fatal, so
+    one flaky query doesn't take down an otherwise-fine rate."""
+    for attempt in range(retries):
+        ser.reset_input_buffer()
+        ser.write(b"cmdq_stats\n")
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            raw = ser.readline()
+            if not raw:
+                continue
+            m = CMDQ_STATS_RE.match(raw.decode(errors="replace").strip())
+            if m:
+                return int(m.group(1)), int(m.group(2))
+        # no reply this attempt -- brief pause, then retry
+        time.sleep(0.2)
+    raise RuntimeError(f"No cmdq_stats reply after {retries} attempts")
 
 
 def report(label, samples_s, requested_trials):
@@ -182,12 +199,60 @@ def run_burst(ser, burst_n):
         print("No drops -- this send rate is safe for fire-and-forget.")
 
 
+def run_sweep(ser, rates_hz, n_per_rate):
+    x = get_current_x(ser)
+    print(f"Current x_center={x} -- sweeping paced fire-and-forget `set_x {x}` "
+          f"at {len(rates_hz)} candidate rates, {n_per_rate} commands each "
+          "(no net movement, always re-sending the FTA's own current position).")
+    line = f"set_x {x}\n".encode("ascii")
+
+    print(f"{'req_hz':>8} {'achieved_hz':>12} {'dropped':>8} {'drop_pct':>9}")
+    results = []
+    for rate in rates_hz:
+        period = 1.0 / rate
+        try:
+            _, dropped_before = get_cmdq_stats(ser)
+
+            t_start = time.monotonic()
+            for i in range(n_per_rate):
+                t_target = t_start + i * period
+                now = time.monotonic()
+                if t_target > now:
+                    time.sleep(t_target - now)
+                ser.write(line)
+            t_end = time.monotonic()
+            achieved_rate = n_per_rate / (t_end - t_start)
+
+            time.sleep(0.5)  # let the firmware's main loop drain before checking
+            _, dropped_after = get_cmdq_stats(ser)
+        except RuntimeError as e:
+            print(f"{rate:>8.0f}          ?        ?  query failed: {e}")
+            continue
+        dropped_this = dropped_after - dropped_before
+        drop_pct = 100.0 * dropped_this / n_per_rate
+
+        print(f"{rate:>8.0f} {achieved_rate:>12.1f} {dropped_this:>8d} {drop_pct:>8.1f}%")
+        results.append((rate, achieved_rate, dropped_this))
+
+    clean = [r for r in results if r[2] == 0]
+    if clean:
+        best = max(clean, key=lambda r: r[0])
+        print(f"\nHighest tested rate with ZERO drops: requested {best[0]:.0f}Hz "
+              f"(achieved {best[1]:.1f}Hz), n={n_per_rate} each.")
+    else:
+        print("\nEven the lowest tested rate showed drops -- try lower rates "
+              "with --sweep-rates.")
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--mode", choices=["ping", "setpos", "burst"], default="ping")
+    parser.add_argument("--mode", choices=["ping", "setpos", "burst", "sweep"], default="ping")
     parser.add_argument("--trials", type=int, default=300)
     parser.add_argument("--burst-n", type=int, default=500)
+    parser.add_argument("--sweep-rates", default="100,200,400,600,800,1000,1200,1400,1600,1800,2000,2500")
+    parser.add_argument("--sweep-n", type=int, default=300)
     parser.add_argument("--port", default=None)
     parser.add_argument("--baud", type=int, default=460800)
     args = parser.parse_args()
@@ -211,6 +276,9 @@ def main():
             run_setpos(ser, args.trials)
         elif args.mode == "burst":
             run_burst(ser, args.burst_n)
+        elif args.mode == "sweep":
+            rates = [float(r) for r in args.sweep_rates.split(",")]
+            run_sweep(ser, rates, args.sweep_n)
     finally:
         ser.close()
 

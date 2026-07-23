@@ -244,6 +244,116 @@ ever put back on this board, remember it needs a rebuild+reflash first**
 — the currently-installed image on any board running that firmware
 predates the `POSITION_SCALE` divide-by-10 fix.
 
+### `fta_serial_latency_test.py` run for real — first attempt still showed the OLD firmware, reflash confirmed, then real numbers (2026-07-23)
+
+First re-check from the Pi after the laptop's flash still showed the old
+`camera_centroid_receiver` heartbeat at 115200 baud (same board serial
+number, so genuinely the same physical unit, just not actually
+reprogrammed yet) — turned out the first CubeIDE action taken had only
+**built**, not flashed. Re-done properly (Run, not just Build); re-checked
+from the Pi and confirmed a clean `status:...` reply at 460800 baud before
+trusting any timing numbers.
+
+**Real results, all three `fta_serial_latency_test.py` modes, committed
+firmware version, single run (not yet repeated across multiple sessions
+or actuator loads):**
+
+| mode | n | min | mean | median | p95 | p99 | max |
+|---|---|---|---|---|---|---|---|
+| `ping` (`get_status`, wait-for-reply) | 300/300 | 1.924ms | 2.141ms | 2.001ms | 2.935ms | 3.004ms | 5.527ms |
+| `setpos` (`set_x`, wait-for-ack) | 300/300 | 0.994ms | 1.261ms | 1.070ms | 1.937ms | 2.027ms | 2.138ms |
+| `burst` (500× `set_x`, zero waiting) | — | — | — | — | — | — | sent at **2824 cmds/sec**, but **257/500 (51%) dropped** |
+
+`setpos` (the command shape real control actually uses) came in *faster*
+than `ping` — likely just `get_status`'s longer reply line (11 comma-
+fields vs. `set_x`'s short ack) costing more polling-mode
+`HAL_UART_Transmit` time on the firmware side, not something specific to
+the command type.
+
+**Interpretation — what's actually known vs. still estimated:**
+- **I2C itself was never round-trip measured in this project** — the
+  `nucleo_i2c_sender.py` link was only ever validated for *correctness*
+  (seq/pkts lockstep, zero checksum errors against a fake orbit), never
+  benchmarked for latency. So "how much faster is I2C" is still a real
+  number (serial) being compared against an *estimate* (I2C,
+  ~0.2-1ms), not two measured numbers side by side.
+- **Taking the I2C estimate at face value**, serial's real wait-for-ack
+  cost (~1.3-2.1ms) is roughly **1-2ms slower per round trip** — a real
+  but modest gap. Stacked on top of the ~3.5-4ms mean per-camera
+  detection latency already measured for the best closed-loop
+  configuration (`MODE_640_100_ROI`), that's ~5-6ms total, still inside
+  Phil's 10ms budget with a few ms of margin — **probably doesn't matter
+  for round-trip latency alone**, if the real-time path avoids
+  waiting on acks.
+- **The throughput/reliability question — RESOLVED (2026-07-23), a real
+  safe ceiling found.** Added a `sweep` mode to
+  `fta_serial_latency_test.py`: paced fire-and-forget `set_x` at fixed
+  candidate rates (100-2500Hz), diffing `cmdq_stats`' drop counter at
+  each rate to find where drops actually start, instead of only knowing
+  "too fast" from the unthrottled `burst` result above. First run hit a
+  transient "no `cmdq_stats` reply" failure partway through (root cause
+  not fully pinned down — possibly a residual ack from the prior rate's
+  burst still in flight) that killed the whole sweep; fixed by adding
+  retries to `get_cmdq_stats` and making `run_sweep` skip a failed rate
+  instead of aborting. Re-run completed cleanly, all 12 rates:
+
+  | req Hz | achieved Hz | dropped | drop % |
+  |---|---|---|---|
+  | 100 – 1600 | matches request | **0** | **0.0%** |
+  | 1800 | 1796.4 | 36 | 12.0% |
+  | 2000 | 1999.2 | 72 | 24.0% |
+  | 2500 | 2496.4 | 116 | 38.7% |
+
+  **Safe fire-and-forget ceiling: ~1600Hz with zero drops**, degrading
+  sharply past that (a real cliff, not a gradual falloff). This is
+  comfortably above the fastest camera-side rate achieved anywhere in
+  this project (~880fps, `MODE_640_100_ROI`) — **throughput is not a
+  bottleneck for serial at any camera mode currently in use.** Combined
+  with the latency finding above (round-trip cost is small relative to
+  the 10ms budget), there's no longer a clear performance argument for
+  keeping the I2C link over serial for the real-time control path — the
+  remaining reasons to keep both (if any) would be architectural
+  (e.g. not wanting the Pi to be a single point of failure for actuation)
+  rather than performance-driven.
+
+**Full raw data (for slides) — test conditions**: 2026-07-23, Nucleo
+serial `SER=0666FF515152827187143833`, "FTA Controller" firmware
+(`ucsbdeepspace/7-element-array`, `lock_in_2`) freshly flashed, single
+run each (not repeated across sessions), `x_center` held at 95 throughout
+(the firmware's own default `roi_x_min` floor) — nothing physically
+moved for any of these numbers, all four tests re-send/query the FTA's
+own current position.
+
+Round-trip latency (`--trials 300` each):
+
+| mode | command | n | min (ms) | mean (ms) | median (ms) | p95 (ms) | p99 (ms) | max (ms) |
+|---|---|---|---|---|---|---|---|---|
+| ping | `get_status` (read-only) | 300/300 | 1.924 | 2.141 | 2.001 | 2.935 | 3.004 | 5.527 |
+| setpos | `set_x 95` (wait-for-ack) | 300/300 | 0.994 | 1.261 | 1.070 | 1.937 | 2.027 | 2.138 |
+
+Unthrottled burst (`--mode burst --burst-n 500`, zero pacing):
+
+| n sent | elapsed | achieved send rate | dropped | drop % |
+|---|---|---|---|---|
+| 500 | 177.1ms | 2824 cmds/sec | 257 | 51.4% |
+
+Rate-paced sweep (`--mode sweep`, default rate list, `--sweep-n 300` per rate):
+
+| requested Hz | achieved Hz | dropped (of 300) | drop % |
+|---|---|---|---|
+| 100 | 100.3 | 0 | 0.0% |
+| 200 | 200.7 | 0 | 0.0% |
+| 400 | 401.3 | 0 | 0.0% |
+| 600 | 601.9 | 0 | 0.0% |
+| 800 | 802.4 | 0 | 0.0% |
+| 1000 | 1003.0 | 0 | 0.0% |
+| 1200 | 1203.6 | 0 | 0.0% |
+| 1400 | 1404.1 | 0 | 0.0% |
+| 1600 | 1604.5 | 0 | 0.0% |
+| 1800 | 1796.4 | 36 | 12.0% |
+| 2000 | 1999.2 | 72 | 24.0% |
+| 2500 | 2496.4 | 116 | 38.7% |
+
 ## IN PROGRESS: streaming beam position to an STM32 Nucleo over I2C — camera_view_tool.py now streams real centroids by default, sub-pixel precision fix needs a matching firmware update, live end-to-end not yet reconfirmed (2026-07-21)
 
 First step past pure characterization: closing the loop out to an external
