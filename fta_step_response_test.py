@@ -59,6 +59,9 @@ Usage:
                        than that (unknown until this test has been run at
                        least once).
     --settle-tol-px PX pixel tolerance band for "settled", default 2.0
+                       (= 6.0um at this sensor's 3.0um/px pitch, confirmed
+                       via Picamera2's own UnitCellSize, not a datasheet
+                       guess -- see MICRONS_PER_PIXEL)
     --port PORT        FTA controller serial port, default auto-detect
     --out PATH         where to save the raw (t, cx, cy) time series --
                        default results/fta_step_response_<axis>_<UTC
@@ -82,6 +85,15 @@ from roi_set_selection import get_max_y_start, set_roi_y_start
 EXPOSURE_US = 1500
 ANALOGUE_GAIN = 4.0
 CAM_INDEX = 0
+
+# OV9281 physical pixel pitch, confirmed live via Picamera2(0).camera_properties
+# -- "UnitCellSize": (3000, 3000) nanometers -- not a datasheet guess. This is
+# the real-sensor pitch: since the pixel coordinates this script logs are
+# already scaled by v_bin (real absolute sensor pixels, same convention as
+# beam_position_streamer.py/fta_calibration.py), multiplying by this constant
+# directly gives real microns of centroid displacement regardless of which
+# raw_size/binning mode was used -- no separate binning correction needed here.
+MICRONS_PER_PIXEL = 3.0
 
 FRAME_DURATION_US_BY_SIZE = {
     (1280, 800): 6000,
@@ -330,7 +342,21 @@ def main():
     t = np.array([r[0] for r in records])
     cx = np.array([r[1] for r in records])
     cy = np.array([r[2] for r in records])
-    primary = cx if args.axis == "x" else cy
+
+    # Don't assume DAC-x drives pixel-x -- the actuator can be rotated
+    # relative to the camera (confirmed live on this rig: DAC-x mostly
+    # drives pixel-y, not pixel-x). Auto-pick whichever pixel axis actually
+    # moved more between the pre- and post-step windows as "primary" for
+    # the rise/overshoot/settling analysis below.
+    pre_mask, post_mask = t < t_step, t >= t_step
+    delta_cx = abs(cx[post_mask].mean() - cx[pre_mask].mean()) if pre_mask.any() and post_mask.any() else 0.0
+    delta_cy = abs(cy[post_mask].mean() - cy[pre_mask].mean()) if pre_mask.any() and post_mask.any() else 0.0
+    if delta_cy > delta_cx:
+        primary, primary_name = cy, "cy"
+    else:
+        primary, primary_name = cx, "cx"
+    print(f"Dominant response axis: {primary_name} (|delta cx|={delta_cx:.1f}px, "
+          f"|delta cy|={delta_cy:.1f}px) -- analyzing {primary_name}.")
 
     print(f"Captured {len(records)} frames ({t[-1] - t[0]:.3f}s span, "
           f"~{len(records) / (t[-1] - t[0]):.0f}fps average).")
@@ -339,8 +365,10 @@ def main():
     if metrics is None:
         print("Not enough frames before/after the step to compute metrics.")
     else:
-        print(f"baseline={metrics['baseline']:.2f}px  final={metrics['final']:.2f}px  "
-              f"delta={metrics['delta']:.2f}px")
+        um = MICRONS_PER_PIXEL
+        print(f"baseline={metrics['baseline']:.2f}px ({metrics['baseline']*um:.1f}um)  "
+              f"final={metrics['final']:.2f}px ({metrics['final']*um:.1f}um)  "
+              f"delta={metrics['delta']:.2f}px ({metrics['delta']*um:.1f}um)")
         if metrics["rise_time_s"] is not None:
             print(f"rise time (10%-90%): {metrics['rise_time_s'] * 1000:.1f}ms")
         else:
@@ -348,7 +376,8 @@ def main():
         if metrics["overshoot_pct"] is not None:
             print(f"overshoot: {metrics['overshoot_pct']:.1f}%")
         if metrics["settling_time_s"] is not None:
-            print(f"settling time (within {args.settle_tol_px}px): "
+            print(f"settling time (within {args.settle_tol_px}px / "
+                  f"{args.settle_tol_px*um:.1f}um): "
                   f"{metrics['settling_time_s'] * 1000:.1f}ms")
         if metrics["note"]:
             print(f"NOTE: {metrics['note']}")

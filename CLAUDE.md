@@ -420,6 +420,88 @@ path this camera sees; (2) once real movement is confirmed, run
 time/overshoot; (3) only then pick real `Kp`/`Ki` and implement the PI
 control law described above.
 
+### Root cause of the "hardware gap" — voice coil amplifier was unplugged; real step-response data now in hand (2026-07-23)
+
+Turned out to be exactly that simple: the voice coil's amplifier was
+physically unplugged. Re-checked with the same manual sweep used to find
+the gap (`set_x`/`set_y` across 95→4000→95, both axes): **real movement
+this time** — e.g. DAC-x 95→4000 moved the centroid from (658, 12) to
+(701, 325). Confirms the FTA is now genuinely steering this beam.
+
+**Confirmed a real ~90° axis rotation between the actuator and the
+camera**: DAC-x mostly drives pixel-**y** (not pixel-x), and DAC-y
+mostly drives pixel-**x**. Not a bug — a physical mounting/alignment
+fact about this rig. This is exactly why the control law design above
+decouples via the full 2x2 calibration gain block rather than assuming
+DAC-x↔pixel-x — that assumption would have been wrong here.
+
+**Bug found and fixed in `fta_step_response_test.py` itself**: the
+analysis picked `cx` as the "primary" trace for an x-axis step (and `cy`
+for a y-axis step) — given the axis rotation just confirmed, that's
+frequently the WRONG, weakly-responding pixel axis. First run's reported
+metrics (rise time 54ms, overshoot 78.7%, settling 132ms) were computed
+against `cx`'s 26px delta while `cy` moved 148px for the same step —
+analyzing noise, not signal. Fixed: now auto-picks whichever of cx/cy
+actually moved more between the pre- and post-step windows and reports
+which one it chose. All numbers below are post-fix.
+
+**Real step-response results, `--axis x`, full-sensor 1280x800:**
+
+Converted px → microns using the OV9281's real pixel pitch, confirmed
+live via `Picamera2(0).camera_properties["UnitCellSize"]` = `(3000,
+3000)` nanometers = **3.0µm/px** — not a datasheet guess, read directly
+off the running sensor. Applies directly here since these runs used
+full-sensor 1280x800 (`v_bin=1`, no binning correction needed); see
+`MICRONS_PER_PIXEL` in `fta_step_response_test.py`.
+
+| step | dominant axis | delta (px) | delta (µm) | rise time (10-90%) | overshoot | settling (2px / 6µm tol) |
+|---|---|---|---|---|---|---|
+| 95 → 2000 (large, 1905 counts) | cy | 161.1px | 483µm | unresolved (see below) | 22.4% | **793ms** |
+| 2000 → 2100 (small, 100 counts) | cy | 9.4px | 28µm | unresolved | 42.3% | **45ms** |
+| 2100 → 2000 (small, reverse) | cy | -8.1px | -24µm | unresolved | 0.0% | **67ms** |
+| 2000 → 2100 (small, repeat) | cy | 8.2px | 25µm | unresolved | 21.4% | **80ms** |
+
+**Rise time reads as ~0ms every time — a real measurement limitation, not
+a real result.** Effective valid-frame capture rate during these runs was
+only ~47-49fps (well under the ~143fps this raw size supports) — almost
+certainly because the beam moves fast/blurs during the sharpest part of
+a transition, dropping `find_beam_blob`'s confidence gate for exactly
+those frames. The result: sampling jumps straight from a pre-step frame
+to an already-mostly-settled post-step frame, with the truly fast part
+of the rise invisible to this method. The settling-time numbers are more
+trustworthy (measured during the slower tail, where detection is
+reliable), but rise time needs a different measurement approach (e.g. a
+faster/binned camera mode, or a photodiode-based approach) to resolve —
+not attempted yet.
+
+**The big finding: settling time depends heavily on step size, and this
+matters a lot for the control law.** The huge first step (1905 DAC
+counts) settled in ~793ms; three small steps (100 counts, closer to what
+a real disturbance-rejection correction would actually look like each
+cycle) settled in 45-80ms instead — over an order of magnitude faster.
+Reads as slew-rate/large-signal limiting on big moves, not a fundamentally
+slow actuator. **This is good news for the project's goal**: a ~45-80ms
+small-signal settling time implies a dominant time constant on the order
+of 10-20ms, i.e. an actuator bandwidth roughly comparable to (not
+dramatically worse than) the ~29Hz ceiling already estimated from pure
+loop latency — meaning the actuator's own dynamics probably aren't the
+single dominant bottleneck for rejecting the 10-20Hz disturbance, though
+neither leaves a lot of margin. Overshoot at small-signal is noisy
+(0-42% across 3 repeats) — expected, since a few pixels of detection
+noise is a much larger fraction of an ~8px step than of a ~161px one, so
+these percentages shouldn't be over-trusted individually, only as "yes,
+there's real overshoot, roughly tens of percent."
+
+**Practical implication for gain tuning (not yet done)**: use the
+small-step numbers as the basis for `Kp`/`Ki`, not the big-step numbers —
+the small-step regime is what real closed-loop disturbance rejection
+actually looks like. Expect to need real overshoot damping (via `Ki`
+tuned conservatively, or eventually `Kd` despite its noise-sensitivity
+cost) given the consistent nonzero overshoot observed. Repeat with more
+trials once implementing the real controller, since 3 small-step repeats
+is not a lot of statistical confidence on the overshoot number
+specifically.
+
 ## IN PROGRESS: streaming beam position to an STM32 Nucleo over I2C — camera_view_tool.py now streams real centroids by default, sub-pixel precision fix needs a matching firmware update, live end-to-end not yet reconfirmed (2026-07-21)
 
 First step past pure characterization: closing the loop out to an external
