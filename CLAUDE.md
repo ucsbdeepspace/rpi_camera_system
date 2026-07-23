@@ -354,6 +354,72 @@ Rate-paced sweep (`--mode sweep`, default rate list, `--sweep-n 300` per rate):
 | 2000 | 1999.2 | 72 | 24.0% |
 | 2500 | 2496.4 | 116 | 38.7% |
 
+### PI control law designed (roughly); step-response characterization built, but hits a real hardware gap — the FTA isn't moving this beam at all (2026-07-23)
+
+**Design discussed for the closed-loop control law** (not yet implemented
+as a script): since the target is basically fixed (keep the beacon
+centered) and the thing being fought is a disturbance (the 10-20Hz
+wobble), this is a regulator problem, not a moving-target-tracking one.
+Proposed structure: (1) a one-time feedforward jump using
+`fta_calibration.py`'s fitted `M_inv` to get near the right operating
+point immediately, then (2) a continuous PI trim every camera frame after
+that. Pixel error is converted into decoupled DAC-space error via the
+calibration's 2x2 gain block inverse (`A_inv = inv(M[:2,:2])`) *before*
+running two independent scalar PI loops — this reuses the calibration's
+already-captured cross-axis coupling instead of re-solving it. Key
+details flagged: use measured `dt` (not assumed-constant) for the
+integral term; anti-windup guard against the DAC clamp (the firmware
+clamps `set_x`/`set_y` independently, so the Python-side integral must
+also stop accumulating once saturated, or it overshoots when the
+disturbance reverses); freeze (don't integrate) on a lost-beam frame;
+start with PI, not PID, since a derivative term would amplify the
+centroid measurement's own pixel noise. **Gains (`Kp`/`Ki`) can't be
+derived analytically from the calibration alone** — that only captures
+the actuator's *static* gain, not its dynamic response (speed,
+overshoot, resonance), which is what actually limits how aggressively
+the loop can be tuned. A rough bandwidth sanity check from the latency
+numbers above: total loop delay (~3.5-4ms camera + ~1-2ms serial ≈
+5-6ms) puts a rule-of-thumb usable closed-loop bandwidth ceiling
+(`~1/(2π·delay)`) around 29Hz — rejecting a 10-20Hz disturbance looks
+plausible but without huge margin, reinforcing that the fastest safe
+camera+serial combination matters for this spec, not just as a nice-to-have.
+
+**Built `fta_step_response_test.py`** (not yet committed) to get the
+missing actuator-dynamics data before picking real gains: commands a
+step in one DAC axis via serial, captures camera frames at full speed
+spanning the step (reusing the `find_beam_blob` duplication convention),
+and computes rise time (10%-90%), overshoot, and settling time (within a
+configurable pixel tolerance) from the logged centroid-vs-time trace.
+Saves the raw time series to `results/` regardless of whether the
+computed metrics come out clean.
+
+**Tried to run it for real — found a hardware gap, not a script bug.**
+Before trusting the full timed test, sanity-checked with simple manual
+steps: a real beam IS visible and stably detected by camera 0 (~(541,
+214), consistent across many frames). But sweeping `set_x`/`set_y`
+across the *entire* safe DAC range (95 → 4000 → 95, both axes) produced
+**zero detectable centroid movement** — position stayed pinned within
+noise (&lt;0.3px) throughout. Checked whether the firmware's
+`amp_enable`/`drv_enable` gates (an amplifier/driver stage between the
+DAC and the physical actuator, off by default per `send_status_auto`'s
+own reported state) were the missing piece — enabled both explicitly
+(`amp_enable` → "Amplifier Enabled", `drv_enable` → "Driver enabled",
+confirmed via a clean `get_status` reparse: `amp_enabled=1
+drv_enabled=1`) and re-swept the DAC range again: **still zero
+movement.** This rules out "just needed to enable the amp/driver" and
+points at something further down the physical chain — the FTA actuator
+not actually connected/wired to whatever's steering this beam, or this
+camera not viewing the beam path this particular FTA actually steers.
+Not something software can diagnose further; needs a physical check of
+the actuator/optics setup.
+
+**Next steps**: (1) check the physical FTA-to-beam optical/mechanical
+path — is the actuator connected, powered, and actually in the beam's
+path this camera sees; (2) once real movement is confirmed, run
+`fta_step_response_test.py` for real to get rise time/settling
+time/overshoot; (3) only then pick real `Kp`/`Ki` and implement the PI
+control law described above.
+
 ## IN PROGRESS: streaming beam position to an STM32 Nucleo over I2C — camera_view_tool.py now streams real centroids by default, sub-pixel precision fix needs a matching firmware update, live end-to-end not yet reconfirmed (2026-07-21)
 
 First step past pure characterization: closing the loop out to an external
@@ -2078,13 +2144,22 @@ one camera works now" rather than "only one camera came up THIS boot."
   `nucleo_i2c_sender.py`/`NucleoLink` use — see "FTA position calibration"
   section above. Not yet run against real hardware.
 - `fta_serial_latency_test.py` — measures real round-trip latency
-  (`--mode ping`/`setpos`) and fire-and-forget burst throughput
-  (`--mode burst`, checks the firmware's own `cmdq_stats` drop counter)
-  to the "FTA Controller" Nucleo over serial, to replace the physics-based
-  estimate in "Serial-vs-I2C latency estimated" above with real numbers.
-  All modes non-destructive (re-sends the FTA's own current position, or
-  is read-only). Not yet committed, not yet run — blocked on reflashing
-  the Nucleo (see that section).
+  (`--mode ping`/`setpos`), fire-and-forget burst throughput at max speed
+  (`--mode burst`), and a rate-paced sweep to find the actual safe
+  fire-and-forget ceiling (`--mode sweep`) — all via the firmware's own
+  `cmdq_stats` drop counter, not a synthetic estimate. All modes
+  non-destructive. Run for real 2026-07-23, see "Serial-vs-I2C latency"
+  section above for the full results table.
+- `fta_step_response_test.py` — commands a step in one FTA DAC axis over
+  serial and logs camera centroid vs. time spanning the step, computing
+  rise time/overshoot/settling time — the actuator DYNAMICS data the
+  static `fta_calibration.py` matrix can't provide, needed before tuning
+  the PI control law's gains. `python3 fta_step_response_test.py
+  --step-to N [--axis x|y] [--step-from N] [--raw-size WxH] [--y-start N]
+  [--pre-s SEC] [--post-s SEC] [--settle-tol-px PX] [--port PORT]
+  [--out PATH]`. Built but not yet producing real data — see "PI control
+  law designed" section above: the FTA isn't currently moving the beam
+  this camera sees at all, a hardware gap unrelated to this script.
 - `led_dual_camera_closed_loop_test_single_process.py`,
   `led_dual_camera_closed_loop_test_mp_buf1.py` — comparison baselines,
   already answered their questions, probably don't need to run again
