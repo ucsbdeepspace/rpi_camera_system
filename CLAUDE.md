@@ -705,6 +705,7 @@ at `nucleo_firmware/camera_centroid_receiver/`, confirm the laptop has
 this repo cloned with push access (HTTPS + Git Credential Manager, per
 the "Laptop is now set up" note at the top of this file), `git add`/
 commit/push it before starting the DAC work above.
+
 ### Optional pre-reflash cross-check: `fta_closed_loop_fps_test.py` built to measure the REAL combined capture+detect+serial-send loop rate, before the I2C-DAC decision above makes it moot (2026-07-28)
 
 Written in a separate, concurrent session (before that session had seen the
