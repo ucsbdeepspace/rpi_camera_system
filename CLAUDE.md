@@ -691,6 +691,21 @@ repo, not independently confirmed this session. Once firmware exists:
 extend `nucleo_i2c_sender.py` with a `set_dac(x, y)`-style send method,
 and update `fta_calibration.py`/step-response/latency scripts to match.
 
+**Before editing it: fold `camera_centroid_receiver` into this repo
+(user-decided, 2026-07-28) — it currently lives ONLY as an uncommitted
+local CubeIDE workspace on the laptop (see the top-of-file note), a real
+data-loss risk that should be closed before adding more work on top of
+it.** Prepped from the Pi side (can't touch the laptop's files directly):
+`.gitignore` now has a `nucleo_firmware/*/{Debug,Release,*.o,...}` block,
+mirroring the existing `kernel_patch/` pattern (source/project tracked,
+per-build output not). **Remaining steps, from the laptop**: copy/move
+the CubeIDE project folder (currently
+`STM32CubeIDE/workspace_1.14.0/camera_centroid_receiver`) into this repo
+at `nucleo_firmware/camera_centroid_receiver/`, confirm the laptop has
+this repo cloned with push access (HTTPS + Git Credential Manager, per
+the "Laptop is now set up" note at the top of this file), `git add`/
+commit/push it before starting the DAC work above.
+
 ## IN PROGRESS: streaming beam position to an STM32 Nucleo over I2C — camera_view_tool.py now streams real centroids by default, sub-pixel precision fix needs a matching firmware update, live end-to-end not yet reconfirmed (2026-07-21)
 
 First step past pure characterization: closing the loop out to an external

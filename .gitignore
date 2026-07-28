@@ -11,3 +11,18 @@ kernel_patch/*/modules.order
 kernel_patch/*/.*.cmd
 kernel_patch/*/.tmp_versions/
 kernel_patch/*/.cache.mk
+
+# STM32CubeIDE build byproducts for firmware folded into this repo (source/
+# project files are tracked, per-build output is not -- same pattern as
+# kernel_patch/ above)
+nucleo_firmware/*/Debug/
+nucleo_firmware/*/Release/
+nucleo_firmware/*/*.o
+nucleo_firmware/*/*.d
+nucleo_firmware/*/*.elf
+nucleo_firmware/*/*.bin
+nucleo_firmware/*/*.hex
+nucleo_firmware/*/*.map
+nucleo_firmware/*/*.list
+nucleo_firmware/*/*.su
+nucleo_firmware/*/*.cyclo
