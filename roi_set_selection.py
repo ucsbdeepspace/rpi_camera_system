@@ -34,6 +34,7 @@ Usage as a module:
   from roi_set_selection import get_roi_y_start, set_roi_y_start
   actual = set_roi_y_start(0, 200)
 """
+import glob
 import re
 import subprocess
 import sys
@@ -43,57 +44,56 @@ from picamera2 import Picamera2
 PIXEL_ARRAY_HEIGHT = 800  # full sensor height every ROI mode crops within
 TOP_BASE = 8  # fixed ISP offset, independent of y_start (same at every stock mode)
 
-# Which CFE media device each camera's i2c control bus feeds -- THIS is
-# stable across boots/camera population (a physical/electrical association,
-# confirmed via libcamera's own startup log: "Registered camera
-# .../i2c@88000/... to CFE device /dev/media0"). Unlike the ov9281 entity's
-# own v4l-subdevN device-node NUMBER within that graph (see
-# _subdev_for_camera below), which is NOT stable.
-_CFE_MEDIA_BY_I2C_LABEL = {
-    "i2c@88000": "/dev/media0",
-    "i2c@80000": "/dev/media1",
-}
-
 
 def _subdev_for_camera(cam_index):
     """Map a Picamera2 camera index to its V4L2 subdev path by querying the
-    media graph directly, rather than a hardcoded subdev device-node number.
+    media graph directly, rather than any hardcoded device-node number.
 
     v4l2 subdev NUMBERS (e.g. /dev/v4l-subdev5) are NOT stable across boots
     -- they depend on total probe order system-wide, not just this camera.
-    Found live (2026-07-21): with only i2c@88000 enumerating this boot (the
-    already-documented intermittent i2c@80000 dropout -- see CLAUDE.md's
-    "Hardware status"), its ov9281 sensor landed at /dev/v4l-subdev2 -- the
-    exact number a two-camera boot had previously assigned to i2c@80000's
-    sensor instead. The old hardcoded {"i2c@88000": "/dev/v4l-subdev5", ...}
-    table silently pointed at the wrong device whenever camera population
-    differed from whatever boot it was last confirmed against -- v4l2-ctl
-    fails with a flat "Cannot open device", indistinguishable at a glance
-    from a genuine contention/exclusivity problem (this cost real
-    debugging time chasing the wrong theory before the stale mapping was
-    found to be the actual cause).
+    An earlier version of this function hardcoded which /dev/mediaN CFE
+    device each camera's i2c label (e.g. "i2c@88000") feeds, on the theory
+    that the CFE media device number -- unlike the v4l-subdevN node number
+    within it -- was a fixed physical/electrical association. That theory
+    was wrong: found live (2026-07-28) that with only one camera enumerating
+    this boot, i2c@88000 fed CFE device /dev/media3 (ISP device /dev/media0
+    -- a *different* device entirely, with no ov9281 entity at all), not
+    the previously-hardcoded /dev/media0. Same class of bug as the
+    subdev-number issue this function already existed to work around, one
+    layer up.
 
-    Fix: the CFE media device (/dev/mediaN) is stable (see
-    _CFE_MEDIA_BY_I2C_LABEL), so query THAT device's own topology for its
-    ov9281 entity's device node, instead of hardcoding the node number.
+    Fix: don't hardcode ANY /dev/mediaN number. Instead, scan every
+    /dev/media* device's topology for an "ov9281 <i2c-bus>-<i2c-addr>"
+    entity (e.g. "ov9281 10-0060"), and for each one found, resolve which
+    devicetree i2c label that Linux i2c bus number actually corresponds to
+    via sysfs (/sys/bus/i2c/devices/<bus>-<addr>/of_node -> a devicetree
+    path containing "i2c@88000" or "i2c@80000") -- genuinely fixed hardware
+    wiring, unlike any /dev/mediaN or /dev/v4l-subdevN enumeration order.
     """
     info = Picamera2.global_camera_info()
     cam_id = info[cam_index]["Id"]
-    media_dev = next((path for label, path in _CFE_MEDIA_BY_I2C_LABEL.items()
-                       if label in cam_id), None)
-    if media_dev is None:
-        raise ValueError(f"unrecognized camera Id, can't map to CFE media device: {cam_id}")
 
-    out = subprocess.run(["media-ctl", "-d", media_dev, "-p"],
-                          capture_output=True, text=True, check=True).stdout
-    lines = out.splitlines()
-    for i, line in enumerate(lines):
-        if re.match(r"- entity \d+: ov9281\b", line.strip()):
+    for media_dev in sorted(glob.glob("/dev/media*")):
+        out = subprocess.run(["media-ctl", "-d", media_dev, "-p"],
+                              capture_output=True, text=True).stdout
+        lines = out.splitlines()
+        for i, line in enumerate(lines):
+            m = re.match(r"- entity \d+: ov9281 (\S+)", line.strip())
+            if not m:
+                continue
+            bus_addr = m.group(1)  # e.g. "10-0060"
+            of_node = subprocess.run(
+                ["readlink", "-f", f"/sys/bus/i2c/devices/{bus_addr}/of_node"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+            i2c_label = of_node.rsplit("/", 2)[-2]  # e.g. "i2c@88000"
+            if i2c_label not in cam_id:
+                continue
             for follow in lines[i:i + 4]:
                 if "device node name" in follow:
                     return follow.split()[-1]
-    raise RuntimeError(f"no ov9281 entity found in {media_dev}'s topology "
-                        f"for camera {cam_index} ({cam_id})")
+    raise RuntimeError(f"no ov9281 entity found matching camera {cam_index} "
+                        f"({cam_id}) in any /dev/media* topology")
 
 
 def _get_crop(cam_index):

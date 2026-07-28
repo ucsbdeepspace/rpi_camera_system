@@ -161,12 +161,78 @@ open-loop inverse-and-command, which wouldn't reject the 10-20Hz beacon
 disturbance this project's spec targets and wouldn't correct for
 calibration drift/hysteresis over time. Not designed or implemented yet.
 
-**Next steps**: (1) physically connect the Nucleo's USB to this Pi and
-confirm `fta_calibration.py --dry-run` finds the beam via the camera path;
-(2) resolve the one-board-vs-two-board question, then flash/confirm the
-right firmware; (3) run a real, conservative (narrow-range) first sweep,
-not the firmware's full 95-4000 default; (4) design the PI control law
-once a trusted calibration matrix exists.
+**`fta_calibration.py --dry-run` run for real — CONFIRMED (2026-07-28).**
+`python3 fta_calibration.py 95 95 4000 4000 --dry-run` (grid corners unused
+in dry-run, just argparse-required): camera 0 opened at full-sensor
+1280x800, detected a real beam at ~(554, 32), stable across 5 captures
+(554.0-554.2, 32.2-32.4 — well under 1px jitter). Capture/detection
+pipeline confirmed working end-to-end; the Nucleo/serial side is still
+untouched by this test (that's the point of `--dry-run`).
+
+**Firmware/connection state re-confirmed (2026-07-28)**: same physical
+board (`SER=0666FF515152827187143833`), alive at 460800 baud, `get_status`
+→ `MODE_IDLE`, `amp_enabled=0`, `drv_enabled=0`, all error counters zero —
+still running "FTA Controller", healthy idle boot.
+
+**Does `fta_calibration.py` need to send `amp_enable` itself? Checked the
+firmware source directly (not assumed) — no.** `grid_scan_roi()` in `FTA
+Controller/Core/Src/main.c` (the routine the calibration sweep actually
+drives) enables the amp GPIO itself at the top and disables it again when
+the scan completes (`HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, ...)`,
+~line 1171/1240) — self-contained, no client-side enable step needed.
+Separately confirmed `drv_enable`/`drv_disable` (GPIO_PIN_9) is unrelated
+to the X/Y DAC path entirely — it only gates `move_z()`, the Z-stage
+stepper motor driver — so enabling it during the 2026-07-23 step-response
+debugging session was a red herring, not part of what actually fixed that
+issue (the physically unplugged amp cable). The `amp_enabled=0` idle
+default seen in `get_status` is expected and fine; only `set_x`/`set_y`
+(used by `fta_step_response_test.py`/`fta_serial_latency_test.py`, NOT by
+`fta_calibration.py`) skip the auto-gate and need a manual `amp_enable`.
+
+**First real sweep run — `fta_calibration.py 200 200 3900 3900` (2026-07-28)
+— completed but result is NOT trustworthy, correctly self-flagged.**
+462/1444 expected grid points recorded, saved to
+`results/fta_calibration_20260728T211217Z.npz`. Fit came back RMS residual
+**86.66px** (script's own sanity threshold is 5px) and a near-singular 2x2
+gain block (det = -3.658e-06, close to the script's 1e-6 warning
+threshold) — both warnings fired, calibration correctly rejected by the
+script's own checks. Root cause is two distinct real problems, not a
+script bug:
+
+1. **Beam leaves this camera's field of view above DAC-x ≈ 900-1000.** For
+   dac_x 200-900 the centroid moves substantially and sensibly (cy sweeps
+   ~4px to ~200px as dac_x rises, matching the already-confirmed DAC-x↔
+   pixel-y axis rotation). At dac_x ≥ ~1000 the centroid **freezes** at
+   ~(555, 30-40) — <1px drift for the rest of the DAC-x range (up to 3900)
+   and fully unresponsive to the entire dac_y sweep. That frozen value is
+   suspiciously close to the beam's pre-sweep idle rest position measured
+   in the same session's `--dry-run` (~554, 32) — best explanation: past
+   dac_x≈900-1000 the beam physically leaves this camera's FOV (or hits a
+   mechanical/optical limit) and the detector locks onto some other
+   static bright feature instead of the real beam, not real tracking data.
+2. **Real Pi-side serial data loss during the sweep.** Around
+   dac=(1100,500) a line arrived corrupted (`SSD 572 3600 400` — fails
+   the parser regex, silently dropped) and the log then jumps straight to
+   dac_x=3600 — DAC columns 1200-3500 (~24 columns, ~900 expected points)
+   never got recorded, with no corresponding time gap, meaning the
+   firmware kept scanning at full pace while Python's serial reads
+   desynced for a long stretch. Likely cause: `capture_centroid()` blocks
+   on 3 camera frames per `SD` line while `grid_scan` streams with no
+   flow control — if Python falls behind, the OS serial receive buffer
+   overflows. Not yet root-caused further or fixed.
+
+Fitting DAC 200-3900 as one linear affine averaged across two totally
+different regimes (real motion + a frozen artifact) is why RMS blew up —
+expected, not surprising, given the above.
+
+**Next steps**: (1) re-run a NARROWER sweep confined to where real beam
+motion was actually observed this session, e.g. dac_x 200-900ish (find
+the real upper bound more precisely first, e.g. with manual `set_x` steps
+around 900-1100), to get a trustworthy fit; (2) separately investigate
+the serial data-loss issue (e.g. whether `capture_centroid` needs to be
+faster, or the firmware needs pacing/flow control) before trusting a
+larger/full-range sweep; (3) design/implement the PI control law once a
+trusted calibration matrix exists.
 
 ### Serial-vs-I2C latency estimated, then a real hardware check found the Nucleo needs reflashing first (2026-07-23)
 
@@ -528,6 +594,102 @@ with hover tooltips, both axes' panels, and the full data table — see
 `fta_step_response.html` build (not checked into this repo, published via
 Claude's Artifact feature; regenerate from the `results/fta_step_response_*.npz`
 files if needed).
+
+### Architecture DECISION (not yet implemented): Nucleo becomes a dumb I2C-driven external DAC, all control logic stays in Python on the Pi (2026-07-28)
+
+Trigger: `camera_view_tool.py`'s default-on I2C streaming collapsed capture
+fps to ~0.9fps (from >100fps) because the physical Nucleo wired to the
+Pi's I2C1 header is currently flashed with "FTA Controller" firmware,
+which has no I2C slave role at all — every per-frame I2C send was blocking
+on the kernel's I2C timeout against a dead link (confirmed: `sudo
+i2cdetect -y 1` took >120s and found zero devices, vs. a healthy bus
+scanning near-instantly). Immediate fix was `--no-stream`; this section is
+the real architectural resolution discussed afterward.
+
+**Two firmware-consolidation options were compared, then a third,
+better one emerged:**
+1. Port I2C-receive into "FTA Controller" (so it gains a fast centroid
+   input), with the PI loop running either onboard or still in Python —
+   rejected as more complex than necessary: it means merging a real
+   command parser + PID framework + grid_scan travel logic into a new
+   I2C receive path, and firmware-side PID work doesn't reuse the
+   Python-side PI design already sketched above.
+2. **Chosen instead (user's idea): flip it — add DAC-output capability TO
+   `camera_centroid_receiver` (the I2C firmware), converting the Nucleo
+   into a pure external I2C-controlled DAC.** All control logic —
+   centroid detection, the calibration matrix, the PI loop itself —
+   stays in Python on the Pi, unchanged from the design already sketched
+   in the "PI control law designed" section above. The firmware's only
+   real-time job becomes: receive a checksummed I2C packet carrying an
+   (x, y) DAC setpoint, clamp it to a safe range, ensure amp/driver are
+   enabled, and write directly to the DAC1 output channels. No onboard
+   PID, no serial ASCII command parsing needed for the real-time control
+   path at all.
+
+**Why this is clean**: reuses the I2C slave transport
+(`camera_centroid_receiver`'s already-validated register-pointer +
+checksum packet convention) instead of building something new: I2C has
+lower overhead than USB-serial (no USB stack, no per-command ACK line to
+parse) and this project already proved the transport works end-to-end.
+Keeping all math in Python means the control loop stays easy to iterate
+on (no CubeIDE rebuild-and-reflash cycle just to tune a gain), and it's
+the same design already on paper — nothing about the PI/calibration plan
+above needs to change, only how the final setpoint gets to the actuator.
+
+**Confirmed via the firmware source (this session, read-only clone of
+`ucsbdeepspace/7-element-array` `lock_in_2`) that this is mechanically
+plausible**: "FTA Controller"'s own `.ioc`/`main.c` never touch I2C1 or
+pins PB6/PB7 at all — no conflict to work around. The actual DAC-write
+logic to port over is "FTA Controller"'s own `set_x`/`set_y`,
+`amp_enable`/`amp_disable`, `drv_enable`/`drv_disable` functions (see the
+"Serial-vs-I2C latency" section above for where these live in `main.c`).
+
+**Real open items, not yet resolved:**
+- **Same physical board, one firmware at a time** — moving to this
+  architecture means re-flashing back toward a `camera_centroid_receiver`
+  descendant (with DAC support added), retiring "FTA Controller" as the
+  flashed image again. Nothing about the underlying one-MCU constraint
+  changes; this is a different resolution of it than either option
+  floated on 2026-07-23, not a way around it.
+- **New I2C packet needed.** The existing packet
+  (`nucleo_i2c_sender.py`'s `seq/status/x/y/checksum` format) was designed
+  for camera→Nucleo *telemetry* (a centroid, for logging). A DAC setpoint
+  is a *command*, semantically different — decide on the laptop whether to
+  reinterpret the same wire format or add a distinct register-pointer
+  value, so the two meanings can't be confused if both roles are ever
+  needed at once.
+- **`fta_calibration.py` currently depends on "FTA Controller"'s own
+  `grid_scan`** for smooth, backlash-aware microstep travel between grid
+  points — that capability doesn't exist in `camera_centroid_receiver`.
+  Under this architecture, either Python has to replicate smooth
+  microstepping itself (many small I2C setpoints instead of one jump), or
+  calibration sweeps become direct jumps (simpler, but should be checked
+  against the actuator's real step-response behavior above before
+  assuming it's fine).
+- **`fta_serial_latency_test.py` / `fta_step_response_test.py`** are
+  built entirely around the serial link and "FTA Controller"'s
+  `get_status`/`cmdq_stats`/`set_x` commands — once that firmware is no
+  longer flashed, these scripts stop working against real hardware as-is
+  and would need an I2C-based equivalent (or "FTA Controller" needs to
+  stay available to reflash back for occasional re-benchmarking).
+- **Worth noting explicitly**: an earlier session (2026-07-23, see the
+  "Wrong turn, corrected" note in the FTA calibration section above)
+  started down a similar-looking path — adding an I2C actuator-command
+  packet — and reverted it, but that was because it was based on the
+  *wrong reference repo* (an old pyboard-driven rig), before "FTA
+  Controller" and its serial protocol were even discovered. This is a
+  different, deliberate decision made *with* full knowledge of what "FTA
+  Controller" actually does — not the same mistake being repeated.
+
+**Next step**: this is firmware work, needs CubeIDE — **move to the
+laptop** for `camera_centroid_receiver`'s actual code changes (add DAC1
+init, port the amp/driver-enable + DAC-write logic, define the new
+setpoint packet, build, flash, bench-test). This Pi's `7-element-array`
+deploy key is deliberately read-only (see the "FTA position calibration"
+section above); the laptop is the one with any real push access to that
+repo, not independently confirmed this session. Once firmware exists:
+extend `nucleo_i2c_sender.py` with a `set_dac(x, y)`-style send method,
+and update `fta_calibration.py`/step-response/latency scripts to match.
 
 ## IN PROGRESS: streaming beam position to an STM32 Nucleo over I2C — camera_view_tool.py now streams real centroids by default, sub-pixel precision fix needs a matching firmware update, live end-to-end not yet reconfirmed (2026-07-21)
 
@@ -2176,6 +2338,36 @@ above for `i2c@80000` (loose/marginal ribbon seating), just affecting the
 other port/camera this time. Not yet re-seated or rebooted to confirm
 recovery — do that before trusting any single-camera test result as "only
 one camera works now" rather than "only one camera came up THIS boot."
+
+## `roi_set_selection.py` subdev lookup fixed — hardcoded CFE media-device mapping was wrong (2026-07-28)
+
+`camera_view_tool.py` crashed on startup: `RuntimeError: no ov9281 entity
+found in /dev/media0's topology for camera 0`. Root cause: only one camera
+(`i2c@88000`) enumerated this boot (the already-documented intermittent
+dropout, see "Hardware status"), and with that camera population,
+`i2c@88000` fed CFE device `/dev/media3` (confirmed via libcamera's own
+startup log: `Registered camera .../i2c@88000/... to CFE device
+/dev/media3 and ISP device /dev/media0`) — but `roi_set_selection.py`'s
+`_subdev_for_camera()` had a hardcoded `{"i2c@88000": "/dev/media0", ...}`
+table, on the theory (stated explicitly in a since-removed comment) that
+the CFE media-device *number* was a stable physical association, unlike
+the already-known-unstable `/dev/v4l-subdevN` node number. That theory was
+wrong — `/dev/media0` this boot was the ISP (`pispbe`) device, not a CFE
+device at all, so it had no `ov9281` entity to find. Same class of
+boot-order-dependent numbering bug the function already existed to work
+around, one layer up.
+
+**Fixed properly, not by hardcoding a different guess**: `_subdev_for_camera()`
+now scans every `/dev/media*` device's topology for an `ov9281 <bus>-<addr>`
+entity (e.g. `ov9281 10-0060`), and for each one resolves which devicetree
+i2c label that Linux i2c bus number actually corresponds to via sysfs
+(`readlink -f /sys/bus/i2c/devices/10-0060/of_node` → a path containing
+`i2c@88000`) — genuinely fixed hardware wiring, unlike any `/dev/mediaN`
+or `/dev/v4l-subdevN` enumeration order. Verified directly:
+`python3 roi_set_selection.py 0` now correctly reports `y_start=0 (max=400)`
+against this boot's actual `/dev/media3`/`/dev/v4l-subdev2`. Not yet
+re-confirmed against a two-camera boot, but the fix removes the
+boot-order assumption entirely rather than adding a second special case.
 
 ## Scripts (all at repo root)
 
