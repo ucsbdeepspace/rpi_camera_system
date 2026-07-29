@@ -56,6 +56,104 @@ both sides individually looking plausible. See "Nucleo firmware built,
 wiring done" below for the full firmware detail; that section's earlier
 "not yet hardware-validated" caveat is now resolved.
 
+## FIXED (2026-07-29): `camera_view_tool.py` auto-track collapsed 640x200 streaming fps from ~527fps to ~50-57fps — root cause was `roi_set_selection.py` re-resolving the subdev path from scratch on every call, not the I2C link
+
+After the amp-board rewiring below got I2C genuinely working again (Nucleo
+now ACKs at `0x42`, confirmed via `i2cdetect`), the user reported
+`camera_view_tool.py` still only hitting ~30fps at 640x200, a mode
+previously validated at ~527fps. Isolated step by step, ruling out causes
+in order: (1) `NucleoLink.send_position()` itself — a direct 200-call
+timing loop against real hardware gave median 1.02ms/call, mean 1.15ms,
+only 2/200 fast-NACK failures — nowhere near slow enough to explain this;
+(2) `beam_position_streamer.py` at the same `640x200` mode, real I2C send,
+hit ~227-249/s and climbing — so the *link* clearly supports much higher
+throughput than 30fps; the problem was specific to `camera_view_tool.py`.
+
+Found it: `auto_track = STREAM_ENABLED` (`camera_view_tool.py`) means
+auto-track recentering is ON by default whenever streaming is on, which it
+is by default. Toggling it off live (`t` key) jumped the *instantaneous*
+rate (the printed average is cumulative-since-start, which hid this) from
+~50-57/s to ~240-250/s — auto-track was the bottleneck, but this was a much
+bigger hit than the ~530→220-230fps already documented elsewhere in this
+file for the same feature, so something about the recentering path itself
+had gotten slower, not just "auto-track is inherently this costly."
+
+Root cause: `roi_set_selection.py`'s `_subdev_for_camera()` — rewritten
+2026-07-28 to fix a real boot-order bug (see that section further down) —
+resolves the Picamera2-index-to-`/dev/v4l-subdevN` mapping by calling
+`Picamera2.global_camera_info()` (spins up a full libcamera camera_manager
+internally) plus a `media-ctl` + `readlink` subprocess per `/dev/media*`
+device, **on every single call**, replacing what used to be a cheap
+hardcoded dict lookup. Measured directly: ~30ms/call. `set_roi_y_start()`
+calls it 2-3 times internally (clamp read, the write, the readback), and
+`camera_view_tool.py`'s `apply_y_start()` (used for auto-track recentering)
+adds another for `get_max_y_start()` — so one recenter event cost ~120ms+
+before any retries, against a ~50ms/20Hz throttle interval it was supposed
+to fit inside. That 120ms+ blocks the single-threaded capture loop
+synchronously, which is what actually collapsed throughput.
+
+**Fix**: added a module-level `_subdev_cache` dict in `roi_set_selection.py`,
+keyed by `cam_index`, populated on first resolution and reused after.
+Safe to cache for a whole process's lifetime — the physical wiring this
+resolves is fixed hardware and can only change across a *reboot* (different
+probe order), which always starts a fresh process anyway, so a per-process
+cache can never see a stale mapping; this preserves the 2026-07-28 fix's
+correctness while removing the repeated cost. Verified in isolation: first
+`_subdev_for_camera(0)` call 31.85ms, next three calls 0.00ms;
+`get_roi_y_start(0)` dropped to 3.36ms (just the remaining real
+`v4l2-ctl` subprocess call). **Verified end-to-end**: fresh
+`camera_view_tool.py` process, default settings (streaming + auto-track
+both on, 640x200), stable **~187-190/s** for 30+ seconds, zero I2C send
+failures — up from ~50-57/s before the fix, and now close to the ~220-230fps
+previously documented for auto-track+detection alone (the remaining small
+gap is plausibly the per-frame I2C send cost, ~1ms, which wasn't part of
+that older benchmark).
+
+## Hardware note (2026-07-29): the Nucleo physically mounted on/near the amplifier board has a real fault — a second, freshly-flashed Nucleo works everywhere EXCEPT plugged into that amp board
+
+While chasing the "camera_view_tool.py can't reach the Nucleo over I2C"
+finding from 2026-07-28 (still current — Nucleo was flashed with "FTA
+Controller" serial firmware, not an I2C slave), the user swapped in a
+second, newly-flashed Nucleo board and rewired it in. Result: **the new
+board works fine everywhere except when actually plugged into the
+amplifier board** — i.e. this isn't (only) the already-documented
+firmware mismatch, there's a real hardware fault on/around the amplifier
+board itself (bad connector, a short, a pin driving something it
+shouldn't, etc.) that breaks a Nucleo once connected to it. Not yet
+root-caused further — needs a continuity/short check on the amp board's
+Nucleo connector before trusting that board with hardware again.
+
+## fps root-cause (2026-07-29): `beam_position_streamer.py` "really slow" (~45fps) at default settings — NOT an I2C problem, it's full-sensor detection cost
+
+After the rewiring above, the user reported `beam_position_streamer.py`
+(run with no args, so full-sensor `1280x800` default) streaming at only
+~45-46/s and asked why, suspecting the I2C link. **Root-caused via a
+synthetic-frame benchmark of `find_beam_blob` in isolation (no camera
+needed)**: at `1280x800` it costs **~22.55ms/call (~44 calls/s)**; at
+`640x200` (the binned ROI mode, same one `camera_view_tool.py` streams by
+default) it costs **~2.32ms/call (~430 calls/s)** — a ~10x difference from
+contour-finding/centroid math scaling with pixel count, nothing to do with
+I2C at all. The ~44fps ceiling this implies matches the user's observed
+45-46/s almost exactly — **full-sensor detection cost, by itself, is the
+entire bottleneck**, independent of whether the I2C send succeeds, fails
+fast, or hangs.
+
+Confirmed by actually re-running the script at `640x200`
+(`python3 beam_position_streamer.py 640x200 --y-start N`, real I2C send,
+not dry-run): **~227-249/s and still climbing** in a 5s sample, zero I2C
+errors logged. This also confirms the amp-board rewiring fixed the I2C
+side specifically (no `[Errno 121]` failures this time, unlike the
+2026-07-28 finding) — the *remaining* gap from this to the ~335fps
+documented elsewhere for this exact script/mode is most likely just this
+sample being too short to reach steady-state (the average is cumulative
+since start), not a new problem.
+
+**Practical takeaway**: never run `beam_position_streamer.py` with no
+size argument for real work — full-sensor is a detection-cost trap, not
+just a slower camera mode. Always pass a binned ROI size (`640x200` or
+`640x100`) plus a `--y-start` that actually brackets the beam (find it
+first via `camera_view_tool.py` or a full-sensor `--dry-run`).
+
 ## IN PROGRESS: FTA position calibration — DAC setpoint → camera centroid, `fta_calibration.py` built, not yet run against hardware (2026-07-23)
 
 Motivating idea (user): to close the loop out to an actual servo, sweep the
@@ -605,6 +703,32 @@ on the kernel's I2C timeout against a dead link (confirmed: `sudo
 i2cdetect -y 1` took >120s and found zero devices, vs. a healthy bus
 scanning near-instantly). Immediate fix was `--no-stream`; this section is
 the real architectural resolution discussed afterward.
+
+**Re-checked 2026-07-29, same root cause confirmed but the failure signature
+is different this time — worth knowing if this gets re-tested again.**
+`sudo i2cdetect -y 1` now returns in ~0.03s (not >120s) and still finds zero
+devices — a fast, clean "nothing answering" scan, not a hung one. Re-ran the
+actual fps comparison (camera 0, only camera enumerating this boot, `1280x800`
+full-sensor is `--no-stream`'s default so `--roi 640x200` was used for a fair
+apples-to-apples check against streaming's `640x200` default):
+
+| config | fps |
+|---|---|
+| `--no-stream --roi 640x200` (baseline, matches the validated ~527fps floor) | **520.1fps** |
+| default (streaming to the dead I2C link) | **~57-63fps** (climbing slowly: 60.9/s → 57.4/s over ~13,400 frames) |
+
+Still a real, large collapse (~9x, not ~0.9fps-scale total collapse) — same
+root cause (Nucleo has no I2C slave firmware loaded right now, still "FTA
+Controller"), but each failed send now returns fast (`OSError: [Errno 121]
+Remote I/O error`) instead of blocking on a multi-second kernel timeout, so
+the cap lands at ~60fps instead of ~1fps. Not chased further why the failure
+mode itself changed (kernel/driver state, bus wiring, or something about how
+the Nucleo's GPIO pins float under "FTA Controller" firmware vs. whatever
+state it was in on 2026-07-28) — not necessary to unblock anything, since the
+fix either way is the same already-decided one below (give
+`camera_centroid_receiver` DAC output and reflash), not a driver-level chase.
+`--no-stream` remains the correct workaround until that firmware work is
+done.
 
 **Two firmware-consolidation options were compared, then a third,
 better one emerged:**

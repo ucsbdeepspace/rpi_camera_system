@@ -44,6 +44,18 @@ from picamera2 import Picamera2
 PIXEL_ARRAY_HEIGHT = 800  # full sensor height every ROI mode crops within
 TOP_BASE = 8  # fixed ISP offset, independent of y_start (same at every stock mode)
 
+_subdev_cache = {}  # cam_index -> resolved /dev/v4l-subdevN path, this
+                      # process only -- see _subdev_for_camera's docstring
+                      # for why this is safe to cache (and why the lookup
+                      # it's caching is expensive enough that NOT caching it
+                      # was a real, measured fps regression: ~30ms/call,
+                      # called 3-4x per set_roi_y_start/apply_y_start
+                      # round trip, enough to dominate camera_view_tool.py's
+                      # ~20Hz auto-track recentering loop and collapse
+                      # combined auto-track+streaming throughput from the
+                      # documented ~220-230fps down to ~50-57fps -- found
+                      # 2026-07-29 debugging exactly that regression).
+
 
 def _subdev_for_camera(cam_index):
     """Map a Picamera2 camera index to its V4L2 subdev path by querying the
@@ -69,7 +81,24 @@ def _subdev_for_camera(cam_index):
     via sysfs (/sys/bus/i2c/devices/<bus>-<addr>/of_node -> a devicetree
     path containing "i2c@88000" or "i2c@80000") -- genuinely fixed hardware
     wiring, unlike any /dev/mediaN or /dev/v4l-subdevN enumeration order.
+
+    Cached per cam_index (module-level `_subdev_cache`) after the first
+    resolution: this scan costs ~30ms/call (dominated by
+    Picamera2.global_camera_info() spinning up a full libcamera
+    camera_manager internally, plus a media-ctl + readlink subprocess per
+    /dev/media* device) -- fine for an occasional manual ROI move, but
+    callers like camera_view_tool.py's ~20Hz auto-track recentering call
+    this 3-4x per recenter (via _get_crop, get_max_y_start, and the
+    readback in set_roi_y_start), which measured out to collapsing combined
+    auto-track+streaming throughput from ~220-230fps to ~50-57fps
+    (2026-07-29). Safe to cache for the lifetime of one process: the
+    physical wiring this resolves is fixed hardware, and can only change
+    across a REBOOT (different probe order) -- which always starts a new
+    process anyway, so a module-level cache never sees a stale mapping.
     """
+    if cam_index in _subdev_cache:
+        return _subdev_cache[cam_index]
+
     info = Picamera2.global_camera_info()
     cam_id = info[cam_index]["Id"]
 
@@ -91,7 +120,9 @@ def _subdev_for_camera(cam_index):
                 continue
             for follow in lines[i:i + 4]:
                 if "device node name" in follow:
-                    return follow.split()[-1]
+                    subdev = follow.split()[-1]
+                    _subdev_cache[cam_index] = subdev
+                    return subdev
     raise RuntimeError(f"no ov9281 entity found matching camera {cam_index} "
                         f"({cam_id}) in any /dev/media* topology")
 
