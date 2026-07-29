@@ -109,6 +109,16 @@ previously documented for auto-track+detection alone (the remaining small
 gap is plausibly the per-frame I2C send cost, ~1ms, which wasn't part of
 that older benchmark).
 
+**Committed**: `b87dc73` (`roi_set_selection.py` + this file). A separate,
+unrelated stray edit sitting in `camera_view_tool.py`'s working tree (a
+one-character docstring typo, "hUses" → "Uses", plus an accidental
+executable-bit change) was cleaned up the same session — fixing the typo
+and reverting the permission bit brought the file back to *exactly*
+matching the last commit, so there was nothing new to commit there.
+Re-ran the same speed check afterward on a fresh process to confirm the
+cleanup didn't regress anything: stable **~187/s**, zero I2C send
+failures, 30+ seconds — matches the fix verification above exactly.
+
 ## Hardware note (2026-07-29): the Nucleo physically mounted on/near the amplifier board has a real fault — a second, freshly-flashed Nucleo works everywhere EXCEPT plugged into that amp board
 
 While chasing the "camera_view_tool.py can't reach the Nucleo over I2C"
