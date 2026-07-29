@@ -56,6 +56,120 @@ both sides individually looking plausible. See "Nucleo firmware built,
 wiring done" below for the full firmware detail; that section's earlier
 "not yet hardware-validated" caveat is now resolved.
 
+## RESOLVED (2026-07-29): I2C1 bus/controller scare was a wedged controller state, cleared by reboot — NOT permanent Pi-side damage; amp board remains the sole real fault
+
+Later the same day as the amp-board finding and the auto-track fps fix
+below: the Nucleo now fails to answer **whether or not it's plugged into
+the amplifier board** (previously it only failed when connected to that
+board — see "Hardware note" below) — a regression from earlier in this
+same session. `sudo i2cdetect -y 1` is slow again too (was confirmed fast,
+~0.03s, immediately after the fps-fix testing above), and **the user
+reports it stays slow even with the I2C lines physically disconnected
+from anything** — which is the key, suspicious data point: a healthy bus
+with nothing wired to it should scan fast (NACK immediately), not hang.
+
+Confirmed directly, not just by user report: `time timeout 15 sudo
+i2cdetect -y 1` took the full 15s and only got partway through the
+address range before being killed. `dmesg` shows the real cause —
+repeated, hard controller-level failures, not a userspace/driver-level
+slowness:
+```
+i2c_designware 1f00074000.i2c: controller timed out
+```
+firing roughly once per second, one per probed address — `1f00074000.i2c`
+is the RP1 I2C1 controller backing `/dev/i2c-1`, the same bus
+`nucleo_i2c_sender.py` uses (see that module's docstring for the
+`i2c@74000`/`/dev/i2c-1` mapping).
+
+**Why this is a bigger deal than "the Nucleo is broken" again**: if the
+I2C lines are genuinely disconnected and it's still timing out on every
+address, the fault can't be in the Nucleo or the amp board anymore — it
+has to be upstream, on the Pi side. Two live hypotheses, not yet
+distinguished:
+1. The RP1 controller got wedged into a bad internal state by whatever
+   electrical event happened on the amp board (a stuck-low SDA/SCL line
+   mid-transaction can do this to many I2C controllers) — recoverable by
+   a plain reboot, since that resets the controller's hardware state.
+2. Actual damage to the Pi's I2C1 hardware itself (GPIO2/GPIO3 pins or
+   the RP1 controller silicon) from whatever backfed through the Nucleo
+   while it was connected to the amp board — would NOT be fixed by a
+   reboot, and would mean the amp-board fault damaged the Pi, not just
+   the Nucleo(s).
+
+**Post-reboot result — hypothesis 1 confirmed (2026-07-29).** `sudo
+i2cdetect -y 1` now cleanly finds the Nucleo ACKing at `0x42` when it is
+NOT plugged into the amplifier board — fast, clean scan, real device
+found, not a timeout. This rules out hypothesis 2 (permanent Pi-side
+I2C1/RP1 damage): a genuinely damaged controller or header pins would
+not suddenly detect a real device correctly after nothing but a reboot.
+The controller was simply wedged into a bad internal state by whatever
+electrical event happened via the amp board, and a plain reboot cleared
+it, exactly as hypothesis 1 predicted.
+
+**Net effect: this whole scare collapses back into the already-known
+amp-board fault** documented in "Hardware note" below — the Nucleo works
+correctly on this bus when isolated from the amp board, consistent with
+that section's finding (a fresh Nucleo also worked everywhere except
+plugged into the amp board). No new Pi-side hardware issue. Safe to
+resume treating the amp board as the sole suspect; no multimeter check
+needed. Not yet re-tested: whether `i2cdetect` still times out
+specifically when the Nucleo *is* connected to the amp board post-reboot
+(expected, per the amp-board finding, but not re-confirmed this session).
+
+**Re-tested, connected to the amp board — confirms amp-board fault, and
+reveals it's intermittent, not a fixed hard fault.** First check (user):
+hung/timed out, as expected. Immediately after (Claude, via Bash, same
+physical setup, ~seconds later): three consecutive clean scans, ~0.024-
+0.030s each, no device found at any address (not `0x42`, not a timeout).
+Re-run by the user again right after that: also clean/fast, no device
+found. So on the same physical connection, in short succession, the
+fault showed up as a hard timeout once and as a silent "nothing there"
+several times — **this flip-flopping is itself informative**: a solid
+short or a permanently dead pin would misbehave the same way every time,
+whereas symptoms that change between a hang and a clean-but-empty scan
+without anything being deliberately altered points at **marginal/
+intermittent contact** (a loose connector, a cracked solder joint, a wire
+just barely making contact) rather than a fixed dead short. Either way,
+the Nucleo never once ACKed at `0x42` while connected to the amp board
+across any of these checks — consistent with the "Hardware note" finding
+below regardless of which failure signature shows up on a given attempt.
+
+**Next step**: to actually localize this (vs. just re-confirming "it's
+still broken somehow"), try gently wiggling/reseating the amp board's
+Nucleo connector while repeatedly running `i2cdetect` (e.g. a tight loop
+printing timestamps) and watch whether hangs/clean-empty-scans correlate
+with physical movement — that would confirm a loose mechanical contact
+specifically, as opposed to a component-level fault on the board that
+just happens to present inconsistently. A continuity check on the
+connector's SDA/SCL/GND pins (multimeter, board unpowered) would be the
+more definitive version of the same test.
+
+**Localized further, and the fault is NOT a loose/marginal connector after
+all — it's power-dependent and pin-specific (2026-07-29).** Confirmed the
+fault isn't unique to one physical board: plugging the Nucleo into **any
+of 3 amp boards on hand** stops I2C from working, ruling out a single
+bad/damaged board as the explanation (points instead at something common
+to this amp board design/wiring, not a one-off defect). Then, on the
+primary board, connected the amp board's pins to the Nucleo **one pin at
+a time** instead of via the full connector — this isolates the fault to a
+**single specific pin: pin 23, one of the ADC pins going to the
+amplifier**. Critically, pin 23 only causes the I2C failure **when the
+amp board is powered on** — unpowered, connecting that same pin is fine.
+
+This changes the diagnosis from the "marginal/intermittent contact"
+theory above (which fit the earlier hang-vs-clean-scan flip-flopping) to
+something more specific and reproducible: a powered ADC line on the amp
+board is interfering with the Pi↔Nucleo I2C bus, most likely either (a) a
+direct short/leakage path from pin 23 to SDA or SCL somewhere in the
+harness/connector, or (b) noise/coupling injected onto the I2C lines by
+that ADC pin only when it's carrying a live signal (unpowered = no
+signal = no interference). **Not yet distinguished which** — the earlier
+suggested continuity check (multimeter, board unpowered, pin 23 vs.
+SDA/SCL/GND) is still the right next diagnostic for (a); confirming (b)
+would need e.g. scoping pin 23 and the I2C lines simultaneously while
+powered. Either way, this is real, useful narrowing: the fault is one
+identified pin, not "something loose somewhere on 3 different boards."
+
 ## FIXED (2026-07-29): `camera_view_tool.py` auto-track collapsed 640x200 streaming fps from ~527fps to ~50-57fps — root cause was `roi_set_selection.py` re-resolving the subdev path from scratch on every call, not the I2C link
 
 After the amp-board rewiring below got I2C genuinely working again (Nucleo
