@@ -170,6 +170,28 @@ would need e.g. scoping pin 23 and the I2C lines simultaneously while
 powered. Either way, this is real, useful narrowing: the fault is one
 identified pin, not "something loose somewhere on 3 different boards."
 
+**Pin-23/powered-only finding no longer reproducing on retest — real
+observation at the time, but the picture has since changed (2026-07-29).**
+The pin-23-only-when-powered result above did happen as described. On
+retest, though, it stopped reproducing: one-pin-at-a-time connection (pin
+23 included) no longer breaks I2C, powered or not. What *does* now
+reliably break it: plugging in the **whole Nucleo connector** (all pins
+via the actual connector, not one at a time) — and this happens
+**regardless of whether the amp board is powered**, unlike the
+powered-only behavior seen with pin 23 in isolation. Net effect: no
+longer have a clean single-pin/single-cause explanation — whatever's
+happening now depends on the full connector being mated (not any one pin
+alone) and isn't gated by board power. The "marginal/intermittent
+contact" theory from before the pin-23 detour is worth taking seriously
+again given this — full-connector-only, one-pin-only-clean is at least
+consistent with something connector-level (cumulative loading across many
+simultaneously-connected pins, a marginal pin not covered by the
+one-at-a-time test, or genuine mechanical contact quality at the
+connector) rather than a single component-level fault. Next diagnostic
+still stands: a continuity/short check across the full connector's pins
+(multimeter, board unpowered) is more informative right now than per-pin
+isolation, since isolation stopped reproducing the fault.
+
 ## FIXED (2026-07-29): `camera_view_tool.py` auto-track collapsed 640x200 streaming fps from ~527fps to ~50-57fps — root cause was `roi_set_selection.py` re-resolving the subdev path from scratch on every call, not the I2C link
 
 After the amp-board rewiring below got I2C genuinely working again (Nucleo
