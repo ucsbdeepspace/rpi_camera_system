@@ -840,6 +840,90 @@ this repo cloned with push access (HTTPS + Git Credential Manager, per
 the "Laptop is now set up" note at the top of this file), `git add`/
 commit/push it before starting the DAC work above.
 
+### Optional pre-reflash cross-check: `fta_closed_loop_fps_test.py` built to measure the REAL combined capture+detect+serial-send loop rate, before the I2C-DAC decision above makes it moot (2026-07-28)
+
+Written in a separate, concurrent session (before that session had seen the
+Architecture DECISION above — cross-referenced and reconciled here after the
+fact, not proposing an alternative to it). Motivation: the "Serial-vs-I2C
+latency estimated" section's "no longer a clear performance argument for
+keeping I2C" conclusion was arithmetic on two separately-measured numbers
+(camera-only detection latency + serial-only round-trip latency via
+`fta_serial_latency_test.py`, never run with a camera in the loop at all) —
+not a real combined measurement. That gap is still real and still
+unmeasured, but **the DECISION above already supersedes it as the reason to
+prefer I2C** — the chosen architecture wasn't purely a latency argument (see
+"Why this is clean" above: avoiding a firmware PID merge, no CubeIDE
+rebuild-per-gain-tune), so a good serial number wouldn't reverse it.
+
+**Value this still has**: a real, measured "what serial actually achieves"
+number is a useful data point to have on record regardless of which link
+gets used for real, and — importantly — **this is a closing window**: it can
+only be measured while the board still runs "FTA Controller" firmware,
+which the DECISION above is about to retire in favor of the I2C-DAC image.
+Once that reflash happens, `fta_serial_latency_test.py`,
+`fta_step_response_test.py`, and this script all stop working against real
+hardware as-is (same point already flagged above). If it doesn't get run
+now, getting this number later means reflashing "FTA Controller" back
+temporarily just to re-benchmark it.
+
+**Built `fta_closed_loop_fps_test.py`** (committed, pushed to
+`origin/master`, **not yet run against real hardware** — written on a
+device with no camera/Nucleo attached). Each loop iteration: capture one raw
+frame, run `find_beam_blob`, then (per `--send-mode`) send the FTA's own
+CURRENT position back over serial for BOTH axes — nothing physically moves
+(same non-destructive convention as `fta_serial_latency_test.py`), but it
+pays the real 2-axis wire cost every iteration alongside real camera work,
+which no prior test did together. Three modes, run separately and compared:
+- `none` — capture+detect only, no serial at all (pure camera-side ceiling,
+  measured with this exact script so it's apples-to-apples with the other two)
+- `wait_ack` (default) — `set_x` then `set_y`, each a full write-then-wait-
+  for-ack round trip before the next axis — notably **two sequential round
+  trips per loop, not one** (double what the existing single-axis latency
+  test measured)
+- `fire_and_forget` — both axes written back-to-back with zero waiting, plus
+  a `cmdq_stats` drop-counter check to confirm nothing is silently lost at
+  the achieved rate
+
+Reports per-stage min/mean/median/p95/p99/max (capture, detect, send, and
+total achieved loop period → Hz), beam-detected fraction, and saves raw
+per-iteration timing arrays to `results/fta_closed_loop_fps_<mode>_<size>_<UTC
+timestamp>.npz`. **One unverified assumption flagged in the docstring**: the
+`set_y` ack line is assumed to read `"y_center set to N"`, symmetric to the
+confirmed `set_x` ack (`"x_center set to N"`) — `fta_serial_latency_test.py`
+only ever validated the x ack. If this assumption is wrong, `wait_ack` mode
+will fail LOUDLY (near-zero successful sends in the report), not silently
+mismeasure, since a sample only counts on an actual regex match.
+
+**If there's time before the reflash, run this on the Pi (camera + "FTA
+Controller" Nucleo still attached) — otherwise skip straight to the DECISION
+section's next step (laptop firmware work) without regret:**
+```
+cd ~/rpi_camera_system   # or wherever this repo is cloned on the Pi -- confirm path
+git pull
+python3 fta_closed_loop_fps_test.py --send-mode none        --raw-size 640x100 --y-start N
+python3 fta_closed_loop_fps_test.py --send-mode wait_ack    --raw-size 640x100 --y-start N
+python3 fta_closed_loop_fps_test.py --send-mode fire_and_forget --raw-size 640x100 --y-start N
+```
+Replace `--y-start N` with whatever real sensor row currently brackets the
+beam for `MODE_640_100_ROI`'s 100-row window (this session's `--dry-run`
+found the beam near row 32 at full-sensor 1280x800 y_start=0 — that maps to
+roughly y_start≈0 for a 100-row window too, but confirm live via
+`roi_live_demo.py` rather than assuming). If unsure, start with `--y-start 0`
+and check the printed "Beam detected: N/N" fraction — a low fraction means
+the window doesn't currently bracket the beam, not that the script is
+broken. Note this session also found `camera_view_tool.py`'s default-on I2C
+streaming currently HANGS for ~120s against this same "FTA Controller"
+firmware (no I2C slave role) — irrelevant to this script (it doesn't use
+`nucleo_i2c_sender.py` at all), but don't run `camera_view_tool.py` with
+default streaming enabled on this same board in the meantime.
+
+**What to do with the results**: just record the three achieved-loop-rate Hz
+numbers (from each run's "Achieved loop period" line) here in this file for
+the record. This does NOT gate the next step — proceed to the DECISION
+section's laptop firmware work regardless of what these numbers show, unless
+they reveal something surprising enough to reopen the architecture question
+(e.g. serial turning out to have some other problem beyond raw speed).
+
 ## IN PROGRESS: streaming beam position to an STM32 Nucleo over I2C — camera_view_tool.py now streams real centroids by default, sub-pixel precision fix needs a matching firmware update, live end-to-end not yet reconfirmed (2026-07-21)
 
 First step past pure characterization: closing the loop out to an external
