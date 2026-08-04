@@ -110,8 +110,18 @@ MIN_BLOB_AREA_PX = 15
 CONTRAST_CONFIDENCE_K = 5.0
 MASK_THRESH_K = 3.0
 
-FTA_BAUD = 460800
-STATUS_RE = re.compile(r"^status:(-?\d+),(-?\d+),(-?\d+),")
+FTA_BAUD = 115200  # camera_centroid_receiver's USART2 rate (unchanged from
+# the original heartbeat-only firmware) -- NOT the old "FTA Controller"'s
+# 460800. Get this wrong and every reply is baud-mismatch garbage, not a
+# clean protocol error (same signature CLAUDE.md already documented once,
+# 2026-07-23, when the two firmwares' baud rates were mixed up).
+# camera_centroid_receiver's phase-1 firmware (nucleo_firmware/, 2026-08-04),
+# not the old "FTA Controller" -- reply format changed from positional CSV
+# ("status:x,y,...") to keyed text. dac_x/dac_y (the last commanded DAC
+# setpoint) is this firmware's equivalent of "FTA Controller"'s reported
+# x/y position; tel_x/tel_y is a different thing (relayed camera telemetry,
+# not the actuator setpoint) and must not be used here.
+STATUS_RE = re.compile(r"dac_x=(-?\d+)\s+dac_y=(-?\d+)")
 
 
 def find_beam_blob(frame):
@@ -164,17 +174,26 @@ def find_fta_port():
 
 
 def get_current_position(ser):
-    ser.reset_input_buffer()
-    ser.write(b"get_status\n")
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline:
-        raw = ser.readline()
-        if not raw:
-            continue
-        m = STATUS_RE.match(raw.decode(errors="replace").strip())
-        if m:
-            return int(m.group(2)), int(m.group(3))
-    raise RuntimeError("No get_status reply -- check the serial link/firmware.")
+    """Retries the whole request a few times, not just the read -- bench
+    testing this firmware (2026-08-04) found the VCP link occasionally
+    drops a character out of a command when it lands during the Pi's
+    high-rate I2C telemetry stream (I2C1 is a higher NVIC priority than
+    USART2), corrupting e.g. "get_status" into "ge_status". The firmware
+    always replies ERR to a corrupted line rather than hanging, so a
+    fresh attempt is enough to recover -- no firmware change needed for
+    this, but a single-shot request isn't reliable enough to build on."""
+    for _ in range(5):
+        ser.reset_input_buffer()
+        ser.write(b"get_status\n")
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            raw = ser.readline()
+            if not raw:
+                continue
+            m = STATUS_RE.search(raw.decode(errors="replace").strip())
+            if m:
+                return int(m.group(1)), int(m.group(2))
+    raise RuntimeError("No get_status reply after 5 attempts -- check the serial link/firmware.")
 
 
 def apply_y_start(target):
