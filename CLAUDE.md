@@ -192,6 +192,128 @@ still stands: a continuity/short check across the full connector's pins
 (multimeter, board unpowered) is more informative right now than per-pin
 isolation, since isolation stopped reproducing the fault.
 
+## RESOLVED (2026-08-03): amp-board I2C fault was the Nucleo-32's own on-board solder bridges (SB16/SB18) tying A4/A5 to D4/D5 — confirmed fixed by removing them
+
+Picked the amp-board fault back up with an electrical approach (scope the
+line, reason from what's on the wire) instead of more mechanical
+reseating/isolation trials, since the last entry above left off without a
+clean single-cause explanation.
+
+**SCL scoped at only ~1.8V high with the amp board connected, vs. a clean
+~3V high on the breadboard.** Informative on its own: 1.8V is close enough
+to (or below) typical VIH thresholds for 3.3V CMOS I/O (commonly ~0.7xVDD ~
+2.3V, sometimes lower in TTL-compatible mode) to plausibly explain the
+flip-flopping symptom documented above (hard timeout on one attempt,
+clean-but-empty scan on the next, same physical connection) — a borderline
+logic high is exactly the kind of fault that reads differently scan to scan.
+**Confirmed the line is still toggling, not clamped flat** — rules out a
+low-impedance driver pinning SCL to a fixed level; this is a *loading*
+effect (something on the amp board competing with the Pi's ~1.8k-ohm
+pull-up), not a hard short.
+
+**Ruled out rail sag**: VDD/3.3V measured directly at the Nucleo came back
+identical (3.3V) whether on the breadboard or plugged into the amp board —
+the pull-up's supply rail itself isn't the problem.
+
+**Ruled out the SDA/SCL pins themselves being the coupling path into the amp
+board.** Physically cut the SDA/SCL pins on the bottom of the Nucleo so they
+no longer connect to the amp board's connector at all (I2C re-wired directly
+to the top of the same pins instead, straight to the Pi); power and ground
+were left connected. **No change** — SCL still capped at ~1.8V high. Key
+negative result: whatever's loading the line down, it isn't reaching SCL
+through the SDA/SCL pins on the amp-board connector, since that specific
+path no longer physically exists.
+
+**Root cause candidate found: the NUCLEO-L432KC (Nucleo-32 form factor)
+ships with two solder bridges, SB16 and SB18, BOTH ON by default.**
+Confirmed directly from ST's UM1956 (Nucleo-32 user manual) — fetched and
+read the actual PDF (board bottom layout, Figure 4; solder-bridges table,
+Table 8), not just secondhand text:
+- **SB16** ties **D5 (PB6) to A5 (PA6)**
+- **SB18** ties **D4 (PB7) to A4 (PA5)**
+
+i.e. on this board, as shipped, D4/D5 — the I2C1 SCL/SDA pins this
+project's whole Pi-to-Nucleo I2C link is built on (see "Nucleo firmware
+built, wiring done" below) — are electrically the *same net*, inside the
+Nucleo's own PCB, as the analog pins A4/A5. **This directly explains the
+"no change" result above**: if the amp board's harness touches A4 or A5 for
+any reason (not yet confirmed which — plausibly related to the already-
+documented pin-23/ADC finding, or something else on the connector), that
+connection rides straight back onto the SDA/SCL net through the internal
+bridge, *upstream* of the D4/D5 header pins that were physically cut.
+Cutting those pins couldn't have isolated anything, because the short way
+back to A4/A5 lives inside the Nucleo board itself, not on the external
+harness.
+
+**Physical location**: bottom side of the Nucleo board, silkscreen-labeled
+directly on the PCB ("SB16"/"SB18" printed right at the pads) — positioned
+just below connector CN4, next to the crystal footprint (X2), grouped with
+SB11/SB12.
+
+**Confirmed via the STM32L4's official alternate-function table (fetched
+and read directly, not CubeMX-guessed) that there is no alternate I2C pin
+pair available on this board at all** — closes off "move I2C to different
+pins" as an alternative to dealing with the bridges:
+- A2/A3 (PA3/PA4, floated as a candidate this session) have **zero** I2C
+  alternate function on any AF slot (AF4 is the I2C1/I2C2/I2C3 category;
+  empty for both pins in the chip's real AF0-AF15 mux table). CubeMX can't
+  offer I2C there because the silicon doesn't route it — no board-level
+  workaround exists for this the way there is for the A4/A5 case.
+- Scanned every pin actually broken out on this board's two headers
+  (CN3+CN4, all of D0-D13/A0-A7) against the same table: **PB6/PB7 (D5/D4,
+  already in use) are the ONLY pins on this entire board with real I2C
+  SCL/SDA capability.** The only other I2C-related AF anywhere on the header
+  is PB5 = `I2C1_SMBA` (SMBus alert line only, not usable as SDA/SCL). There
+  is no fallback pin pair to move to even if desired.
+
+**Net conclusion**: removing/desoldering SB16 and SB18 is not just the
+preferred fix, it's the *only* available path to keep I2C working on this
+board while breaking whatever's coupling in via A4/A5 — no firmware change
+needed (PA5/PA6 default to input-floating on reset, which is what the
+bridge-off state requires anyway), no rewiring of the already-validated
+Pi-to-Nucleo D4/D5 harness.
+
+**Removed SB16/SB18 — confirmed fixed (2026-08-03).** Immediately after
+desoldering the bridges, I2C appeared to be down even on the plain
+breadboard setup (previously the known-good baseline) — alarming at first,
+since electrically the bridges shouldn't have touched the D4/D5 path to the
+Pi at all (D4/D5 wire straight to the MCU's PB6/PB7 pads independently of
+the bridge; only A4/A5 run through it). Treated this as likely rework
+collateral damage rather than a real electrical dependency — SB16/SB18 sit
+in a cramped cluster right next to the crystal (X2) and SB11, easy to
+nick/bridge/lift something adjacent while working pads that small. After
+cleaning up the rework, I2C came back — **and, critically, now works with
+the Nucleo plugged into the amp board**, which is the fault this whole
+thread was chasing. This confirms the SB16/SB18 diagnosis was correct: A4/A5
+(tied to D4/D5 via the bridges) was the real coupling path from the amp
+board onto the I2C bus, not the D4/D5 connector pins themselves, not ground,
+not rail sag, and not anything else investigated earlier in this file. Amp
+board's exact connection point on A4/A5 was never directly confirmed (no
+continuity trace was done before the fix), but the outcome — fault present
+with bridges in, gone with bridges out, on the same physical hardware
+otherwise unchanged — is strong enough evidence to close this thread.
+
+**Net result: the amp-board I2C fault documented across this whole file
+since 2026-07-29 (bus/controller scare, pin-23 detour, full-connector-only
+finding, marginal-contact theory, and finally this SB16/SB18 root cause) is
+resolved.** Nucleo I2C is confirmed working with the amp board connected.
+**Full pipeline re-validated end-to-end (2026-08-04).** Ran
+`camera_view_tool.py` for real (default settings: camera 0, `640x200`,
+streaming on, live I2C send to the Nucleo now plugged into the amp board) —
+streamed 1600+ packets in ~9s, **0 send failures throughout**, `valid=True`
+and a stable centroid (~962-966, ~568-572) the entire run. Confirms the
+whole camera->centroid->I2C->Nucleo path is genuinely working through the
+amp board, not just bare bus connectivity. (Run was stopped via an external
+SIGINT rather than the `q` keypress, which produced a benign
+`KeyboardInterrupt` traceback mid-frame-capture at shutdown — not a bug,
+just an artifact of how the test was stopped; not a graceful-exit path
+issue in the script itself.) Verified clean afterward: `tainted` stayed
+`4096` (no D/W), no dmesg BUG/Oops, no lingering `/dev/video*`/`/dev/media*`
+handles beyond the normal pipewire/wireplumber holders, and `i2cdetect`
+still cleanly finds the Nucleo at `0x42` post-run. This closes out the
+amp-board I2C fault thread for real — hardware fix confirmed, software path
+confirmed, bus left in a known-good state.
+
 ## FIXED (2026-07-29): `camera_view_tool.py` auto-track collapsed 640x200 streaming fps from ~527fps to ~50-57fps — root cause was `roi_set_selection.py` re-resolving the subdev path from scratch on every call, not the I2C link
 
 After the amp-board rewiring below got I2C genuinely working again (Nucleo
