@@ -28,17 +28,18 @@ original assumption below.
 
 **Nucleo firmware bring-up done from the laptop (2026-07-21)** — see the
 "IN PROGRESS" section below for full detail. Summary: CubeIDE project
-`camera_centroid_receiver` (workspace
-`STM32CubeIDE/workspace_1.14.0/camera_centroid_receiver` on the laptop)
-configures I2C1 as a slave at address `0x42` and receives/checksums the
-8-byte packet from `nucleo_i2c_sender.py`, with a USART2→ST-Link VCP debug
-print added for visibility. **Important gap: this CubeIDE project is NOT
-part of this git repo** — it's a separate workspace living only on this
-one laptop, unlike every other artifact this file tracks. If the laptop is
-lost/reimaged, that firmware work is gone. Worth deciding later whether to
-fold it into this repo (e.g. as a subdirectory, with build artifacts
-gitignored) or a separate repo — not done yet, flagging so it isn't
-forgotten.
+`camera_centroid_receiver` configures I2C1 as a slave at address `0x42` and
+receives/checksums the 8-byte packet from `nucleo_i2c_sender.py`, with a
+USART2→ST-Link VCP debug print added for visibility. **Folded into this
+repo (2026-08-04)**: originally lived only in the laptop's local
+`STM32CubeIDE/workspace_1.14.0/camera_centroid_receiver` workspace (a real
+gap — if the laptop was lost/reimaged, that firmware work would have been
+gone, unlike every other artifact this file tracks); now tracked at
+`nucleo_firmware/camera_centroid_receiver/` in this repo, build-output
+dirs (`Debug/`/`Release/`) gitignored. The laptop's CubeIDE workspace still
+needs to be re-pointed at the new path (see "Firmware phase 1" section
+below) — the physical files were moved, not copied, so the old workspace
+location no longer exists.
 
 Physical wiring between the Pi's header I2C1 (physical pin 5=SCL/GPIO3,
 pin 3=SDA/GPIO2, plus GND) and the Nucleo's I2C1 pins (board silkscreen
@@ -1101,9 +1102,10 @@ deliberately kept the same as "FTA Controller"'s existing `set_x`/`set_y`).
 Per the user's explicit sequencing ("get everything else working first, then
 put a PID controller in last"), built every non-PID piece of the v2
 architecture above into the existing `camera_centroid_receiver` CubeIDE
-project (`STM32CubeIDE/workspace_1.14.0/camera_centroid_receiver` on the
-laptop — still not part of this git repo, see the gap noted at the top of
-this file). Deferred to the PID pass, per that sequencing: `run_control_step`/
+project (at the time, still only in the laptop's local
+`STM32CubeIDE/workspace_1.14.0/camera_centroid_receiver` workspace, not this
+git repo -- since folded in, see "Folded `camera_centroid_receiver` into
+this repo" below). Deferred to the PID pass, per that sequencing: `run_control_step`/
 `pixel_error_to_dac_error`/`pi_update_axis`, and the VCP setters that only a
 running PID would consume (`set_target_x/y`, `set_kp_x/ki_x/kp_y/ki_y`,
 `set_gain_matrix`). `set_mode closed_loop` is explicitly rejected (`ERR
@@ -1178,6 +1180,28 @@ itself and never flashed** — that, plus a real bench pass (`get_status`,
 `set_x`/`set_y` moving the actuator, `amp_enable`/`amp_disable`,
 `clear_estop`, and the bare `!` e-stop), is the actual next step before
 trusting this on hardware.
+
+### Folded `camera_centroid_receiver` into this repo (2026-08-04)
+
+Closed the tracking gap flagged at the top of this file since 2026-07-21:
+moved (not copied) the CubeIDE project from the laptop's local
+`STM32CubeIDE/workspace_1.14.0/camera_centroid_receiver` into
+`nucleo_firmware/camera_centroid_receiver/` in this repo. `.gitignore`
+already had `nucleo_firmware/*/Debug/` etc. rules waiting for this (unclear
+who added them or when — they predate this move), so build-output
+exclusion needed no extra work. Committed 104 files (source, `.cproject`/
+`.project`/`.settings`, the `.ioc`, linker script, launch config); `Debug/`
+correctly excluded.
+
+**The already-open STM32CubeIDE instance on the laptop still points at the
+old, now-nonexistent path** — moving the physical folder doesn't update
+Eclipse's workspace metadata, which is separate from the project's own
+files. Needs manual fixup next time that IDE window is used: remove the
+stale `camera_centroid_receiver` project reference (right-click → Delete →
+**uncheck** "delete contents", since the files are already gone from that
+location anyway) and re-import from `nucleo_firmware/camera_centroid_receiver/`
+in this repo (File → Import → Existing Projects into Workspace). Not done
+yet as of this entry.
 
 ### Architecture DECISION v1, SUPERSEDED 2026-08-04 (see above): Nucleo becomes a dumb I2C-driven external DAC, all control logic stays in Python on the Pi (2026-07-28)
 
@@ -1301,20 +1325,19 @@ repo, not independently confirmed this session. Once firmware exists:
 extend `nucleo_i2c_sender.py` with a `set_dac(x, y)`-style send method,
 and update `fta_calibration.py`/step-response/latency scripts to match.
 
-**Before editing it: fold `camera_centroid_receiver` into this repo
-(user-decided, 2026-07-28) — it currently lives ONLY as an uncommitted
-local CubeIDE workspace on the laptop (see the top-of-file note), a real
-data-loss risk that should be closed before adding more work on top of
-it.** Prepped from the Pi side (can't touch the laptop's files directly):
-`.gitignore` now has a `nucleo_firmware/*/{Debug,Release,*.o,...}` block,
-mirroring the existing `kernel_patch/` pattern (source/project tracked,
-per-build output not). **Remaining steps, from the laptop**: copy/move
-the CubeIDE project folder (currently
-`STM32CubeIDE/workspace_1.14.0/camera_centroid_receiver`) into this repo
-at `nucleo_firmware/camera_centroid_receiver/`, confirm the laptop has
-this repo cloned with push access (HTTPS + Git Credential Manager, per
-the "Laptop is now set up" note at the top of this file), `git add`/
-commit/push it before starting the DAC work above.
+**Fold `camera_centroid_receiver` into this repo (user-decided, 2026-07-28)
+— DONE 2026-08-04.** It lived ONLY as an uncommitted local CubeIDE
+workspace on the laptop (see the top-of-file note) until then, a real
+data-loss risk. Prepped from the Pi side back on 2026-07-28 (couldn't touch
+the laptop's files directly at the time): `.gitignore` got a
+`nucleo_firmware/*/{Debug,Release,*.o,...}` block, mirroring the existing
+`kernel_patch/` pattern (source/project tracked, per-build output not).
+Completed from the laptop 2026-08-04: moved the project folder from
+`STM32CubeIDE/workspace_1.14.0/camera_centroid_receiver` into this repo at
+`nucleo_firmware/camera_centroid_receiver/`, committed. See "Folded
+`camera_centroid_receiver` into this repo" further below for the full
+detail, including the still-open follow-up (the laptop's already-running
+CubeIDE instance needs re-pointing at the new path).
 
 ### Optional pre-reflash cross-check: `fta_closed_loop_fps_test.py` built to measure the REAL combined capture+detect+serial-send loop rate, before the I2C-DAC decision above makes it moot (2026-07-28)
 
@@ -1483,8 +1506,9 @@ the NUCLEO-L432KC + STM32CubeIDE:
 Steps 1-3 above are now done and confirmed live (step 4, the real
 camera-driven streamer, is still not started — only the fake-orbit smoke
 test in step 3 has been run). Built via STM32CubeIDE on the laptop,
-project `camera_centroid_receiver` (**not part of this git repo** — see
-the note near the top of this file).
+project `camera_centroid_receiver` (at the time, not part of this git
+repo — folded in 2026-08-04, see "Folded `camera_centroid_receiver` into
+this repo" further below; now at `nucleo_firmware/camera_centroid_receiver/`).
 
 **CubeMX config**: I2C1 as slave, PB6/PB7 (SCL/SDA, matches
 `nucleo_i2c_sender.py`'s expectation), address `0x42`, NVIC event+error
