@@ -1281,13 +1281,63 @@ incompatibilities (old status format assumption, `FTA_BAUD` at `460800`)
 and haven't been checked yet — do that before running either against this
 firmware.
 
-**Not yet done**: the actual step-response test itself. It needs
-`picamera2`/`cv2`, so it can only run on the Pi, and the Nucleo's USB is
-currently on the laptop (where this bench test just ran), not the Pi —
-per this file's own architecture note, the physical USB cable needs to
-move over before `fta_step_response_test.py` can capture real camera data.
-Board was left in a clean idle state after bench testing: `amp=0 estop=0
-dac_x=95 dac_y=95`.
+**Corrected same session: the "needs the Pi" framing above was wrong.**
+Initially assumed rerunning the step-response test required moving the
+Nucleo's USB to the Pi (`fta_step_response_test.py` captures camera frames
+directly via Picamera2). User pushback: under the v2 architecture the Pi's
+only job is streaming centroids over I2C — already running, already
+confirmed live in this bench session — so nothing else needs to happen
+there. The missing piece was noticing that `camera_centroid_receiver`
+already prints a line for *every* relayed I2C packet over its VCP (the
+`seq=... x=... y=...` lines seen throughout this bench session), at the
+same rate the Pi streams — a ready-made high-rate position feed over the
+exact link already used to send `set_x`/`set_y`. Wrote
+`fta_step_response_test_vcp.py`: same `analyze_step` math, but sources
+`(t, x, y)` from that relay stream via a background reader thread instead
+of `Picamera2.capture_array()`, so it runs entirely from the laptop.
+Tradeoff vs. the camera-direct version: time resolution is bounded by the
+relay/VCP rate (~176/s measured), not raw camera fps, plus a small
+roughly-constant relay latency — fine for rerunning the existing
+small-step characterization, not a replacement if sub-frame precision is
+ever needed again.
+
+**First real run (`axis x, 95→2000`) measured ~0.06px delta — essentially
+no movement**, the same "actuator isn't moving the beam" signature this
+file documented once before (2026-07-23, that time root-caused to an
+unplugged voice-coil amplifier). The script's own `amp_enable` call
+confirmed the PA12 signal went out, but that's as far as software can see
+— it can't confirm the physical amp board has power or the actuator is
+wired up. Wrote `fta_manual_control.py` (interactive REPL: `x`/`y` jog,
+`amp on`/`off`, `status`, `estop`/`clear`) so a human can watch the
+actuator directly while driving it by hand, instead of trusting a
+scripted pixel-delta measurement for this specific question. Physical
+check not yet done as of this entry.
+
+**Second real finding, this time from the user's own interactive session**:
+`fta_manual_control.py` immediately corrupted its first two live commands
+(`amp_enable`→`amp_eble`, `get_status`→`getstatus`) — worse than the ~1-in-
+5-6 rate measured earlier in this same file, up to 100% of the first few
+commands in that session. Prompted actually fixing the byte-loss issue
+instead of just working around it. **Root cause confirmed and fixed**:
+I2C1 was NVIC priority 0 (above USART2's 1) — backwards, given I2C1 has
+`NoStretchMode` disabled (so a preempting UART ISR only costs the Pi's
+master a few µs of protocol-legal clock stretching) while UART RX has no
+equivalent tolerance (no hardware flow control — a missed byte is gone for
+good). Swapped priorities in `stm32l4xx_hal_msp.c` (USART2 → 0, I2C1 EV/ER
+→ 1), rebuilt, reflashed. **Verified on hardware**: 30/30 commands clean
+over the VCP with I2C telemetry actively streaming throughout (`errs=0`),
+where the same test previously corrupted roughly 1 in 5-6. Neither NVIC
+change lives in the `.ioc` — flagged inline in both spots to reapply by
+hand if this project is ever regenerated from it.
+
+**Current state**: firmware flashed with the priority fix, board left idle
+(`amp=0 estop=0 dac_x=95 dac_y=95`). Still not done: the physical
+amp/actuator check via `fta_manual_control.py` (why the step-response test
+measured no movement — signal-reaches-the-pin vs. actuator-actually-moves
+is still an open question), and re-running
+`fta_step_response_test_vcp.py`'s full original protocol (95→2000, small
+100-count steps both directions, both axes) once real movement is
+confirmed.
 
 ### Architecture DECISION v1, SUPERSEDED 2026-08-04 (see above): Nucleo becomes a dumb I2C-driven external DAC, all control logic stays in Python on the Pi (2026-07-28)
 
