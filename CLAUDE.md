@@ -1096,6 +1096,89 @@ calibration (see above); this is still firmware work requiring the laptop
 `open_loop`-mode command set (likely minimal, since the command shapes are
 deliberately kept the same as "FTA Controller"'s existing `set_x`/`set_y`).
 
+### Firmware phase 1 (everything except PID) implemented in `camera_centroid_receiver`, build-verified, NOT yet flashed (2026-08-04)
+
+Per the user's explicit sequencing ("get everything else working first, then
+put a PID controller in last"), built every non-PID piece of the v2
+architecture above into the existing `camera_centroid_receiver` CubeIDE
+project (`STM32CubeIDE/workspace_1.14.0/camera_centroid_receiver` on the
+laptop — still not part of this git repo, see the gap noted at the top of
+this file). Deferred to the PID pass, per that sequencing: `run_control_step`/
+`pixel_error_to_dac_error`/`pi_update_axis`, and the VCP setters that only a
+running PID would consume (`set_target_x/y`, `set_kp_x/ki_x/kp_y/ki_y`,
+`set_gain_matrix`). `set_mode closed_loop` is explicitly rejected (`ERR
+closed_loop not yet implemented`) rather than silently stubbed, per the
+user's call.
+
+**What's built:**
+- **DAC1** (`MX_DAC1_Init`, PA4=OUT1=x, PA5=OUT2=y) and **`apply_dac(axis,
+  value)`** — the single choke point for DAC writes, clamps to
+  `[95, 4000]` (same floor/ceiling as "FTA Controller"'s own default
+  clamp). PA4/PA5 are conflict-free with I2C1 now that SB16/SB18 are gone
+  (see the amp-board I2C fault thread above).
+- **PA12 amp-enable gate** (active high, default LOW at boot) plus
+  `amp_enable()`/`amp_disable()`/`estop()`. `estop()` disables the amp and
+  latches `g_estop_latched`, which blocks `amp_enable()` until an explicit
+  clear — **`clear_estop`, a command not named in the v2 command-set table
+  above**, was added since the latch needs some way to release; flagging
+  in case a different name/flow was intended.
+- **VCP command link**: USART2 RX interrupt (single-byte
+  `HAL_UART_Receive_IT`, re-armed each byte, same one-shot/re-arm
+  convention the I2C reception already used) feeding a line buffer, parsed
+  by `process_command_line()`. Implemented commands: `set_mode
+  open_loop|closed_loop` (closed_loop rejected, see above), `set_x N` /
+  `set_y N`, `amp_enable`, `amp_disable`, `clear_estop`, `get_status`. The
+  bare `!` e-stop byte is handled at ISR level in
+  `HAL_UART_RxCpltCallback`, bypassing the line parser, matching "FTA
+  Controller"'s convention.
+- **`get_status`** reports mode, amp/estop state, last commanded DAC x/y,
+  the last *relayed* I2C telemetry x/y + its age in ms, telemetry
+  packet/checksum-error counts, and uptime — **not the same reply format
+  "FTA Controller" used** (that was a fixed positional CSV list; this is
+  keyed `key=value` text). `fta_calibration.py`/`fta_step_response_test.py`
+  will need their status-parsing updated to match, not just their DAC
+  command calls, when they're adapted for this firmware (still open per
+  the "Not yet decided/done" note above).
+- Heartbeat (`print_heartbeat`, still free-running every 1s regardless of
+  traffic) extended with `mode=`/`amp=`/`estop=`, for a glance-and-go bench
+  check without needing `get_status`.
+- I2C1 receive path (`process_beam_packet`) unchanged in wire format, only
+  addition is `g_latest_beam_tick = HAL_GetTick()` per packet, feeding
+  `get_status`'s telemetry-age field.
+
+**Sourcing the DAC HAL driver**: this project's `Drivers/` only ever
+contained the HAL source files CubeMX generates for the peripherals
+actually selected in the `.ioc` (I2C1, USART2) — `stm32l4xx_hal_dac[.c/.h]`
+and the `_ex` pair didn't exist here at all. Copied them from the cached
+`STM32Cube_FW_L4_V1.18.2` package
+(`~/STM32Cube/Repository/STM32Cube_FW_L4_V1.18.2`, matching this project's
+`ProjectManager.FirmwarePackage` exactly — not a different/newer version)
+rather than hand-authoring a HAL driver from memory. Also flipped
+`HAL_DAC_MODULE_ENABLED` on in `stm32l4xx_hal_conf.h`.
+
+**Deliberately NOT added to the `.ioc`.** DAC1/PA4/PA5/PA12 and the USART2
+NVIC interrupt exist only as hand-written code inside `USER CODE` marker
+blocks in `main.c`/`stm32l4xx_hal_msp.c`/`stm32l4xx_it.c` — same tradeoff
+already made for the PB3 LED GPIO earlier in this project (see
+`MX_GPIO_Init`'s own comment). This means a future CubeMX "Generate Code"
+from the `.ioc` will **not** delete any of this (USER CODE blocks always
+survive regeneration) but **will** silently re-comment-out
+`HAL_DAC_MODULE_ENABLED` in `stm32l4xx_hal_conf.h`, since that file isn't
+USER-CODE-protected and is driven straight off the `.ioc`'s IP list — if
+this project is ever regenerated, re-enable that line by hand.
+
+**Build-verified, not hardware-verified.** STM32CubeIDE was already open
+with this workspace (so a headless CubeIDE build would have fought the
+workspace lock) — instead compiled every project source file directly with
+the project's own bundled `arm-none-eabi-gcc` (13.3.rel1) against the real
+include paths/defines/target flags, then linked the result against the
+project's actual `STM32L432KCUX_FLASH.ld`: clean build, zero warnings even
+under `-Wall -Wextra`, zero linker errors. **Never built inside CubeIDE
+itself and never flashed** — that, plus a real bench pass (`get_status`,
+`set_x`/`set_y` moving the actuator, `amp_enable`/`amp_disable`,
+`clear_estop`, and the bare `!` e-stop), is the actual next step before
+trusting this on hardware.
+
 ### Architecture DECISION v1, SUPERSEDED 2026-08-04 (see above): Nucleo becomes a dumb I2C-driven external DAC, all control logic stays in Python on the Pi (2026-07-28)
 
 Trigger: `camera_view_tool.py`'s default-on I2C streaming collapsed capture
