@@ -1400,6 +1400,80 @@ Finding 2 before trusting these settling times for gain tuning; (3) only
 after both are settled, pick real `Kp`/`Ki` and implement the PID loop
 (the piece deliberately deferred through all of "Firmware phase 1").
 
+### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
+
+Frequency-domain complement to the step-response tests, motivated by the
+project's actual goal (top of this file): a step tells you settling time
+for a one-off jump, not whether the actuator can continuously reject a
+10-20Hz disturbance. Built `fta_sine_response_test_vcp.py` — same
+laptop-only VCP architecture as the step test (paced `set_x`/`set_y`
+commands, position sourced from the Nucleo's telemetry-relay print via a
+background reader thread) — commands
+`center + amplitude*sin(2*pi*freq*t)` and fits the measured trace to
+`A*sin(wt) + B*cos(wt) + C` (linear least-squares, since the test
+frequency is known exactly) to extract amplitude and phase lag.
+
+**Fixed a latent timing bug while building this** (present in
+`fta_step_response_test_vcp.py` too, but harmless there): the reader
+thread didn't start until after the pre-test 0.5s settle sleep, so
+telemetry arriving during that sleep would burst through with
+near-identical timestamps once the thread finally started reading — fine
+for the step test (only ever took a *mean* over its pre-step baseline,
+insensitive to relative timing within that window) but would corrupt a
+sine-phase fit, which depends on precise timing throughout. Added
+`ser.reset_input_buffer()` right before starting the reader thread.
+**Verified this wasn't the actual cause of the finding below** — retested
+0.5Hz before/after the fix, result didn't meaningfully change (169° → also
+~169° reported phase).
+
+**Ran 0.5Hz, 1Hz, 2Hz on axis x (±200 DAC counts around 2000).** Plotted
+(`docs/session_results_2026-08-04.pptx`, sine-tracking slides) — visually,
+the measured pixel trace is a clean, low-noise sinusoid locked to the
+exact commanded frequency at every rate tested, for the full duration of
+each run. **Qualitatively this is a real, positive result**: the actuator
+tracks a continuous sine faithfully in shape, not distorted, clipped, or
+backlash-limited. (The 1Hz run has an obvious startup transient in its
+first ~0.3s, excluded from the fit by dropping the first full commanded
+cycle.)
+
+**But the fitted phase lag is large and hard to trust as-is.** Even at
+0.5Hz — where the step-response settling times (125-469ms) would predict
+a small lag if the actuator behaved like a simple low-order system — the
+fit shows ~940ms of lag, uncomfortably close to half that 2000ms period
+(a single-frequency phase fit can't distinguish a lag from
+`lag - n*period`, a fundamental ambiguity, and physically a passive
+actuator can't lead its own command, so a fitted "phase lead" is really an
+aliased large lag, not evidence of anything faster than expected).
+Fitted lag values: 0.5Hz → -940ms, 1Hz → -447ms, 2Hz → -204ms — roughly
+constant *phase* (~190-210°, computed as `period + lag_ms` mod period)
+rather than constant *time delay*, which doesn't cleanly point at either a
+simple fixed transport delay or a simple actuator time-constant
+explanation; not resolved.
+
+**Most likely explanation, not yet confirmed**: this test's measurement
+path — I2C → Nucleo prints a line → USB VCP → Python `readline()` in a
+background thread — is nothing like how a real closed-loop controller
+would read position. A future PID running on the Nucleo reads
+`g_latest_beam` directly at ISR level, with none of this print/USB/Python
+overhead. The fitted lag numbers here almost certainly conflate real
+actuator+optics dynamics with this test method's own added latency, which
+a Nucleo-side PID would never actually pay — meaning these specific
+numbers should NOT be used for gain tuning without first separating the
+two. **Two ways to disambiguate, neither done yet**: test at an even lower
+frequency (e.g. 0.1Hz, where true actuator lag should become negligible
+relative to the period — a persistent large offset there would implicate
+fixed pipeline latency, not frequency-dependent actuator dynamics); or run
+a camera-direct sine test on the Pi (analogous to why
+`fta_step_response_test.py` was kept as the camera-direct ground truth)
+that removes the VCP relay from the measurement path entirely.
+
+**Not yet done**: resolving the above; pushing frequency toward the
+actual 10-20Hz disturbance band (deliberately not attempted yet given the
+lag-attribution question is still open — a clean number at 15Hz isn't
+worth much if we don't know how much of it is real); testing axis y and
+the cross-axis coupling further (already logged per-run in the results
+but not separately analyzed).
+
 ### Architecture DECISION v1, SUPERSEDED 2026-08-04 (see above): Nucleo becomes a dumb I2C-driven external DAC, all control logic stays in Python on the Pi (2026-07-28)
 
 Trigger: `camera_view_tool.py`'s default-on I2C streaming collapsed capture
