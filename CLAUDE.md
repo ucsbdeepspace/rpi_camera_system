@@ -1203,6 +1203,92 @@ location anyway) and re-import from `nucleo_firmware/camera_centroid_receiver/`
 in this repo (File → Import → Existing Projects into Workspace). Not done
 yet as of this entry.
 
+### Firmware phase 1 flashed and bench-tested — CONFIRMED working (2026-08-04)
+
+Flashed the phase-1 build (previous section) to real hardware from the
+laptop, bypassing CubeIDE entirely (it was closed by request, so this used
+the bundled `STM32_Programmer_CLI.exe` directly against the `.elf` built
+earlier): `STM32_Programmer_CLI -c port=SWD sn=066FFF515152827187153930 -w
+firmware.elf -v -rst` — download verified, MCU reset. **Board identity
+confirmed by the user**, not assumed: three ST-Link-capable Nucleos were
+physically connected to the laptop at once (Device Manager showed three
+distinct serials, one of which — `0666FF515152827187143833` — matches this
+file's own on-record "FTA Controller" board serial from the 2026-07-23
+latency-test session); with CubeIDE closed, `STM32_Programmer_CLI --list`
+only detected one (`066FFF515152827187153930`, a different serial, board
+type `NUCLEO-L432KC`), and the user confirmed that's the
+`camera_centroid_receiver` target.
+
+**Bench-tested over the VCP (COM4, 115200 baud) directly, no laptop-side
+Python driver yet — just raw command/response.** Confirmed live, in this
+order: heartbeat free-running (`mode=open_loop amp=0 estop=0`); real I2C
+telemetry actively streaming from the Pi the whole time (thousands of
+packets, 0 checksum errors — `camera_view_tool.py` or similar was already
+running on the Pi during this test); `get_status` reporting correctly;
+`amp_enable` → `OK amp_enabled`; `set_x`/`set_y` → `OK x=N`/`OK y=N` and
+confirmed via a follow-up `get_status` (`dac_x`/`dac_y` updated); bare `!`
+→ amp drops within one heartbeat tick, `estop=1` latches, DAC value held
+(not zeroed) exactly as designed; `amp_enable` correctly refused
+(`ERR amp latched by estop, clear_estop first`) until `clear_estop` →
+`OK estop cleared` → `amp_enable` now succeeds; `set_mode closed_loop` →
+`ERR closed_loop not yet implemented`, confirming the deliberate rejection
+works; `set_x 99999` → `OK x=4000`, confirming the `[95, 4000]` clamp;
+unknown commands correctly rejected. **Every phase-1 function behaves
+exactly as designed.**
+
+**Real finding: the VCP occasionally drops a character out of a command
+line under live I2C load — not a parser bug, an interrupt-priority
+artifact.** Saw it 3 times in the first ~19 commands sent while the Pi's
+telemetry stream was running (`get_status`→`ge_status`,
+`bogus_command`→`bogus_mand`, `set_y 95`→`set_y95`), then again on a later
+retry (`se_y` before a clean `set_y 95` landed) — roughly 1 in 5-6 commands
+during this session, always while telemetry was flowing, never observed
+against a quiet bus. Root cause, not yet confirmed by instrumentation but
+consistent with every symptom: I2C1's NVIC priority (0) is higher than
+USART2's (1) (see `stm32l4xx_hal_msp.c`'s `USART2_MspInit 1` comment,
+deliberate at the time — telemetry was judged more time-critical than
+occasional VCP commands). Under the Pi's high packet rate, the CPU spends
+enough time inside the I2C ISR that the UART's single-byte
+receive/re-arm cycle occasionally misses a byte before the next one
+arrives, corrupting whatever line was mid-transmission. **Not fixed in
+firmware** (would mean either raising USART2's priority, which risks
+delaying I2C servicing under the exact conditions this was originally
+tuned to avoid, or moving to a more robust framing/ack scheme — neither
+attempted yet, flagging as open). **Not a safety concern**: corrupted
+lines are never silently misinterpreted as a *different* valid command —
+`process_command_line`'s exact-match dispatch means a mangled token either
+matches nothing (`ERR unknown command`) or, if the front-loaded byte drop
+happens to land, occasionally reproducing a truncated form of a real
+command name is possible in principle but wasn't observed. Worked around
+on the host side instead (see below) — a corrupted line always gets an
+`ERR` reply, so simply retrying is safe.
+
+**Fixed `fta_step_response_test.py`** (commit `a1e0725`) to actually target
+this firmware — it was still written against the old "FTA Controller"
+protocol on two real points, not just the already-known `get_status`
+format concern: (1) `get_current_position()`'s regex matched the old
+positional `status:x,y,...` reply, updated to this firmware's keyed
+`dac_x=N dac_y=N`; (2) `FTA_BAUD` was still `460800` (the old firmware's
+rate) against this firmware's actual `115200` — would have produced pure
+baud-mismatch garbage, the same failure signature this file already
+documented once before (2026-07-23) for the reverse mix-up. Also added a
+5-attempt retry around `get_current_position()`'s request/reply, given the
+byte-loss finding above — confirmed this actually matters in practice: a
+live retry during this same bench session needed 2 attempts before
+`set_y 95` landed cleanly. `fta_calibration.py` and
+`fta_serial_latency_test.py` almost certainly have the same two
+incompatibilities (old status format assumption, `FTA_BAUD` at `460800`)
+and haven't been checked yet — do that before running either against this
+firmware.
+
+**Not yet done**: the actual step-response test itself. It needs
+`picamera2`/`cv2`, so it can only run on the Pi, and the Nucleo's USB is
+currently on the laptop (where this bench test just ran), not the Pi —
+per this file's own architecture note, the physical USB cable needs to
+move over before `fta_step_response_test.py` can capture real camera data.
+Board was left in a clean idle state after bench testing: `amp=0 estop=0
+dac_x=95 dac_y=95`.
+
 ### Architecture DECISION v1, SUPERSEDED 2026-08-04 (see above): Nucleo becomes a dumb I2C-driven external DAC, all control logic stays in Python on the Pi (2026-07-28)
 
 Trigger: `camera_view_tool.py`'s default-on I2C streaming collapsed capture
