@@ -117,9 +117,21 @@ void HAL_I2C_MspInit(I2C_HandleTypeDef* hi2c)
     /* Peripheral clock enable */
     __HAL_RCC_I2C1_CLK_ENABLE();
     /* I2C1 interrupt Init */
-    HAL_NVIC_SetPriority(I2C1_EV_IRQn, 0, 0);
+    /* Priority hand-lowered to 1 (below USART2's 0, see USART2_MspInit's
+     * comment) -- NOT what CubeMX would regenerate from the .ioc (still
+     * 0,0 there), re-apply by hand if this project is ever regenerated.
+     * Bench testing 2026-08-04 found the VCP dropping characters out of
+     * commands, up to 100% of the first few in one session, while I2C
+     * held this priority above USART2's: a UART byte arriving mid-I2C-ISR
+     * had to wait, and the single-byte receive/re-arm cycle sometimes
+     * missed the next byte entirely. I2C1 can absorb the reverse (a UART
+     * ISR preempting it) for free -- NoStretchMode is disabled above, so
+     * the Pi's I2C master just sees SCL held a few extra us, a protocol-
+     * legal clock stretch, not an error. UART RX has no equivalent
+     * tolerance (no HW flow control), so it's the one that needs to win. */
+    HAL_NVIC_SetPriority(I2C1_EV_IRQn, 1, 0);
     HAL_NVIC_EnableIRQ(I2C1_EV_IRQn);
-    HAL_NVIC_SetPriority(I2C1_ER_IRQn, 0, 0);
+    HAL_NVIC_SetPriority(I2C1_ER_IRQn, 1, 0);
     HAL_NVIC_EnableIRQ(I2C1_ER_IRQn);
     /* USER CODE BEGIN I2C1_MspInit 1 */
 
@@ -215,10 +227,14 @@ void HAL_UART_MspInit(UART_HandleTypeDef* huart)
     /* Hand-added: USART2 global interrupt, needed for the VCP command link's
      * single-byte HAL_UART_Receive_IT reception (see main.c). Not in the
      * .ioc -- this project only ever used USART2 for blocking TX (the
-     * heartbeat print) until now. Lower priority (1) than I2C1's (0): the
-     * beam-telemetry stream is the time-critical link, VCP commands are
-     * occasional/low-rate laptop input. */
-    HAL_NVIC_SetPriority(USART2_IRQn, 1, 0);
+     * heartbeat print) until now. HIGHER priority (0) than I2C1's (now 1,
+     * see HAL_I2C_MspInit's comment) -- originally the reverse, changed
+     * 2026-08-04 after bench testing found the VCP dropping characters
+     * out of commands under live I2C load. UART RX has no hardware
+     * tolerance for being kept waiting (no flow control, no clock
+     * stretching); I2C does (NoStretchMode disabled), so I2C is the one
+     * that can safely lose the priority race. */
+    HAL_NVIC_SetPriority(USART2_IRQn, 0, 0);
     HAL_NVIC_EnableIRQ(USART2_IRQn);
 
     /* USER CODE END USART2_MspInit 1 */
