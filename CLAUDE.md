@@ -1339,6 +1339,67 @@ is still an open question), and re-running
 100-count steps both directions, both axes) once real movement is
 confirmed.
 
+### Actuator confirmed physically moving; full step-response protocol rerun on hardware (2026-08-04)
+
+User confirmed via `fta_manual_control.py` that `amp on` does something
+physically observable at the amp board and the actuator visibly moves —
+resolves the open question above. `amp_enable`'s PA12 signal was always
+reaching the board; whatever the null result on the very first
+`fta_step_response_test_vcp.py` run was, it wasn't "amp board unpowered/
+disconnected." Not root-caused further (not necessary once a real
+non-zero response was confirmed on the retest below).
+
+**Full original protocol rerun** (95→2000 large step, then 2000↔2100 small
+steps ×3, both axes; amp enabled once for the whole batch rather than
+re-toggled per run) — real motion confirmed on every single run this time:
+
+| axis | step | dominant (2026-07-23 → now) | delta (px) | overshoot | settling (2026-07-23 → now) |
+|---|---|---|---|---|---|
+| x | 95→2000 | cy → **x** | -148.6 | 0.0% | 793ms → 922ms |
+| x | 2000→2100 | cy → **x** | -19.8 | 0.0% | 45ms → **469ms** |
+| x | 2100→2000 | cy → **x** | +5.3 | 79.1% | 67ms → 31ms |
+| x | 2000→2100 (repeat) | cy → **x** | -7.1 | 0.0% | 80ms → 125ms |
+| y | 95→2000 | cx → **y** | -124.2 | 0.0% | 1183ms → 765ms |
+| y | 2000→2100 | cx → **y** | -11.5 | 0.0% | 83ms → 250ms |
+| y | 2100→2000 | cx → **y** | +3.4 | 94.1% | 144ms → 156ms |
+| y | 2000→2100 (repeat) | cx → **y** | -5.7 | 0.0% | 22ms → 234ms |
+
+Raw data: `results/fta_step_response_vcp_{x,y}_20260804T2326-2327*.npz`.
+
+**Finding 1 — axis coupling flipped, real and consistent across all 8
+runs, not noise**: pre-fix, DAC-x visibly drove pixel-*y* (cy) and DAC-y
+drove pixel-*x* (cx) — a rotated rig. Now each axis drives its own
+matching pixel coordinate directly (DAC-x → cx, DAC-y → cy). Consistent
+direction across every run rules out measurement noise as the explanation.
+**Physical cause not identified** — plausibly the camera or actuator got
+reoriented during the SB16/SB18 rework or the bench reconfiguration for
+laptop-based testing, but not confirmed by inspection. **Practical
+consequence: any old `fta_calibration.py` fit matrix is now invalid** — a
+fresh calibration sweep is required before that matrix can be trusted
+again, independent of anything else in this thread.
+
+**Finding 2 — small-step settling times are larger and noisier than
+pre-fix (125-469ms vs. 22-144ms), large-step settling is comparable
+(765-922ms vs. 793-1183ms)**: not yet distinguished between two
+explanations — (a) a real dynamics change from the rework (extra parasitic
+mass/damping from rework, different mechanical preload after
+reorientation), or (b) a measurement-resolution artifact of this specific
+retest method: `fta_step_response_test_vcp.py` samples at ~170-190/s (the
+VCP relay rate), well below whatever camera-direct rate the original
+2026-07-23 numbers used, and `analyze_step`'s settling-time criterion
+(every remaining sample must stay within tolerance) is more sensitive to a
+single noisy tail sample at a lower sample rate. **Not yet resolved** —
+more repeats, or a camera-direct rerun via `fta_step_response_test.py` for
+a resolution-matched comparison, would distinguish these.
+
+**Next steps, not yet decided/done**: (1) re-run `fta_calibration.py`
+(needs the same protocol/status-format/baud fixes already applied to the
+step-response script, not yet done) given Finding 1; (2) more repeats of
+the small-step sequence, or a camera-direct comparison run, to resolve
+Finding 2 before trusting these settling times for gain tuning; (3) only
+after both are settled, pick real `Kp`/`Ki` and implement the PID loop
+(the piece deliberately deferred through all of "Firmware phase 1").
+
 ### Architecture DECISION v1, SUPERSEDED 2026-08-04 (see above): Nucleo becomes a dumb I2C-driven external DAC, all control logic stays in Python on the Pi (2026-07-28)
 
 Trigger: `camera_view_tool.py`'s default-on I2C streaming collapsed capture
