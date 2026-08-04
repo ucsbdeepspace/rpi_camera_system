@@ -961,7 +961,142 @@ with hover tooltips, both axes' panels, and the full data table — see
 Claude's Artifact feature; regenerate from the `results/fta_step_response_*.npz`
 files if needed).
 
-### Architecture DECISION (not yet implemented): Nucleo becomes a dumb I2C-driven external DAC, all control logic stays in Python on the Pi (2026-07-28)
+### Architecture DECISION v2 (2026-08-04, supersedes the "dumb DAC" decision below): the PID controller runs ON the Nucleo — Pi is a pure centroid sensor streaming telemetry over I2C, laptop sends setpoint/tuning commands over VCP
+
+After talking to Peter, reversed the 2026-07-28 "dumb DAC" decision
+immediately below this one. That decision kept all control math in Python
+specifically to avoid a CubeIDE rebuild-and-reflash cycle per gain change —
+a real cost, but it's outweighed by a bigger concern surfaced this session:
+the loop-bandwidth margin against the 10-20Hz disturbance band is tight
+(~29Hz ceiling estimated from pure latency, with real closed-loop step
+response showing overshoot at every step size tested), and a PID running in
+Python is subject to OS/interpreter scheduling jitter in a way a bare-metal
+MCU loop isn't. This is the more standard embedded-control pattern anyway:
+fast deterministic inner loop on the MCU, slow supervisory setpoint updates
+from a host. The reflash-per-tune cost is deliberately offset below by
+making gains (and the calibration gain-block) live-settable over VCP,
+instead of hardcoded.
+
+**Roles, strictly separated:**
+- **Pi**: camera capture + centroid detection only. Streams telemetry to the
+  Nucleo over I2C. Never receives anything back, never makes a decision
+  based on feedback, never issues a command to anything. This boundary was
+  deliberately tightened mid-design after an inconsistency got caught: an
+  earlier version of this plan had the Pi watching its own centroid to
+  decide when a hypothetical future grid-scan target was "reached" — that's
+  a control decision, which violates "Pi is just a sensor." Any future
+  logic that needs to react to position (e.g. a target-position grid scan)
+  belongs on the laptop, reading the Nucleo's relayed telemetry via
+  `get_status`, not on the Pi.
+- **Nucleo**: runs the actual PI control loop (pixel error, decoupled via
+  the calibration's 2x2 gain-block inverse, into per-axis P+I with
+  anti-windup), drives the DAC, owns amp-enable safety gating. Also
+  supports a raw open-loop DAC passthrough mode for bench characterization
+  (see below — this is not optional, several existing tools depend on it).
+- **Laptop**: sends target-position setpoints and gain/calibration updates
+  over the existing ST-Link VCP link (USART2, PA2/PA15 — already wired for
+  `camera_centroid_receiver`'s heartbeat print, no new hardware). Also
+  where any future closed-loop sequencing logic (e.g. a target-position
+  grid scan) would live, per the Pi-boundary note above.
+
+**I2C wire format does NOT need to change.** Under this architecture the
+Pi's job is exactly what `nucleo_i2c_sender.py`/`camera_centroid_receiver`
+were originally built for — stream centroid telemetry, nothing else. The
+existing `seq/status/x/y/checksum` packet is already the right shape. Only
+outstanding fix: the `POSITION_SCALE` divide-by-10 (sub-pixel precision,
+flagged in an earlier session, never flashed — see "camera_view_tool.py
+gains built-in full-speed I2C streaming" below) still needs to land in
+firmware.
+
+**DAC pins are now conflict-free.** DAC1_OUT1/OUT2 are PA4/PA5 — PA5 is the
+same physical pin as this board's "A4" header position, which used to be
+hard-wired to D4 (I2C1_SDA) via solder bridge SB18 (see the amp-board I2C
+fault section above). With SB16/SB18 removed, PA4/PA5 are fully independent
+of I2C1 now — no shared-net concern between the DAC output and the
+telemetry input.
+
+**Two firmware modes, not one — this is the part that's easy to get wrong.**
+`fta_step_response_test.py` and `fta_calibration.py` both work by exciting
+the raw actuator directly and watching the plant's own response — that's
+not a convenience, it's required: you need open-loop actuator dynamics
+*before* you can pick sensible gains, and calibration measures the raw
+DAC-to-centroid transform, which a closed loop would corrupt by correcting
+for it while you're trying to measure it. So:
+- **`open_loop`**: raw DAC passthrough (`set_x`/`set_y`, same shape as
+  today's "FTA Controller" commands), PID inactive, I2C telemetry received
+  but ignored. Used for `fta_step_response_test.py` and
+  `fta_calibration.py`.
+- **`closed_loop`**: `set_target_x`/`set_target_y` sets the PID's setpoint;
+  the loop runs continuously against streamed telemetry. Real operation.
+
+**`grid_scan` is being dropped, not ported.** Its only real job was smooth,
+backlash-avoiding travel between points for the (different, lock-in-based)
+firmware it came from. Under this architecture, `fta_calibration.py`'s
+sweep becomes a plain sequence of `set_x`/`set_y` calls in `open_loop`
+mode — no firmware travel logic needed — *as long as* the grid step size
+stays in the small-step regime already characterized (~45-80ms clean
+settling, none of the slew-rate ringing seen on the one large 1905-count
+step). This aligns with the earlier finding that small-step dynamics, not
+big-step dynamics, are the right basis for gain tuning anyway. **Not yet
+verified**: whether this actuator has real position-dependent hysteresis
+(different reading approaching a point from opposite directions) — if so,
+calibration should approach points from a consistent direction even with
+plain jumps (trivial to arrange in Python), but this hasn't been tested. A
+*separate*, future closed-loop grid scan (visiting known target positions
+for e.g. tracking-repeatability testing) is a different tool entirely, and
+per the Pi-boundary note above would live on the laptop, not the Pi.
+
+**Command set (VCP, laptop<->Nucleo):**
+
+| Command | Mode | Purpose |
+|---|---|---|
+| `set_mode open_loop\|closed_loop` | either | switch control mode |
+| `set_x N` / `set_y N` | open_loop | raw DAC setpoint, bypasses PID |
+| `set_target_x N` / `set_target_y N` | closed_loop | PID setpoint |
+| `set_kp_x/ki_x/kp_y/ki_y N` | closed_loop | live gain tuning, no reflash |
+| `set_gain_matrix ...` | closed_loop | load the calibration 2x2 gain-block (inverse) without a reflash |
+| `amp_enable` / `amp_disable` | either | manual override; auto-gated by telemetry freshness in closed_loop (manual disable always wins) |
+| `get_status` | either | mode, amp state, last raw/target value, last relayed telemetry (x/y + age), packet/checksum-error counters, uptime |
+| `!` (bare byte, bypasses line parser) | either | ISR-level emergency stop, carried forward as-is from "FTA Controller" |
+
+**Firmware function breakdown** (subsystem / where it runs — ISRs stay
+short, matching the existing `camera_centroid_receiver` convention):
+- *I2C1 (ISR)*: `HAL_I2C_SlaveRxCpltCallback()` — parse/checksum/apply
+  `POSITION_SCALE`, store into `g_latest_telemetry` + timestamp;
+  `HAL_I2C_ErrorCallback()` re-arms, unchanged from today.
+- *VCP (ISR buffers only, parsed in main loop)*: RX ISR pushes to a ring
+  buffer; `process_command_line()` dispatches to `cmd_set_mode()`,
+  `cmd_set_x/y()`, `cmd_set_target_x/y()`, `cmd_set_kp_x/ki_x/kp_y/ki_y()`,
+  `cmd_set_gain_matrix()`, `cmd_amp_enable/disable()`, `cmd_get_status()`;
+  `handle_estop_byte()` stays ISR-level, bypasses the line buffer.
+- *Control loop (fires on each fresh valid telemetry packet, not a
+  timer)*: `run_control_step(x_meas, y_meas, dt)` — only in closed_loop
+  mode, `dt` measured from the actual telemetry interval; calls
+  `pixel_error_to_dac_error()` (applies the gain-block inverse) then
+  `pi_update_axis()` per axis (P+I, anti-windup against the DAC clamp).
+  `check_telemetry_staleness()` runs every main-loop tick; past a timeout,
+  freezes both integrators and forces `amp_disable()`.
+- *DAC output*: `apply_dac(axis, value)` — the only function that ever
+  writes the DAC registers, clamps to [95, 4000], called by both
+  `cmd_set_x/y` (open-loop) and `run_control_step` (closed-loop).
+- *Amp/safety*: `amp_enable()`/`amp_disable()` (GPIOA12, shared by manual
+  commands and the automatic staleness trigger); `estop()` disables amp,
+  holds the DAC, latches a fault requiring an explicit clear.
+- *Housekeeping*: `print_heartbeat()` (periodic VCP status, extended with
+  mode/telemetry-age/amp-state vs. today's version); `main()` services the
+  USART ring buffer, calls `check_telemetry_staleness()`, drives the
+  heartbeat on its own cadence.
+
+**Not yet decided/done**: exact staleness-timeout value for the fail-safe
+amp gate; whether hysteresis needs directional-approach discipline in
+calibration (see above); this is still firmware work requiring the laptop
+(same one-board-one-firmware-at-a-time constraint as ever — this retires
+"FTA Controller" as the flashed image again); `fta_calibration.py` and
+`fta_step_response_test.py` will need updates to target this firmware's
+`open_loop`-mode command set (likely minimal, since the command shapes are
+deliberately kept the same as "FTA Controller"'s existing `set_x`/`set_y`).
+
+### Architecture DECISION v1, SUPERSEDED 2026-08-04 (see above): Nucleo becomes a dumb I2C-driven external DAC, all control logic stays in Python on the Pi (2026-07-28)
 
 Trigger: `camera_view_tool.py`'s default-on I2C streaming collapsed capture
 fps to ~0.9fps (from >100fps) because the physical Nucleo wired to the
