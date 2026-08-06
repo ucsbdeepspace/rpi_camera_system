@@ -148,16 +148,41 @@ def _reader_thread(ser, t0, records, stop_event):
 def fit_sine(t, v, freq):
     """Linear least-squares fit of v ~= A*sin(wt) + B*cos(wt) + C, w known
     exactly (we commanded it) so this is linear, not an iterative fit.
-    Returns (amplitude, phase_rad, offset). amplitude*sin(wt + phase_rad)
-    is the equivalent single-sinusoid form (R = sqrt(A^2+B^2),
-    phase = atan2(B, A))."""
+
+    Returns (signed_gain, lag_rad, offset), NOT the raw (amplitude, phase)
+    a naive read of the fit would give. sqrt(A^2+B^2) is always positive
+    and folds the actual sign of the DAC->pixel relationship into phase --
+    for an axis where increasing DAC moves the pixel value DOWN (confirmed
+    directly from the step-response data: DAC 95->2000 on x measured a
+    -148.6px delta), phase lands near +-180 degrees at EVERY frequency
+    regardless of any real dynamics, since a sign flip IS a constant
+    180-degree phase shift by definition. Mistaking that for lag was a
+    real error made analyzing the first pass of this data (2026-08-06) --
+    it produced a "large lag at every frequency including near-DC" result
+    that isn't physically sensible for a system whose step-response
+    settling times are under a second.
+
+    Fixed here by choosing whichever reference (0 or 180 degrees) puts the
+    residual phase within +-90 degrees -- that residual is the real,
+    small, frequency-dependent lag; the 0-vs-180 choice is reported
+    separately as the sign of signed_gain. lag_rad is that residual,
+    positive meaning a true delay (consistent with -lag_rad/w giving a
+    positive time lag, same convention the rest of this script uses)."""
     w = 2.0 * math.pi * freq
     basis = np.stack([np.sin(w * t), np.cos(w * t), np.ones_like(t)], axis=1)
     coeffs, *_ = np.linalg.lstsq(basis, v, rcond=None)
     A, B, C = coeffs
     amplitude = float(np.hypot(A, B))
-    phase = float(np.arctan2(B, A))
-    return amplitude, phase, float(C)
+    phase = float(np.arctan2(B, A))  # in (-pi, pi]
+
+    if abs(phase) <= math.pi / 2:
+        sign = 1.0
+        lag_rad = phase
+    else:
+        sign = -1.0
+        lag_rad = phase - math.pi if phase > 0 else phase + math.pi
+
+    return sign * amplitude, lag_rad, float(C)
 
 
 def main():
@@ -287,22 +312,27 @@ def main():
     driven, other = (x, y) if args.axis == "x" else (y, x)
     driven_name, other_name = (args.axis, "y" if args.axis == "x" else "x")
 
-    amp_driven, phase_driven, off_driven = fit_sine(t, driven, args.freq)
-    amp_other, phase_other, off_other = fit_sine(t, other, args.freq)
+    # signed_gain's sign reflects the DAC->pixel relationship's real
+    # direction (e.g. negative = DAC up moves the pixel value down); the
+    # residual lag_rad is the actual, small, frequency-dependent delay --
+    # see fit_sine's docstring for why this isn't just "amplitude, phase".
+    gain_driven, lag_rad_driven, off_driven = fit_sine(t, driven, args.freq)
+    gain_other, lag_rad_other, off_other = fit_sine(t, other, args.freq)
 
-    lag_ms_driven = -phase_driven / w * 1000.0
-    lag_ms_other = -phase_other / w * 1000.0
+    lag_ms_driven = -lag_rad_driven / w * 1000.0
+    lag_ms_other = -lag_rad_other / w * 1000.0
 
     print(f"\n--- Driven axis ({driven_name}) ---")
-    print(f"fitted amplitude: {amp_driven:.2f}px  (commanded {args.amplitude} DAC counts)")
-    print(f"phase lag: {lag_ms_driven:.1f}ms  ({phase_driven * 180/math.pi:.1f} deg "
-          f"at {args.freq}Hz)")
+    print(f"fitted gain: {gain_driven:+.2f}px for {args.amplitude:+d} commanded DAC counts "
+          f"({'DAC up -> pixel up' if gain_driven > 0 else 'DAC up -> pixel down'})")
+    print(f"lag: {lag_ms_driven:.1f}ms  ({lag_rad_driven * 180/math.pi:.1f} deg at {args.freq}Hz, "
+          "relative to the fitted gain direction, not raw phase)")
     print(f"offset: {off_driven:.2f}px")
 
     print(f"\n--- Cross-coupled axis ({other_name}) ---")
-    print(f"fitted amplitude: {amp_other:.2f}px  ({100*amp_other/max(amp_driven,1e-9):.1f}% "
-          f"of driven-axis amplitude)")
-    print(f"phase lag: {lag_ms_other:.1f}ms")
+    print(f"fitted gain: {gain_other:+.2f}px  ({100*abs(gain_other)/max(abs(gain_driven),1e-9):.1f}% "
+          f"of driven-axis magnitude, {'same' if gain_other*gain_driven > 0 else 'opposite'} sign)")
+    print(f"lag: {lag_ms_other:.1f}ms")
     print(f"offset: {off_other:.2f}px")
 
     out_path = args.out
@@ -311,8 +341,8 @@ def main():
         out_path = f"results/fta_sine_response_vcp_{args.axis}_{args.freq:g}Hz_{ts}.npz"
     np.savez(out_path, t=t, x=x, y=y, cmd_t=cmd_t, cmd_v=cmd_v,
              axis=args.axis, freq=args.freq, amplitude=args.amplitude, center=args.center,
-             fit_driven=(amp_driven, phase_driven, off_driven),
-             fit_other=(amp_other, phase_other, off_other))
+             fit_driven=(gain_driven, lag_rad_driven, off_driven),
+             fit_other=(gain_other, lag_rad_other, off_other))
     print(f"\nSaved raw time series to {out_path}")
 
 
