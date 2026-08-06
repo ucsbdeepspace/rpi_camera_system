@@ -1733,6 +1733,23 @@ above — this is all still over the VCP relay path); using the resonance
 location (once better pinned down) to inform any actual hardware change
 before assuming a stiffer flexure is the right fix.
 
+**Follow-up same session**: user pushed further — the high-frequency
+DAC-vs-pixel plots (5/10/15/20Hz slide) still showed x-pixel and y-pixel
+as two separate traces, implicitly treating x as "the" signal and y as
+"cross-coupling noise." That framing only makes sense if the actuator's
+axis is close to the camera's x-axis, which the angle finding above says
+it isn't (~-150 to -172°, not ~0/180°). Fixed by projecting the raw
+(x, y) trace onto each frequency's own fitted motion direction
+(`x·cos(angle) + y·sin(angle)`) instead — the actual 1D displacement
+along the axis the actuator really moves on, replacing the old two-trace
+slide 10 in `docs/session_results_2026-08-04.pptx`. **Notable**: even
+correctly rotated, the 10-20Hz traces still look noisy rather than
+cleanly sinusoidal — reassuring, not concerning: projecting onto the true
+axis maximizes captured signal (recovers the fitted magnitude exactly),
+it doesn't reduce measurement noise, so this confirms the earlier "signal
+genuinely weak at 15-20Hz" read wasn't an artifact of looking at the
+wrong axis split.
+
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 
 Frequency-domain complement to the step-response tests, motivated by the
