@@ -220,6 +220,7 @@ def main():
 
     last_abs_x, last_abs_y = 0, 0
     n_sent = 0
+    n_send_errors = 0
     t_start = time.monotonic()
     try:
         while True:
@@ -246,12 +247,25 @@ def main():
             if dry_run:
                 print(f"x={last_abs_x:.1f} y={last_abs_y:.1f} valid={valid}")
             else:
-                link.send_position(last_abs_x, last_abs_y, valid=valid)
+                try:
+                    link.send_position(last_abs_x, last_abs_y, valid=valid)
+                except OSError as e:
+                    # e.g. the TimeoutError smbus2 raises when the Nucleo
+                    # doesn't ACK -- expected while it's held in reset or
+                    # mid-reflash on the laptop. Don't let a send failure
+                    # kill this process; this script is meant to be left
+                    # running unattended as the Pi's one telemetry source.
+                    n_send_errors += 1
+                    if n_send_errors == 1 or n_send_errors % STATUS_INTERVAL == 0:
+                        print(f"WARNING: I2C send to Nucleo failed ({e}) -- "
+                              f"{n_send_errors} failures so far, still "
+                              f"retrying every frame.")
 
             n_sent += 1
             if n_sent % STATUS_INTERVAL == 0:
                 elapsed = time.monotonic() - t_start
-                print(f"{n_sent} sent, {n_sent / elapsed:.1f}/s average")
+                print(f"{n_sent} sent ({n_sent / elapsed:.1f}/s average, "
+                      f"{n_send_errors} send failures)")
     except KeyboardInterrupt:
         pass
     finally:

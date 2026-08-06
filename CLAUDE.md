@@ -57,6 +57,60 @@ both sides individually looking plausible. See "Nucleo firmware built,
 wiring done" below for the full firmware detail; that section's earlier
 "not yet hardware-validated" caveat is now resolved.
 
+## HANDOFF (2026-08-06): moving to the laptop to build the v2 firmware — Pi side is ready and running
+
+Picking up right after "Architecture DECISION v2" below (Nucleo runs the
+PID, Pi is telemetry-only, laptop sends setpoints/tuning over VCP) got
+logged, and after the SB16/SB18 amp-board I2C fix was confirmed end-to-end.
+This note is the pickup point for the laptop session doing the actual
+CubeIDE work — full design detail lives in "Architecture DECISION v2"
+further down, this is just "what's already done, what to do next."
+
+**Not yet done, and blocking the firmware work**: `camera_centroid_receiver`
+still needs to be folded into this repo from the laptop's local CubeIDE
+workspace (`STM32CubeIDE/workspace_1.14.0/camera_centroid_receiver`) —
+this was decided back on 2026-07-28 and prepped from the Pi side (the
+`.gitignore` block for build artifacts already exists, see below) but
+never actually done. **Do this first**, as its own commit, before starting
+any new firmware changes — see "Before editing it: fold
+`camera_centroid_receiver` into this repo" further down for the exact
+steps (copy the project folder into `nucleo_firmware/camera_centroid_receiver/`,
+commit as an honest "import as-is" baseline, push, confirm push access
+still works).
+
+**Pi-side prep done this session, and left running**:
+`beam_position_streamer.py` (not `camera_view_tool.py` — that's an
+interactive bench GUI, not meant to run unattended) was hardened to
+survive I2C send failures without crashing (commit `821cb1d`) — needed
+because the Nucleo will be reset/reflashed repeatedly during firmware
+bring-up, which previously would have killed the script outright on the
+first failed send. It's meant to be started once and left running for the
+whole laptop session; every reset/reflash on the laptop side will just
+show up as a burst of `WARNING: I2C send to Nucleo failed` lines on the
+Pi, then recover on its own once new firmware boots and starts ACKing
+again. Start it (from this Pi) with whichever mode/`--y-start` currently
+brackets the beam:
+```
+python3 beam_position_streamer.py 640x200 --y-start N
+```
+
+**Suggested build order once `camera_centroid_receiver` is folded in and
+new firmware work starts** (from "Architecture DECISION v2"'s function
+list): add DAC1 (PA4/PA5) + the amp-enable GPIO (GPIOA12) to the `.ioc`
+first and get `open_loop`-mode `set_x`/`set_y` + `get_status` working —
+bench-testable with just a multimeter, no Pi or camera needed. Then the
+mode switch and heartbeat extension. PID + the I2C telemetry-staleness
+fail-safe last, since that's the only part that actually needs
+`beam_position_streamer.py`'s real telemetry to test against — which is
+exactly why it's already running.
+
+**Two things flagged as worth confirming early, not assumed**: (1) which
+physical DAC channel (PA4 vs PA5) drives which axis in "FTA Controller"'s
+existing `main.c`, so `apply_dac()` wires to the right channel; (2) that
+`camera_centroid_receiver`'s current `.ioc` doesn't already claim
+PA4/PA5/PA12 for anything (shouldn't, since that firmware never touched
+them, but cheap to check before adding DAC1 + the amp-enable output).
+
 ## RESOLVED (2026-07-29): I2C1 bus/controller scare was a wedged controller state, cleared by reboot — NOT permanent Pi-side damage; amp board remains the sole real fault
 
 Later the same day as the amp-board finding and the auto-track fps fix
