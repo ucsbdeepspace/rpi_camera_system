@@ -267,6 +267,17 @@ def main():
               "(will be restored to disabled afterward).")
         ser.write(b"amp_enable\n")
         time.sleep(0.1)
+        # Verify, don't assume -- a fire-and-forget enable here produced a
+        # real false result once (see fta_sine_response_test_vcp.py's
+        # 2026-08-06 note): amp stayed off, measured as ~zero response,
+        # briefly mistaken for a real actuator finding. Confirm the state
+        # actually changed before collecting any data.
+        _, _, amp_confirmed, _ = get_status(ser)
+        if not amp_confirmed:
+            print("ERR: sent amp_enable but get_status still reports amp=off -- "
+                  "aborting rather than collecting data with the amp off again.")
+            ser.close()
+            raise SystemExit(1)
 
     records = []
     stop_event = threading.Event()

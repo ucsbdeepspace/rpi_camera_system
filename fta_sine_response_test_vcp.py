@@ -209,6 +209,18 @@ def main():
               "(will be restored to disabled afterward).")
         ser.write(b"amp_enable\n")
         time.sleep(0.1)
+        # Verify, don't assume -- a fire-and-forget enable here previously
+        # produced a real false result (2026-08-06 0.1Hz run: amp was
+        # actually still off, measured as ~zero response, initially
+        # mistaken for a real high-pass/AC-coupling finding about the
+        # actuator). Confirm the state actually changed before trusting
+        # any data collected after this point.
+        _, _, amp_confirmed, _ = get_status(ser)
+        if not amp_confirmed:
+            print("ERR: sent amp_enable but get_status still reports amp=off -- "
+                  "aborting rather than collecting data with the amp off again.")
+            ser.close()
+            raise SystemExit(1)
 
     records = []
     commanded = []  # (t, value) at the exact moment each command was sent
