@@ -111,6 +111,45 @@ existing `main.c`, so `apply_dac()` wires to the right channel; (2) that
 PA4/PA5/PA12 for anything (shouldn't, since that firmware never touched
 them, but cheap to check before adding DAC1 + the amp-enable output).
 
+**SUPERSEDED — this handoff note was stale by the time it was pulled.**
+Written from the Pi without visibility into laptop-side work that had
+already happened in parallel: `camera_centroid_receiver` was folded into
+this repo, the full non-PID "firmware phase 1" was built, bench-tested on
+real hardware, and a real VCP byte-loss bug found and fixed (NVIC
+priority swap) — see "Firmware phase 1 flashed and bench-tested", "Folded
+`camera_centroid_receiver` into this repo", and everything after them,
+all further down this file. Step-response and sine-tracking
+characterization was also done on top of that. **Current actual state**:
+firmware built and hardware-verified through everything except the PID
+loop itself (still deliberately not implemented — see "Firmware phase 1
+(everything except PID) implemented"); open questions are the axis-
+calibration invalidation and the step/sine dynamics findings documented
+in the later sections, not anything this note describes as blocking.
+
+**One item from this note *was* still worth checking, and got checked**:
+confirmed directly against `7-element-array`'s `FTA Controller/Core/Src/main.c`
+(`write_x_cmd_from_float`/`write_y_cmd_from_float`, ~line 741) — `DAC_CHANNEL_1`
+is x, `DAC_CHANNEL_2` is y, no swap. `camera_centroid_receiver`'s
+`apply_dac()` uses the identical mapping. **This rules out a DAC-channel
+software swap as the explanation for the axis-coupling-flip finding**
+(step-response section, "Actuator confirmed physically moving") — that
+finding stands as a real physical change, not a wiring/software bug on
+this end.
+
+**Real, useful info from this note, worth keeping**: `beam_position_streamer.py`
+was hardened on the Pi (commit `821cb1d`) to survive I2C send failures
+(catch-log-continue instead of crashing) rather than dying every time the
+Nucleo resets/reflashes, and is meant to be left running unattended as the
+Pi's telemetry source through repeated laptop-side firmware work —
+relevant context for future bench sessions, since earlier sessions this
+file documents weren't necessarily running that hardened version.
+
+Two coordination gaps this surfaced, worth naming so they don't repeat:
+this file is the hand-off mechanism between the Pi and laptop (per the
+note at the very top of this file), but two sessions clearly ran on
+different machines without pulling each other's commits first — worth
+pulling before writing a new handoff note, not just before starting work.
+
 ## RESOLVED (2026-07-29): I2C1 bus/controller scare was a wedged controller state, cleared by reboot — NOT permanent Pi-side damage; amp board remains the sole real fault
 
 Later the same day as the amp-board finding and the auto-track fps fix
