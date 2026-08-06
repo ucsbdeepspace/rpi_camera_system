@@ -1750,6 +1750,90 @@ it doesn't reduce measurement noise, so this confirms the earlier "signal
 genuinely weak at 15-20Hz" read wasn't an artifact of looking at the
 wrong axis split.
 
+### RETRACTED: the "angle rotation" finding was a batch artifact — and a clean amplitude comparison finds the 10-20Hz "rolloff" was mostly a nonlinear threshold effect, not a bandwidth ceiling (2026-08-06)
+
+**User question that unraveled this**: could the 2-3Hz angle rotation
+just be a sudden camera/rig shift rather than real frequency-dependent
+dynamics? Good instinct — checked immediately rather than defended the
+original read.
+
+**Checked baseline offsets first**: mean pixel y-position jumped from
+~478-480px (0.1-2Hz batch, run ~18:58) to ~379-386px (3-20Hz batch, run
+~19:39 onward — *after* the two calibration sweeps at ~19:12-19:16 that
+swing the actuator across nearly its full DAC range). Mean x shifted
+too, ~15px. DAC-y was confirmed unchanged (95) throughout via the
+printed status line on every run — this isn't a commanded-position
+difference.
+
+**Decisive test**: reran 2Hz standalone, well after the calibration
+sweeps. Result: offset and angle matched the "high-frequency batch"
+pattern (~-151°), **not** the original 2Hz result (~-171.5°) — same
+frequency, different answer, on the same hardware, same session. This
+proves the shift tracks *elapsed time / an intervening event* (most
+likely the two calibration sweeps' large excursions — real mechanical
+hysteresis/settling, or a Pi-side ROI recenter, not yet distinguished),
+not test frequency. **The "two mechanical axes have different dynamics"
+claim in the section above is retracted.** The root cause: every sine
+test up to that point was run in increasing-frequency order over time,
+so frequency and elapsed-time/intervening-disturbance were perfectly
+confounded — a real methodology gap, not just an isolated bad reading.
+
+**Real fix — clean resweep, one uninterrupted session, 3 amplitudes**:
+reran the full 0.1→20Hz sweep (16 frequencies) three times back to back
+with no calibration sweep or other large excursion in between, at
+±200/±400/±800 DAC counts (all `--amplitude`, `center=2000`,
+`--update-rate 400` throughout). This is the comparison that actually
+matters:
+
+| freq | ret. @200 | ret. @400 | ret. @800 |
+|---|---|---|---|
+| 0.1 Hz | 100% | 100% | 100% |
+| 2 Hz | 80% | 84% | 81% |
+| 5 Hz | 60% | 68% | 68% |
+| 10 Hz | 57% | 69% | 61% |
+| 15 Hz | **14%** | **82%** | **66%** |
+| 20 Hz | **22%** | **61%** | **69%** |
+
+(retention = % of that sweep's own 0.1Hz magnitude; full table and
+`amplitude_comparison.png` in `docs/session_results_2026-08-04.pptx`)
+
+**Finding: the severe 15-20Hz collapse was largely a small-amplitude
+nonlinear threshold effect (stiction/backlash/dead-band), not a hard
+bandwidth ceiling.** If the system were linear, doubling amplitude
+200→400 should double the response at every frequency equally. That
+roughly holds 0.1-9Hz (ratios 1.6-2.3×, consistent with local linearity
+— matches the calibration sweep's own finding of reasonable local
+linearity away from the full-range extremes). It breaks badly at 15Hz
+(10.8× — not 2×) and 20Hz (4.9×) — exactly what you'd expect if a small
+command can't generate enough force fast enough to break through some
+threshold at high frequency, while a larger command has enough "push" to
+get past it. **Bonus confirmation**: angle stayed stable (~-146 to
+-157°) across all 16 frequencies in *both* clean amplitude sweeps —
+independent confirmation the earlier rotation finding was a batch
+artifact, not real.
+
+**Not fully resolved — even at ±800 there's still real rolloff** (20Hz
+retains only ~69%, not ~100%), so this doesn't mean "no bandwidth
+concern at all," just a much smaller one than the ±200 data implied.
+
+**Practical implication, genuinely open**: which amplitude regime is the
+right one to design around depends on how large the actual beacon-wobble
+disturbance is in DAC-equivalent terms — a number this project hasn't
+established yet. If the real disturbance is small, the controller may
+still be fighting this stiction/threshold effect in practice even though
+the large-signal bandwidth looks much healthier than first measured —
+classic territory for needing a small dither signal to keep the actuator
+unstuck, a standard trick for exactly this kind of nonlinearity.
+
+**Not yet done**: pinning down what physically caused the batch-to-batch
+offset shift (calibration-sweep hysteresis vs. Pi-side ROI recenter vs.
+something else — not yet distinguishable from the laptop side);
+characterizing the threshold itself more precisely (e.g. an amplitude
+sweep at a fixed high frequency like 15Hz, from 100 to 800+ counts in
+steps, to find where the transition actually happens); getting a real
+number for the expected beacon-wobble amplitude so the right regime can
+be identified; axis y at any of this.
+
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 
 Frequency-domain complement to the step-response tests, motivated by the
