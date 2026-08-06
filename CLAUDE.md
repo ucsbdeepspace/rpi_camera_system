@@ -1672,6 +1672,67 @@ architecture (e.g. accepting partial rejection, revisiting the actuator/
 optics hardware, or re-scoping the disturbance-rejection target) before
 proceeding to PID gain selection and firmware implementation.
 
+### Corrected to true displacement vector; fine 3-12Hz sweep finds real resonance/anti-resonance behavior, not simple rolloff (2026-08-06)
+
+User question that triggered this: was the gain-rolloff analysis assuming
+DAC-x displacement shows up as pure x-pixel motion, or measuring the
+actual (rotated) displacement direction? Answer was the former — a real
+gap. Every gain number up to this point was the driven axis's own pixel
+projection only, ignoring the confirmed cross-axis coupling.
+
+**Fixed**: `fta_sine_response_test_vcp.py` now also reports the true
+displacement vector, `|vector| = sqrt(gain_x^2 + gain_y^2)` and its
+direction `atan2(gain_y, gain_x)`, not just the driven axis's own
+component. Correction is small at 0.1-2Hz (~1%, cross-coupling is modest
+there) but 6-14% at 5-20Hz — doesn't overturn the rolloff conclusion, but
+surfaces a real new finding: **the vector's angle rotates sharply between
+2-3Hz** (steady ~-171.5° from 0.1-2Hz → ~-150 to -160° from 3Hz onward,
+holding roughly steady through 20Hz) — a step change, not a gradual
+drift. Evidence the x and y mechanical axes have measurably different
+dynamics, not identical ones.
+
+**Ran a finer 3-12Hz sweep (1Hz steps)** specifically to locate what's
+happening there, instead of inferring it from 4 widely-spaced points
+(0.1/0.5/1/2 then jumping to 5/10/15/20). Reused the 5Hz/10Hz slots with
+fresh runs under identical conditions to the rest of the fine sweep
+(same amplitude/update-rate) rather than mixing them with the earlier
+separately-run data.
+
+**Result is genuinely not a simple rolloff**: magnitude plateaus 6-10Hz
+(~11-12px, barely below the 5Hz value), **dips sharply at 11Hz** (~8.4px),
+**partially recovers at 12Hz** (~11.4px), then collapses by 15Hz. See
+`docs/session_results_2026-08-04.pptx`'s "Fine sweep" slide for both
+charts (magnitude and angle vs. frequency). A plateau-dip-recovery shape
+is not what a simple single-pole (first-order low-pass) actuator would
+produce — it's more consistent with resonance/anti-resonance interaction
+from a higher-order or two-mode mechanical system, e.g. the x and y
+flexure axes having close but distinct resonant frequencies whose
+combined response creates constructive/destructive interference at
+specific frequencies (matching the angle-rotation finding: different
+axes, different dynamics).
+
+**On whether a stiffer flexure would help (user question, same
+conversation)**: yes in principle — flexure resonant frequency scales as
+`f_n ∝ sqrt(k/m)`, so stiffening raises where the rolloff starts. But
+three caveats, now sharper given the resonance finding: (1) stiffness
+trades against low-frequency gain/sensitivity (current gain has
+headroom — 19px per 200 counts against a ~4000-count usable range — so
+this is probably an acceptable trade); (2) stiffness alone doesn't fix
+damping, and the step-response ringing already on record suggests the
+system may already be underdamped — could just move the same ringing to
+a higher frequency; (3) **given the two axes now look mechanically
+different, stiffening only one wouldn't address the other** — worth
+identifying which axis is softer before deciding where to act.
+
+**Not yet done**: separating the two apparent modes properly (this
+sweep only ever drove axis x — driving y separately, and ideally at
+matched fine resolution, would show whether the y axis has its own
+distinct resonance/rolloff shape); confirming any of this against a
+camera-direct measurement (same outstanding caveat as the rolloff finding
+above — this is all still over the VCP relay path); using the resonance
+location (once better pinned down) to inform any actual hardware change
+before assuming a stiffer flexure is the right fix.
+
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 
 Frequency-domain complement to the step-response tests, motivated by the
