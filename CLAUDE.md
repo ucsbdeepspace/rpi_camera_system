@@ -1607,6 +1607,71 @@ numbers, not the large-step ones. Both sweeps kept
 show the diagnostic story (200-3800/capture=0.15 first pass +
 400-3800/capture=0.4 corner-and-noise check), not just the final matrix.
 
+### Pushed sine tracking to 5/10/15/20Hz — real gain rolloff found, likely a plant-bandwidth problem for the 10-20Hz spec (2026-08-06)
+
+Direct follow-up to the "RESOLVED" sine-tracking correction above: with a
+trustworthy 0.1-2Hz analysis in hand, pushed frequency toward the actual
+10-20Hz disturbance band this project needs to reject. Also raised
+`--update-rate` (to 400Hz) as frequency increased, to keep the commanded
+trajectory from degrading into a coarse staircase.
+
+**Hit a second, related but distinct sign-ambiguity bug at 5Hz.**
+`fit_sine()`'s auto-detected sign (whichever of 0°/180° puts the residual
+phase within ±90°) misdetected axis x's known-negative gain as positive,
+symptom: an impossible negative "lag" (a response can't precede its own
+command). Root cause: real actuator dynamics stacking on top of the
+~41ms pipeline delay established above pushed total phase past the ±90°
+auto-detection boundary — expected, once frequency is high enough,
+regardless of how the sign is computed. Fix: since a linear system's
+static-gain *sign* is a fixed physical property (confirmed independently
+by the step-response data and every 0.1-2Hz sine run — negative on this
+axis, always), added `--gain-sign` to fix that reference instead of
+re-deriving it per frequency — valid up to a full ±180° of real lag, not
+just ±90°.
+
+**Real result once fixed:**
+
+| freq | gain (px / ±200 DAC counts) | lag |
+|---|---|---|
+| 0.1 Hz | -19.2 | 161ms |
+| 0.5 Hz | -17.8 | 68ms |
+| 1 Hz | -16.6 | 59ms |
+| 2 Hz | -15.2 | 47ms |
+| 5 Hz | -10.3 | 50ms |
+| 10 Hz | -9.2 | unreliable — phase at the ±180° wraparound boundary |
+| 15 Hz | -2.6 | unreliable |
+| 20 Hz | -4.1 | unreliable |
+
+**Gain drops to ~15-20% of its low-frequency value by 15-20Hz** — not a
+gentle rolloff, a real collapse right at the frequencies that matter most
+for this project. Lag above ~5-10Hz is explicitly not reported as a
+number: at 10Hz the phase reaches the *fundamental* single-frequency
+wraparound ambiguity (a real mathematical limit — a single test frequency
+alone can't distinguish a lag from `lag ± n·period`), and by 15-20Hz the
+raw traces (`docs/session_results_2026-08-04.pptx`, "Pushing toward the
+10-20Hz disturbance band" slide) visibly stop looking like clean sinusoids
+— signal is small enough that noise likely dominates whatever the fit
+returns.
+
+**Why this matters more than a tuning detail**: this is evidence about
+the *plant* (actuator + optics), not the controller. If the actuator
+itself can only produce ~15-20% of its low-frequency response at 10-20Hz,
+no PID gain choice fixes that — the physical bandwidth ceiling sits below
+where this project needs to operate. Not yet confirmed as a hard
+blocker (only axis x tested; single-tone sine at fixed amplitude, not
+the real 10-20Hz beacon wobble; camera-direct verification never done to
+rule out any remaining test-method attenuation) — but real enough to
+flag as a project-level open question before investing further in gain
+selection, not just a footnote to route around.
+
+**Not yet done**: axis y at these frequencies; confirming this isn't
+still a residual test-method artifact (e.g. via a camera-direct sine test
+removing the VCP relay, same rationale as `fta_step_response_test.py`
+being kept as ground truth); deciding whether this changes the control
+architecture (e.g. accepting partial rejection, revisiting the actuator/
+optics hardware, or re-scoping the disturbance-rejection target) before
+proceeding to PID gain selection and firmware implementation.
+
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 
 Frequency-domain complement to the step-response tests, motivated by the
