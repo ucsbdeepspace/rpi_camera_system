@@ -1493,6 +1493,64 @@ Finding 2 before trusting these settling times for gain tuning; (3) only
 after both are settled, pick real `Kp`/`Ki` and implement the PID loop
 (the piece deliberately deferred through all of "Firmware phase 1").
 
+### RESOLVED (2026-08-06): the "large phase lag" below was a sign-unaware analysis bug, not a real actuator problem — real lag is ~41ms, consistent with a fixed pipeline delay
+
+**Root cause of the whole "large phase lag" thread below**: `fit_sine()`
+reported `amplitude = sqrt(A^2+B^2)` (always positive) and
+`phase = atan2(B, A)`, but the step-response data already on record in
+this file showed DAC increases move axis-x's pixel value *down* — a real,
+normal sign convention (however the actuator/optics happen to be
+oriented), not a bug. A negative gain is mathematically indistinguishable
+from a 180-degree phase shift, so it showed up as phase ≈ ±180° at *every*
+tested frequency regardless of any real dynamics — exactly the "roughly
+constant phase, not constant time delay" pattern noted below as
+unresolved, misread as an alarmingly large lag present even near DC.
+
+**Two other real mistakes compounded this before it got sorted out**: (1)
+the very first 0.1Hz run showed ~0 amplitude — not a frequency-response
+finding at all, just the amp actually being off (a fire-and-forget
+`amp_enable` had silently failed to take effect; fixed by having both
+scripts verify via `get_status` and abort if it didn't take, rather than
+proceeding to collect data against a de-energized actuator). (2) The
+retest after that ran with the beam not confidently detected at all
+(`tel_status=0`, 0 usable samples) — a Pi-side camera/ROI issue, resolved
+by checking on the Pi and restarting its streaming script.
+
+**Fix**: `fit_sine()` now picks whichever reference (0° or 180°) puts the
+residual phase within ±90°, returning a *signed gain* (the direction)
+separately from that residual (the real, small, frequency-dependent lag).
+Reran 0.1/0.5/1/2Hz clean with this fix plus the amp-verification fix:
+
+| freq | gain (px / 200 DAC counts) | lag (ms) |
+|---|---|---|
+| 0.1 Hz | -19.2 | 161 |
+| 0.5 Hz | -17.8 | 68 |
+| 1 Hz | -16.6 | 59 |
+| 2 Hz | -15.2 | 47 |
+
+Fitting lag-in-degrees vs. frequency gives a near-perfect line through
+near-zero (residuals under 1.5° across the whole range) — the signature
+of a roughly **constant ~41ms time delay**, not frequency-dependent
+actuator dynamics (which would curve/plateau, not stay linear all the way
+down to 0.1Hz). ~41ms is a plausible total for this test's own
+measurement pipeline (camera capture → I2C → Nucleo print → USB VCP →
+Python read) — a real closed-loop PID running on the Nucleo reads
+telemetry directly at ISR level and would not pay most of this cost. Gain
+is consistent across all 4 frequencies (mildly declining, -15 to -19px),
+no sign of distortion or tracking failure at any rate tested so far.
+
+**Net effect**: the actuator's own dynamics look faster/cleaner than the
+original (mistaken) reading suggested — closer to good news than bad.
+Doesn't yet answer the real question (10-20Hz, still untested) but the
+analysis is trustworthy now, which it wasn't before. `docs/session_results_2026-08-04.pptx`'s
+3 sine-tracking slides were rebuilt with the corrected numbers/story —
+**rebuilt from scratch in one pass**, not edited in place:
+`python-pptx`'s slide-removal trick (manipulating `_sldIdLst` directly)
+leaves orphaned XML parts in the zip, which produced a file with
+duplicate zip entries on the first attempt — caught via `zipfile`
+integrity check before it was committed, worth remembering if slides ever
+need removing from this deck again.
+
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 
 Frequency-domain complement to the step-response tests, motivated by the
@@ -1560,12 +1618,12 @@ a camera-direct sine test on the Pi (analogous to why
 `fta_step_response_test.py` was kept as the camera-direct ground truth)
 that removes the VCP relay from the measurement path entirely.
 
-**Not yet done**: resolving the above; pushing frequency toward the
-actual 10-20Hz disturbance band (deliberately not attempted yet given the
-lag-attribution question is still open — a clean number at 15Hz isn't
-worth much if we don't know how much of it is real); testing axis y and
-the cross-axis coupling further (already logged per-run in the results
-but not separately analyzed).
+**Not yet done**: resolving the above (see "RESOLVED (2026-08-06)" just
+above — sign-unaware analysis, not a real actuator lag problem); pushing
+frequency toward the actual 10-20Hz disturbance band (still not attempted
+— now that the analysis is trustworthy, this is the real next step);
+testing axis y and the cross-axis coupling further (already logged
+per-run in the results but not separately analyzed).
 
 ### Architecture DECISION v1, SUPERSEDED 2026-08-04 (see above): Nucleo becomes a dumb I2C-driven external DAC, all control logic stays in Python on the Pi (2026-07-28)
 
