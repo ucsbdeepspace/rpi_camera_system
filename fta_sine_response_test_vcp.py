@@ -145,7 +145,7 @@ def _reader_thread(ser, t0, records, stop_event):
         records.append((now, x, y))
 
 
-def fit_sine(t, v, freq):
+def fit_sine(t, v, freq, expected_sign=None):
     """Linear least-squares fit of v ~= A*sin(wt) + B*cos(wt) + C, w known
     exactly (we commanded it) so this is linear, not an iterative fit.
 
@@ -162,12 +162,20 @@ def fit_sine(t, v, freq):
     that isn't physically sensible for a system whose step-response
     settling times are under a second.
 
-    Fixed here by choosing whichever reference (0 or 180 degrees) puts the
-    residual phase within +-90 degrees -- that residual is the real,
-    small, frequency-dependent lag; the 0-vs-180 choice is reported
-    separately as the sign of signed_gain. lag_rad is that residual,
-    positive meaning a true delay (consistent with -lag_rad/w giving a
-    positive time lag, same convention the rest of this script uses)."""
+    Without expected_sign, the reference (0 or 180 degrees) is auto-
+    detected by choosing whichever puts the residual phase within +-90
+    degrees. That auto-detection is only reliable while true lag stays
+    under 90 degrees -- confirmed to break at 5Hz (2026-08-06): axis x's
+    known-negative gain was misdetected as positive, with an impossible
+    negative "lag" as the symptom, once real actuator dynamics stacked on
+    top of the ~41ms pipeline delay pushed total phase past the boundary.
+    Since a linear system's static-gain SIGN is a fixed physical property
+    that cannot change with test frequency (confirmed independently by
+    the step-response data and every 0.1-2Hz sine run here), pass
+    expected_sign (+1.0 or -1.0) to fix it instead of re-guessing it per
+    frequency -- valid up to a full +-180 degrees of real lag before the
+    fundamental single-frequency wrap ambiguity reappears, a much wider
+    safe margin than +-90."""
     w = 2.0 * math.pi * freq
     basis = np.stack([np.sin(w * t), np.cos(w * t), np.ones_like(t)], axis=1)
     coeffs, *_ = np.linalg.lstsq(basis, v, rcond=None)
@@ -175,7 +183,13 @@ def fit_sine(t, v, freq):
     amplitude = float(np.hypot(A, B))
     phase = float(np.arctan2(B, A))  # in (-pi, pi]
 
-    if abs(phase) <= math.pi / 2:
+    if expected_sign is not None:
+        sign = 1.0 if expected_sign > 0 else -1.0
+        if sign > 0:
+            lag_rad = phase
+        else:
+            lag_rad = phase - math.pi if phase > 0 else phase + math.pi
+    elif abs(phase) <= math.pi / 2:
         sign = 1.0
         lag_rad = phase
     else:
@@ -194,6 +208,10 @@ def main():
     parser.add_argument("--center", type=int, default=2000)
     parser.add_argument("--duration", type=float, default=None)
     parser.add_argument("--update-rate", type=float, default=200.0)
+    parser.add_argument("--gain-sign", type=float, choices=[-1.0, 1.0], default=-1.0,
+                         help="Fixed sign for the DAC->pixel gain (see fit_sine's "
+                              "docstring) -- default -1.0 matches every axis-x "
+                              "measurement so far (step response + 0.1-2Hz sine).")
     parser.add_argument("--port", default=None)
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
@@ -316,8 +334,13 @@ def main():
     # direction (e.g. negative = DAC up moves the pixel value down); the
     # residual lag_rad is the actual, small, frequency-dependent delay --
     # see fit_sine's docstring for why this isn't just "amplitude, phase".
-    gain_driven, lag_rad_driven, off_driven = fit_sine(t, driven, args.freq)
-    gain_other, lag_rad_other, off_other = fit_sine(t, other, args.freq)
+    # expected_sign is fixed (not auto-detected) from prior evidence: both
+    # the step-response data and every 0.1-2Hz sine run on this axis found
+    # a negative self-gain (DAC up -> pixel down) and negative cross-axis
+    # gain -- args.gain_sign defaults to that, override with --gain-sign 1
+    # if ever driving/checking an axis where that doesn't hold.
+    gain_driven, lag_rad_driven, off_driven = fit_sine(t, driven, args.freq, args.gain_sign)
+    gain_other, lag_rad_other, off_other = fit_sine(t, other, args.freq, args.gain_sign)
 
     lag_ms_driven = -lag_rad_driven / w * 1000.0
     lag_ms_other = -lag_rad_other / w * 1000.0
