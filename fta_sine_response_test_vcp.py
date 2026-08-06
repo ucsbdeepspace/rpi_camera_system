@@ -358,6 +358,23 @@ def main():
     print(f"lag: {lag_ms_other:.1f}ms")
     print(f"offset: {off_other:.2f}px")
 
+    # True displacement magnitude/direction, not just the driven axis's own
+    # projection -- gain_driven alone underreports real motion whenever
+    # there's cross-axis coupling (there always is here, see the
+    # axis-coupling-flip finding). vector_angle_deg drifting with frequency
+    # (confirmed 2026-08-06: ~-171.5deg at 0.1-2Hz vs ~-152 to -160deg at
+    # 5-20Hz, a real ~12-20deg rotation, not noise) means the two physical
+    # axes likely have different resonant dynamics -- the response leans
+    # toward whichever axis is closer to ITS OWN resonance at each test
+    # frequency, not a fixed rotation.
+    gain_x, gain_y = (gain_driven, gain_other) if args.axis == "x" else (gain_other, gain_driven)
+    vector_mag = math.hypot(gain_x, gain_y)
+    vector_angle_deg = math.degrees(math.atan2(gain_y, gain_x))
+    print(f"\n--- True displacement vector (both axes combined) ---")
+    print(f"magnitude: {vector_mag:.2f}px  ({100*(vector_mag/max(abs(gain_driven),1e-9)-1):.1f}% "
+          f"more than the driven-axis-only number above)")
+    print(f"direction: {vector_angle_deg:.1f}deg (atan2(y,x) in pixel space)")
+
     out_path = args.out
     if out_path is None:
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -365,7 +382,8 @@ def main():
     np.savez(out_path, t=t, x=x, y=y, cmd_t=cmd_t, cmd_v=cmd_v,
              axis=args.axis, freq=args.freq, amplitude=args.amplitude, center=args.center,
              fit_driven=(gain_driven, lag_rad_driven, off_driven),
-             fit_other=(gain_other, lag_rad_other, off_other))
+             fit_other=(gain_other, lag_rad_other, off_other),
+             vector_mag=vector_mag, vector_angle_deg=vector_angle_deg)
     print(f"\nSaved raw time series to {out_path}")
 
 
