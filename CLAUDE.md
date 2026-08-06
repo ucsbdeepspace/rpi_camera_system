@@ -1551,6 +1551,62 @@ duplicate zip entries on the first attempt — caught via `zipfile`
 integrity check before it was committed, worth remembering if slides ever
 need removing from this deck again.
 
+### Fresh calibration sweep run — `fta_calibration_vcp.py` built, real data collected, RMS higher than the script's own threshold but explained (2026-08-06)
+
+Needed regardless of the sine-lag correction above: the step-response
+axis-coupling-flip finding (see "Actuator confirmed physically moving")
+already invalidated any old `fta_calibration.py` fit matrix, and no
+replacement existed yet.
+
+**Old `fta_calibration.py` doesn't work against this firmware** — drove
+its sweep via "FTA Controller"'s `grid_scan` command, which
+`camera_centroid_receiver` doesn't have (dropped rather than ported, per
+the architecture decision), and captured centroids via `Picamera2`
+directly on the Pi, which the v2 architecture doesn't need for this kind
+of thing anymore. Built `fta_calibration_vcp.py` instead: same
+laptop-only VCP architecture as the step/sine scripts — plain `set_x`/
+`set_y` jumps with a settle wait, position read from the Nucleo's I2C-relay
+print, no Pi access needed. Grid points swept in serpentine
+(boustrophedon) row order (hysteresis not yet characterized — this at
+least keeps travel direction consistent within a row).
+
+**First real sweep, 200→3800 both axes, step 300 (169 points)**:
+**169/169 captured, zero skipped** — the beam stayed in view across the
+*entire* range, unlike the old pre-rework sweep documented earlier in
+this file (982/1444 points lost past `dac_x≈900-1000`). Real, welcome
+confirmation that whatever changed during the SB16/SB18 rework didn't
+shrink the usable field of view.
+
+**RMS residual 9.1px, above the script's own 5px warning threshold** —
+diagnosed rather than dismissed or blindly trusted:
+- Plotted `cx`/`cy` vs `dac_x`/`dac_y` directly: both look genuinely
+  linear per axis, no visible kink or saturation region.
+- Tested whether excluding the near-floor corner (`dac < 500`, close to
+  the firmware's 95-count clamp) helped: modestly (9.1px → 7.6-8.0px),
+  not enough to be the whole story.
+- Tested whether more per-point averaging helped (`--capture-s` 0.15 →
+  0.4, roughly doubling samples/point): barely (9.1px → 8.9px) — rules
+  out plain measurement noise as the dominant cause.
+- **Conclusion**: most likely real, smooth nonlinearity across this wide
+  a sweep (~90% of the actuator's full clamped range), not a bug, not
+  noise, not a sharp localized defect. Not surprising for a mechanical
+  actuator swept across nearly its whole travel rather than around one
+  small operating point — matches this project's own established
+  "small-step regime is what real control looks like" lesson from the
+  step-response work.
+- 2x2 gain block determinant (-0.0004455) is small but **not** below the
+  script's own 1e-6 near-singular threshold — the inverse map is usable,
+  just not tight.
+
+**Practical takeaway**: this wide-range matrix is a reasonable first-pass
+decoupling estimate, not a final one. Once a real closed-loop operating
+point exists, a narrower sweep centered there should fit much tighter —
+same logic as why gain tuning should use small-step step-response
+numbers, not the large-step ones. Both sweeps kept
+(`results/fta_calibration_vcp_202608061912*.npz`) since together they
+show the diagnostic story (200-3800/capture=0.15 first pass +
+400-3800/capture=0.4 corner-and-noise check), not just the final matrix.
+
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 
 Frequency-domain complement to the step-response tests, motivated by the
