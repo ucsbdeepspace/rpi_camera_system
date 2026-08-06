@@ -1834,6 +1834,61 @@ steps, to find where the transition actually happens); getting a real
 number for the expected beacon-wobble amplitude so the right regime can
 be identified; axis y at any of this.
 
+### FTA amplifier static voltage/power calibration, both axes — very linear, and a real travel-limit finding (2026-08-06)
+
+Manually-measured (multimeter at the amp output, not an automated
+script-driven sweep — unlike every other `fta_*.py` script):
+`fta_amp_voltage_calibration.py` records DAC 200-4000 (step 200, 20
+points) → amplifier output voltage, both axes, same 2.85Ω load. Y-axis
+had one clear outlier (nominally DAC=2200, read 0.85V, breaking an
+otherwise consistent ~-0.147V/200-count trend) — excluded as bad/missing
+rather than guessed at. X-axis came back clean; its 10th value (.084V)
+lands almost exactly where the Y-axis trend predicted its own excluded
+point would have been — a nice independent check that the exclusion was
+the right call.
+
+**Both axes are extremely linear statically**: X R²=0.99999 (slope
+-0.000732 V/count), Y R²=0.9971 (slope -0.000784 V/count) — no visible
+kink or dead-band anywhere in the range. Also reports counts/volt
+(X: -1365, Y: -1276) and counts/amp (X: -3891, Y: -3636, via R). Plots
+carry a secondary top axis in volts (computed from each axis's own fit)
+alongside the primary DAC-counts axis. **Useful negative result**: since
+the DAC/amp stage is this linear when swept slowly, the dynamic
+nonlinear threshold found in the sine-tracking amplitude comparison
+(above) more likely lives in actuator mechanics (stiction/backlash) or a
+frequency-dependent electrical effect, not simple DC nonlinearity in the
+drive electronics.
+
+**Follow-up (`fta_travel_range_analysis.py`), combining this with the
+calibration sweep — a real, important mechanical finding**: plotted
+centroid position against DAC counts (using the wider 200-3800
+calibration sweep) alongside power (from this amp calibration's fits),
+to see where the beam actually stops moving vs. where the amp is just
+spending power. **X axis**: `cx` tracks `dac_x` linearly across the
+*entire* tested range (200-3800) — no flattening at either end.
+**Y axis**: `cy` rises steeply from `dac_y`=200→~500 (~0.028 px/count),
+then flattens almost completely for the rest of the range 500-3800
+(~0.003 px/count mid-range, ~0.0015 at the high end — a 94-95%
+sensitivity drop) while power keeps climbing to ~850mW at the far end.
+**Read: the Y axis's real useful mechanical travel is only about DAC
+200-500/800 — a small fraction of the 200-3800 range that was actually
+swept.** Past that, DAC-y commands spend power for essentially zero
+additional beam movement, consistent with hitting a real mechanical
+limit (flexure hard stop or similar) early. See
+`docs/session_results_2026-08-04.pptx`'s two newest slides for the
+plots.
+
+**Practical implications, not yet acted on**: (1) any future Y-axis
+calibration/PID work should probably restrict itself to the ~200-800
+DAC range rather than the wider range used so far — commanding beyond
+that is likely wasted effort; (2) this asymmetry between X (full-range
+linear) and Y (saturates early) is a plausible mechanical explanation
+for why Y's sine-tracking gain was consistently smaller than X's
+throughout this session's testing, independent of the frequency-domain
+findings; (3) worth checking whether X has an analogous limit just
+outside the 200-3800 tested window, or whether it genuinely has much
+more usable travel than Y.
+
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 
 Frequency-domain complement to the step-response tests, motivated by the
