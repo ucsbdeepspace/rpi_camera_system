@@ -1976,6 +1976,25 @@ nothing like the previous (retracted) 60-90x collapse. This is now the
 best-aligned calibration in hand — worth using as the baseline for
 picking Kp/Ki once that work resumes.
 
+**Optics recollimated, grid re-swept again** (2026-08-12,
+`results/fta_calibration_vcp_fullframe_recollimated.npz`): gain matrix
+flipped to near-**anti**-diagonal — `dac_x` now barely moves `cx`
+(-0.0069) but strongly moves `cy` (0.130); `dac_y` barely moves `cy`
+(0.0014) but strongly moves `cx` (-0.107). Determinant 0.0139, same
+order of magnitude as the previous (diagonal) calibration, and the grid
+mesh (`results/fta_calibration_grid_mesh_recollimated.png`) is still a
+clean, evenly-spaced, non-degenerate parallelogram — just rotated
+~90° from the post-repositioning run above. **Important**: recollimation
+changed which DAC axis drives which camera axis, and did so in the
+opposite sense from the earlier repositioning (that one made the mapping
+*more* diagonal; this made it anti-diagonal). Any control code must use
+the fitted `M`/`M_inv` from the *current* calibration rather than
+assuming `dac_x`→`cx`/`dac_y`→`cy` — that identity does not hold right
+now. Slide-18-style single-axis plots (`cx` vs. `dac_x` alone) are
+actively misleading for this calibration since the real per-axis signal
+now lives almost entirely in the *other* pixel axis; use the grid-mesh
+plot instead when checking alignment quality going forward.
+
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 
 Frequency-domain complement to the step-response tests, motivated by the
