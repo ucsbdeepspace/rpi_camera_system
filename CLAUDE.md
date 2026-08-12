@@ -1962,6 +1962,20 @@ Determinant 0.0116 and RMS 19.4px, both consistent with the 4x-shorter-dwell
 fixed run (0.0101, 18.4px) — the ~19px affine-fit residual is real
 actuator curvature, not measurement noise from under-settling.
 
+**Camera physically repositioned, grid re-swept again** (2026-08-12,
+`results/fta_calibration_vcp_fullframe_adjusted.npz`, same fixed script,
+long dwell): gain matrix is now close to diagonal — off-diagonal terms
+(~0.001-0.012) are roughly 10x smaller than the diagonal terms (~0.11),
+vs. the previous camera position where they were comparable magnitude
+(a ~45°-ish rotation). Grid mesh (`results/fta_calibration_grid_mesh_adjusted.png`)
+is now nearly axis-aligned with camera x/y — `dac_x` mostly drives `cx`,
+`dac_y` mostly drives `cy`. Both axes track smoothly across the full
+200-3800 range (`results/fta_travel_range_analysis_adjusted.png`); Y
+shows a mild ~3x gain reduction in just the bottom segment (200-500),
+nothing like the previous (retracted) 60-90x collapse. This is now the
+best-aligned calibration in hand — worth using as the baseline for
+picking Kp/Ki once that work resumes.
+
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 
 Frequency-domain complement to the step-response tests, motivated by the
