@@ -83,6 +83,40 @@ def find_fta_port():
     return candidates[0].device
 
 
+def send_command(ser, cmd):
+    """Writes a VCP command and blocks until its reply line arrives, instead
+    of firing-and-forgetting like the old set_x/set_y calls did. Necessary
+    because the firmware's VCP line parser (HAL_UART_RxCpltCallback in
+    main.c) only buffers ONE pending command line at a time -- bytes of a
+    new command that arrive before the main loop has drained/replied to the
+    previous one are silently dropped, no error reported anywhere. Sending
+    set_x immediately followed by set_y with no wait between them raced
+    that one-line buffer: set_x (sent first) usually landed, but set_y's
+    bytes often arrived while set_x's "OK ..." reply was still pending and
+    got dropped -- which silently stuck dac_y while dac_x kept updating,
+    discovered 2026-08-12 when a grid sweep visibly moved only one axis
+    despite manual set_x/set_y control clearly working on both. Waiting for
+    each reply here guarantees the firmware's one-line buffer is empty
+    before the next command is written, removing the race rather than just
+    adding a delay that would still be racy under different timing.
+    Skips telemetry/heartbeat lines (they never start with OK/ERR) while
+    waiting. Raises on a firmware-reported error or a 1s timeout with no
+    reply at all (dropped command, same failure mode as above)."""
+    ser.write(f"{cmd}\n".encode("ascii"))
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        raw = ser.readline()
+        if not raw:
+            continue
+        line = raw.decode(errors="replace").strip()
+        if line.startswith("OK"):
+            return line
+        if line.startswith("ERR"):
+            raise RuntimeError(f"firmware rejected {cmd!r}: {line}")
+    raise RuntimeError(f"no reply to {cmd!r} within 1s -- command was likely dropped "
+                        "(see send_command's docstring)")
+
+
 def get_status(ser):
     """Returns (dac_x, dac_y, amp, tel_age_ms). Retries the whole request a
     few times -- the VCP can still occasionally drop a character out of a
@@ -228,8 +262,8 @@ def main():
     try:
         t_start = time.monotonic()
         for i, (dac_x, dac_y) in enumerate(points):
-            ser.write(f"set_x {dac_x}\n".encode("ascii"))
-            ser.write(f"set_y {dac_y}\n".encode("ascii"))
+            send_command(ser, f"set_x {dac_x}")
+            send_command(ser, f"set_y {dac_y}")
             time.sleep(args.settle_s)
             result = capture_centroid(ser, args.capture_s)
             if result is None:
@@ -251,9 +285,8 @@ def main():
             print(f"WARNING: couldn't send emergency stop: {e}")
     finally:
         try:
-            ser.write(f"set_x {dac_x0}\n".encode("ascii"))
-            ser.write(f"set_y {dac_y0}\n".encode("ascii"))
-            time.sleep(0.1)
+            send_command(ser, f"set_x {dac_x0}")
+            send_command(ser, f"set_y {dac_y0}")
             if not amp_was_enabled:
                 ser.write(b"amp_disable\n")
                 time.sleep(0.1)

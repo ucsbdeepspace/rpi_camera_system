@@ -30,17 +30,23 @@ real but secondary and not the point of this particular plot.
 Usage: python3 fta_travel_range_analysis.py
 Outputs: results/fta_travel_range_analysis.png
 """
+import argparse
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-CALIB_PATH = "results/fta_calibration_vcp_20260806T191230Z.npz"  # 200-3800, widest range
+DEFAULT_CALIB_PATH = "results/fta_calibration_vcp_fullframe_fixed.npz"  # 200-3800, set_x/set_y race fixed 2026-08-12
 AMP_PATH = "results/fta_amp_voltage_calibration.npz"
 
 
 def main():
-    calib = np.load(CALIB_PATH)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--in", dest="calib_path", default=DEFAULT_CALIB_PATH)
+    parser.add_argument("--out", dest="out_path", default="results/fta_travel_range_analysis.png")
+    args = parser.parse_args()
+
+    calib = np.load(args.calib_path)
     dac_x, dac_y, cx, cy = calib["dac_x"], calib["dac_y"], calib["cx"], calib["cy"]
 
     amp = np.load(AMP_PATH)
@@ -117,9 +123,8 @@ def main():
     fig.suptitle("Where does the centroid actually stop moving, and what's the power cost getting there?",
                  fontsize=13, fontweight="bold")
     fig.tight_layout()
-    out_png = "results/fta_travel_range_analysis.png"
-    fig.savefig(out_png)
-    print(f"\nwrote {out_png}")
+    fig.savefig(args.out_path)
+    print(f"\nwrote {args.out_path}")
 
 
 if __name__ == "__main__":

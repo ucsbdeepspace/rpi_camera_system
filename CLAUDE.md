@@ -1889,6 +1889,79 @@ findings; (3) worth checking whether X has an analogous limit just
 outside the 200-3800 tested window, or whether it genuinely has much
 more usable travel than Y.
 
+### RETRACTED (2026-08-12): the Y-axis travel-limit finding above was a `set_x`/`set_y` race condition in `fta_calibration_vcp.py`, not a real mechanical limit
+
+Asked to re-run the grid sweep after switching the camera to full-frame
+mode (to test whether a too-narrow ROI explained the Y flattening).
+First full-frame attempt had to be killed mid-sweep — the beam was
+visibly clipping out the top of frame — but the follow-up full-frame run
+completed 169/169 with no clipping, and STILL showed the same near-
+degenerate mapping (`fta_calibration_grid_mesh.py`, a new script that
+draws the commanded DAC grid as a polygonal mesh directly in centroid
+space: connect points sharing `dac_y` as "rows", points sharing `dac_x`
+as "columns" — a linear, well-conditioned actuator draws a rectangle;
+this drew a near-degenerate sliver, 2x2 gain-block determinant
+~0.0003-0.0004 in both the old windowed-ROI sweep and the new full-frame
+one). That ruled out the ROI hypothesis but not the underlying finding —
+until manual DAC control was compared directly: manual `set_x`/`set_y`
+commands clearly moved the beam on both axes, but the automated grid
+sweep visibly moved only one axis at a time, scanning back and forth
+along a single line.
+
+**Root cause, found by reading the firmware's VCP receive ISR**
+(`HAL_UART_RxCpltCallback` in `nucleo_firmware/camera_centroid_receiver/Core/Src/main.c`):
+it buffers exactly one pending command line at a time and silently drops
+incoming bytes of a new command if the previous line's `vcp_line_ready`
+flag hasn't been drained by the main loop yet — no error, no signal,
+just dropped. `fta_calibration_vcp.py`'s sweep loop wrote `set_x` then
+immediately `set_y` with zero delay and never read either reply. `set_x`
+(sent first) almost always landed; `set_y`'s bytes frequently arrived
+while `set_x`'s `OK` reply was still pending in the buffer and got
+dropped, silently sticking `dac_y` while `dac_x` kept updating — exactly
+the near-degenerate/one-axis-only grid observed in **every** prior
+calibration sweep this session, including the one behind slide 18.
+`fta_manual_control.py` was never affected because its `send()` helper
+already waits for each command's reply before returning — which is
+exactly why manual control looked fine while the automated sweep didn't.
+
+**Fix**: added `send_command()` to `fta_calibration_vcp.py`, which writes
+a command and blocks (skipping telemetry/heartbeat lines) until it sees
+that command's `OK`/`ERR` reply before returning, guaranteeing the
+firmware's one-line buffer is empty before the next command is sent.
+Applied to both the main sweep loop and the park-at-exit in `finally`.
+
+**Re-run with the fix, full-frame, same 200-3800/step-300 grid**
+(`results/fta_calibration_vcp_fullframe_fixed.npz`): 2x2 gain-block
+determinant jumped to **0.01** (~25-30x larger than either corrupted
+run) and the grid mesh (`results/fta_calibration_grid_mesh_fullframe_fixed.png`)
+is now a clean, evenly-spaced parallelogram — rotated relative to
+camera x/y (consistent with the independently-derived ~-150° motion-
+axis angle from the sine-tracking rotated-view slides, which were never
+affected by this bug since they only ever send `set_x` in a loop), but
+genuinely crossed and non-degenerate, no collapse on either axis.
+Re-running `fta_travel_range_analysis.py` on the fixed data
+(`results/fta_travel_range_analysis_fixed.png`) shows `cy` now declining
+smoothly across the **entire** DAC-y 200-3800 range, closely mirroring
+`cx`'s behavior — no flattening past ~500. **The Y-axis travel-limit
+finding, and by extension the "restrict Y calibration to 200-800"
+recommendation above, are both retracted.** RMS residual on the fixed
+sweep is still large for a pure affine fit (18.42px, vs. ~8-9px on the
+corrupted runs) — expected, since the fixed data now reflects the
+actuator's real (mildly nonlinear/curved) response instead of a mostly-
+flat one-axis line; a higher-order fit would likely do much better, not
+yet tried.
+
+**Any DAC↔centroid calibration data collected before 2026-08-12 via
+`fta_calibration_vcp.py` should be treated as unreliable** and, if
+still needed, re-collected with the fixed script.
+
+**Confirmation re-run at ~4x dwell** (`--settle-s 1.2 --capture-s 0.6`
+vs. the 0.3/0.15 default, to rule out settling-time noise as the source
+of the still-large RMS residual): `results/fta_calibration_vcp_fullframe_fixed_longdwell.npz`.
+Determinant 0.0116 and RMS 19.4px, both consistent with the 4x-shorter-dwell
+fixed run (0.0101, 18.4px) — the ~19px affine-fit residual is real
+actuator curvature, not measurement noise from under-settling.
+
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 
 Frequency-domain complement to the step-response tests, motivated by the
