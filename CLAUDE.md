@@ -2109,6 +2109,179 @@ bench-test with a step setpoint before a sine setpoint, then work up to
 10-20Hz. See the assistant's response in-session (2026-08-12) for the
 fuller architecture writeup if picking this up fresh.
 
+### First closed-loop PID bench test — diverged twice, root-caused to real actuator hysteresis (not a sign/rate bug), then converged on the confirmed-clean branch (2026-08-13)
+
+Picked up directly from the "Next step" above. Found the single-axis
+P+I closed-loop implementation already written in `main.c`
+(`MODE_CLOSED_LOOP`, `cmd_set_target_x`/`cmd_set_kp`/`cmd_set_ki`,
+`run_closed_loop_step`) sitting **uncommitted** in the working tree from
+a prior session that never got logged here — `main.c` last saved
+2026-08-12 17:42, `Debug/camera_centroid_receiver.elf` built one minute
+later. Rebuilt from source with the project's own bundled toolchain
+(same bypass-CubeIDE approach as "Firmware phase 1") to confirm the
+`.elf` genuinely matched current source (`make` reported nothing to
+rebuild — it already did), then flashed it for real via
+`STM32_Programmer_CLI` (board serial `066FFF515152827187153930`,
+confirmed against this file's own on-record serial) so what's running on
+the chip is verified, not assumed.
+
+**Real bug #1, found before any PID testing could even start: a single
+`ser.write()` burst of a whole VCP command line reliably loses/corrupts
+bytes under the Pi's current high telemetry rate (~150-200Hz).**
+`get_status` consistently arrived as `getsa` — not random noise, the
+*exact same* corruption reproduced across many independent attempts,
+before and after reflashing, and across two completely different serial
+stacks (.NET `SerialPort` and `pyserial`). Isolated with the bare `!`
+e-stop byte (ISR-level, bypasses the line parser entirely): it landed
+cleanly every time (`estop=1` confirmed via heartbeat), proving raw
+byte-level UART RX works fine — the bug is specific to the multi-byte
+line path. Pacing the write at ~20ms/character instead of one burst
+call made the corruption disappear completely (confirmed repeatedly).
+Root cause not fully instrumented, but consistent with the whole
+~11-byte/~1ms burst window occasionally landing on the main loop's
+`__disable_irq()` telemetry-snapshot critical section (see the
+`g_new_packet_ready` handling in `main()`) — human/manual typing over a
+terminal is naturally paced well past this, which is almost certainly
+why earlier sessions' "30/30 commands clean" validation never caught it.
+**Not fixed in firmware — a host-side workaround only.** This affects
+the *existing* `fta_manual_control.py` and `fta_calibration_vcp.py` too
+(`send_command`/`send` in both do a single-burst `ser.write()`), not
+just new tooling — worth porting the paced-write fix into those if this
+keeps biting.
+
+**First closed-loop attempt — diverged almost immediately.** Baseline
+`cx≈251.6`, `set_target_x` +25px, `set_kp 1750` (Kp=1.75 counts/px),
+`set_ki 0`, `amp_enable`, `set_mode closed_loop`. Within under a second
+`dac_y` climbed 95→417+ and `cx` crashed the *wrong* direction (251.6→
+~90) instead of toward the target. A host-side monitoring script (not
+committed, scratchpad-only) watching for DAC-clamp/divergence caught it
+and sent the bare `!` e-stop within ~3.2s — `dac_y` peaked at 426, well
+short of the `[95,4000]` clamp, no real risk to hardware.
+
+**Added a 25Hz control-update throttle to firmware, suspecting the
+control step (previously run on every confident telemetry packet,
+~150-200Hz) was outrunning the actuator's own settling time** — new
+`CONTROL_INTERVAL_MS` (40U) in `main.c`, gating the
+`run_closed_loop_step` call site in `main()`'s `while(1)` loop against
+`g_last_control_tick`. Rebuilt, reflashed, retested with identical
+Kp/target: **nearly identical divergence numbers.** This ruled out
+update rate as the cause — the throttle is still a reasonable thing to
+have (25Hz is comfortably above the 10-20Hz disturbance band this
+project targets, comfortably below anything that could outrun this
+actuator), just not what was actually wrong.
+
+**Root cause found: real, substantial hysteresis in `dac_y`→`cx`, not a
+sign or timing bug.** An open-loop sweep first at coarse resolution
+(200-450, settled single reads) showed a clean positive slope and looked
+like sign confirmation — but it never sampled below 200. A follow-up
+fine sweep (25-count steps, 95→600, ~40 telemetry samples averaged per
+point, both directions, all via the paced-write fix above, scratchpad
+scripts not committed) told the real story:
+- **Ascending** (95→600): a clear U-shape. `cx` falls from 67.7 at
+  `dac_y=95` to a minimum of 60.4 around `dac_y≈195`, then rises
+  smoothly the rest of the way to 88.0 at 600.
+- **Descending** (600→95): clean and monotonic across the *entire*
+  range, no reversal — 88.3 falling smoothly to 42.6.
+- The gap between the two branches at the same commanded `dac_y` grows
+  toward the floor: ~11.5px at `dac_y=200`, ~25px at `dac_y=100`. Both
+  curves are individually smooth (well-averaged, not noise) — this is
+  real mechanical hysteresis/backlash, worst near the DAC floor.
+
+This directly explains attempt #1: starting at the floor (95) with a
+positive error, the controller's first correction raised `dac_y` into
+exactly the ascending branch's reversed-slope region (95-195), driving
+the error the wrong way from the very first step — a plant nonlinearity,
+not a firmware bug. It also fills a gap `fta_calibration_vcp.py`'s own
+docstring already flagged as untested ("Not yet tested for hysteresis").
+Raw sweep data lives only in this session's scratchpad script output,
+not saved as a committed `results/*.npz` — worth a proper committed
+script if this needs to be trusted/reused long-term.
+
+**Second attempt — pre-positioned to `dac_y=300`** (inside the range the
+coarse check had called "positive"). Result: bounded, no clamp/runaway
+this time, but also **didn't converge** — error crept from 26.5px to
+30.5px over 8s, and `cx` drifted the *wrong* direction in response to
+real `dac_y` changes (300→353) despite this nominally being the
+"confirmed good" zone. Demonstrates the transfer function has real local
+wiggle even inside that zone at fine (50-count) resolution — a coarse
+±150-count check isn't reliable enough to trust for gain selection here.
+
+**Third attempt — SUCCESS (partial): pre-positioned to `dac_y=550`, then
+picked a target BELOW the current `cx`** so the controller's error is
+always negative and it only ever needs to *decrease* `dac_y` — staying
+entirely on the confirmed-clean descending branch. Same Kp=1.75
+counts/px, Ki=0. Result: monotonic, bounded convergence — error shrank
+from -18.4px to -13.0px over 10s, `dac_y` held in [519,528], no
+divergence, no clamp. Slow (expected: P-only leaves a real steady-state
+residual without Ki), but the **first genuinely-converging closed-loop
+run of this project's PID implementation.**
+
+**State left**: hardware safely idle (`mode=open_loop amp=0 estop=0
+dac_x=95 dac_y=95`). Firmware source has two uncommitted changes as of
+this entry: the original closed-loop P+I implementation (from the
+unlogged prior session) and this session's `CONTROL_INTERVAL_MS` 25Hz
+throttle — both rebuilt clean and reflashed to real hardware, confirmed
+running via `get_status`, not just built.
+
+**Not yet done**:
+1. Ki still untried (every run above was P-only) — needed to eliminate
+   the residual steady-state error seen in the successful run.
+2. Kp could likely go higher now that a clean branch is confirmed, for
+   faster convergence — not explored.
+3. **Real hysteresis handling is still an open design question.** "Only
+   ever approach the target from above" is a workaround that made this
+   one test converge, not a real control strategy — an actual
+   disturbance-rejecting controller must handle error in both
+   directions, which means either a dead-band/dither scheme, a
+   hysteresis-aware model, or confining real operation to a region where
+   the effect is small enough to ignore. Needs a decision before this
+   goes further, not more gain guessing.
+4. The VCP burst-write corruption fix (pace at ~20ms/char) has not been
+   ported into `fta_manual_control.py`/`fta_calibration_vcp.py` — both
+   still do a single-burst write and will hit the same corruption under
+   high telemetry load.
+5. ~~Firmware changes described above are still uncommitted~~ — done,
+   see below.
+
+**Follow-up, same day: throttle removed, retested at full telemetry
+speed — confirms the throttle was never the actual fix.** Per the user's
+request, reverted `CONTROL_INTERVAL_MS`/its call-site gate entirely
+(removed rather than left dead/disabled, since the divergence theory it
+was built on turned out to be wrong) so `run_closed_loop_step` runs on
+every confident packet again (~150-200Hz). Rebuilt, reflashed, reran the
+exact same pre-position-550/target-below/Kp=1.75/Ki=0 test: **nearly
+identical convergence** — error -18.1px → -12.9px over 10s, `dac_y` held
+in [519,528], no divergence. Confirms conclusively that update rate was
+never the cause; staying on the hysteresis-clean descending branch is
+what makes this converge, independent of control rate. Hardware left
+idle (`amp=0 estop=0 dac_x=95 dac_y=95`); firmware (PID implementation,
+now without the disproven throttle) committed to the repo.
+
+**Open question raised the same session: does the hysteresis mean this
+can never track the real beacon disturbance?** Answered, not yet tested
+empirically — worth flagging clearly for whoever picks this up: every
+hysteresis measurement so far (fine sweep, all three closed-loop
+attempts) only ever moved `dac_y` in ONE direction at a time over a wide
+excursion (the sweep) or approached a target monotonically from a fixed
+starting side (the successful closed-loop runs). **Real disturbance
+rejection needs the controller to correct in BOTH directions repeatedly
+at small amplitude** — the 10-20Hz beacon wobble this project targets,
+not a single one-way step. Hysteretic actuators very commonly behave
+much better on these small "minor loops" than the wide "major loop"
+characterized here (a standard property of magnetic/mechanical
+hysteresis, e.g. Preisach-type models) — but that hasn't been measured
+on this rig. The honest answer is "probably not a dead end, but
+unconfirmed": if minor-loop hysteresis at small amplitude turns out to
+be comparably wide, standard mitigations exist (a small dither signal to
+keep the actuator off the sticky region — already flagged as a
+candidate in the amplitude-comparison sine-tracking work earlier in this
+file; or operating with a deliberate one-sided bias/preload) but neither
+has been tried. **Recommended next diagnostic**: repeat the fine sweep
+but with small (~10-20 count) back-and-forth oscillations superimposed
+at a few points across the range, instead of one big monotonic pass each
+direction, to directly measure minor-loop width where real control
+actually has to operate.
+
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 
 Frequency-domain complement to the step-response tests, motivated by the

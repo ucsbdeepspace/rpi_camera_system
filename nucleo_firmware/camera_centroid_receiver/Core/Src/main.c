@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 
 /* USER CODE END Includes */
 
@@ -37,12 +38,16 @@ typedef enum
   AXIS_Y = 1
 } fta_axis_t;
 
-/* CLOSED_LOOP is deliberately not implemented yet -- PID lands in a later
- * pass (see CLAUDE.md architecture decision v2, 2026-08-04). set_mode
- * rejects it explicitly rather than silently accepting a no-op mode. */
+/* CLOSED_LOOP: single-axis (dac_y -> cx) P+I position control -- the
+ * architecture was decided 2026-08-04 (CLAUDE.md v2) but left
+ * unimplemented until the optics were locked down and dac_y->cx
+ * confirmed as by far the cleanest DAC->pixel pairing (2026-08-12, same
+ * file). Derivative action and a second controlled axis are both
+ * deliberately deferred -- see run_closed_loop_step's docstring below. */
 typedef enum
 {
-  MODE_OPEN_LOOP = 0
+  MODE_OPEN_LOOP   = 0,
+  MODE_CLOSED_LOOP = 1
 } fta_mode_t;
 
 /* USER CODE END PTD */
@@ -83,6 +88,16 @@ typedef enum
  * terminating NUL this buffer adds. Generous for the longest command
  * currently defined (set_x/set_y with a 4-digit value). */
 #define VCP_LINE_BUF_LEN 96U
+
+/* Closed-loop staleness watchdog threshold -- generous vs. the observed
+ * ~0-25ms telemetry age even at the slower full-frame capture mode (see
+ * rpi_camera_system CLAUDE.md, 2026-08-12 sine-check section), so this
+ * only trips on genuine stream loss (Pi crashed, cable unplugged, etc.),
+ * not normal jitter. Checked once per heartbeat tick (1Hz) rather than
+ * only when a new packet arrives, so a fully-dead stream (no more
+ * g_new_packet_ready events at all) still gets caught within ~1s instead
+ * of silently freezing run_closed_loop_step with no active warning. */
+#define STALE_TELEMETRY_MS 200U
 
 /* USER CODE END PD */
 
@@ -147,6 +162,26 @@ static volatile uint8_t    g_estop_latched = 0;
 static volatile int32_t    g_last_dac_x = DAC_MIN_COUNT;
 static volatile int32_t    g_last_dac_y = DAC_MIN_COUNT;
 
+/* --- Closed-loop (dac_y -> cx) control state -- only ever touched from
+ * main-loop context (command processing and run_closed_loop_step, both
+ * called from the main while(1) loop, never from ISR context), so unlike
+ * g_latest_beam/g_last_dac_x/y above these don't need `volatile` for
+ * cross-context visibility. Kp/Ki are taken over the VCP as milli-units
+ * integers (strtol, no float parsing) and converted to float once here --
+ * matches decode_scaled's existing avoidance of pulling in newlib's
+ * float-formatting support for the small dedicated purpose of *display*,
+ * while still doing the actual control arithmetic in float (cheap, this
+ * MCU has a hardware FPU, see -mfpu=fpv4-sp-d16 in the build). */
+static int32_t g_target_x_scaled = 0;   /* pixel setpoint for cx, POSITION_SCALE-scaled */
+static uint8_t g_target_x_set    = 0;   /* set_mode closed_loop refuses to engage until this is 1 */
+static int32_t g_kp_milli = 0;          /* Kp = g_kp_milli/1000, DAC counts per pixel of error */
+static int32_t g_ki_milli = 0;          /* Ki = g_ki_milli/1000, DAC counts per (pixel*second) */
+static float   g_kp = 0.0f;
+static float   g_ki = 0.0f;
+static float   g_integral_px_s = 0.0f;  /* running integral of error_px*dt_s, anti-windup clamped */
+static int32_t g_closed_loop_base_dac_y = DAC_MIN_COUNT;  /* bumpless-transfer bias, see cmd_set_mode */
+static uint32_t g_last_control_tick = 0;
+
 /* Single-byte interrupt-driven VCP (USART2) receive, re-armed on every
  * completion/error -- same one-shot-then-rearm pattern as the I2C
  * reception below, just at the byte level instead of the packet level
@@ -166,7 +201,7 @@ static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
 
 static void process_beam_packet(const uint8_t *buf);
-static void decode_scaled(int16_t scaled, const char **sign, int *whole, int *frac);
+static void decode_scaled(int32_t scaled, const char **sign, int *whole, int *frac);
 
 static void MX_DAC1_Init(void);
 static void apply_dac(fta_axis_t axis, int32_t value);
@@ -182,6 +217,10 @@ static void cmd_amp_enable(void);
 static void cmd_amp_disable(void);
 static void cmd_clear_estop(void);
 static void cmd_get_status(void);
+static void cmd_set_target_x(const char *arg);
+static void cmd_set_kp(const char *arg);
+static void cmd_set_ki(const char *arg);
+static void run_closed_loop_step(int16_t tel_x_scaled, uint32_t now);
 
 /* USER CODE END PFP */
 
@@ -263,6 +302,20 @@ int main(void)
 
       if ((now - last_heartbeat_tick) >= 1000U)
       {
+        /* Closed-loop staleness watchdog -- see STALE_TELEMETRY_MS's
+         * comment for why this lives here (1Hz, independent of whether
+         * new packets are even still arriving) rather than only being
+         * checked inside run_closed_loop_step. Trips a full estop, not
+         * just a hold -- driving further open-loop DAC commands on stale
+         * position data is the one failure mode here with no safe
+         * automatic default, so stop and make a human look at it. */
+        if (g_mode == MODE_CLOSED_LOOP && g_packet_count > 0U
+            && (now - g_latest_beam_tick) > STALE_TELEMETRY_MS)
+        {
+          estop();
+          send_line("WARN closed-loop estop: telemetry stale\r\n");
+        }
+
         char hb_line[96];
         int  hb_len = snprintf(hb_line, sizeof(hb_line),
                                 "heartbeat uptime=%lus mode=%s amp=%u estop=%u pkts=%lu errs=%lu\r\n",
@@ -314,6 +367,21 @@ int main(void)
       err_count = g_checksum_error_count;
       g_new_packet_ready = 0;
       __enable_irq();
+
+      /* Closed-loop control step -- only on a CONFIDENT detection (status
+       * bit0), matching the same "don't trust this position" convention
+       * the host-side scripts already use (e.g. fta_calibration_vcp.py's
+       * capture_centroid). The Pi-side streamer still sends its last-known
+       * position with the confidence bit clear rather than going silent
+       * (see camera_view_tool.py's NucleoLink.send_position note), so
+       * status must be checked here rather than assuming every packet is
+       * usable. Skipping a step just holds the DAC at its last commanded
+       * value -- the staleness watchdog above (1Hz) is what actually
+       * catches a fully-dead stream. */
+      if (g_mode == MODE_CLOSED_LOOP && (status & 1U))
+      {
+        run_closed_loop_step(x, HAL_GetTick());
+      }
 
       {
         const char *x_sign, *y_sign;
@@ -522,10 +590,14 @@ static void MX_GPIO_Init(void)
  * just for a one-decimal-digit debug print). Handles negative values
  * correctly even when the whole part is 0 (e.g. -4 -> "-0.4") --
  * plain integer division alone loses the sign in that case since
- * -4 / 10 == 0 in C, which would otherwise silently print "0.4". */
-static void decode_scaled(int16_t scaled, const char **sign, int *whole, int *frac)
+ * -4 / 10 == 0 in C, which would otherwise silently print "0.4".
+ * Takes int32_t (not int16_t) so it can also decode g_target_x_scaled,
+ * which isn't wire-format-constrained to 16 bits like the telemetry
+ * fields are -- existing int16_t callers still work unchanged, promoted
+ * implicitly at the call site. */
+static void decode_scaled(int32_t scaled, const char **sign, int *whole, int *frac)
 {
-  int v = scaled;
+  int32_t v = scaled;
 
   *sign = (v < 0) ? "-" : "";
   if (v < 0)
@@ -661,6 +733,66 @@ static void apply_dac(fta_axis_t axis, int32_t value)
   }
 }
 
+/* Single-axis (dac_y -> cx) closed-loop control step -- P+I only,
+ * derivative deliberately deferred (no filtering/kick-avoidance work has
+ * been done for it yet). Called once per fresh, confidently-detected
+ * telemetry packet while g_mode == MODE_CLOSED_LOOP (see the call site in
+ * main()'s while(1) loop) -- never during open_loop, and never for stale/
+ * unconfident packets. tel_x_scaled is g_latest_beam.x, still
+ * POSITION_SCALE-scaled, same as everywhere else in this file.
+ *
+ * The sign here (positive error -> positive dac_y correction) and the
+ * choice of dac_y/cx as the controlled pair both come directly from the
+ * locked-optics calibration finding that dac_y's effect on cx is
+ * +0.126 px/count, the single largest coefficient in that calibration's
+ * gain matrix (rpi_camera_system CLAUDE.md, 2026-08-12). If the optics
+ * are ever recollimated again, both of those may need to change together
+ * with a fresh calibration -- this function does not re-derive them.
+ *
+ * Anti-windup: the integral accumulator is clamped so its contribution
+ * (g_ki * g_integral_px_s) can never exceed the full DAC output range --
+ * Ki-agnostic (the bound is computed from the current g_ki each step), so
+ * it stays correct across a live set_ki change rather than needing a
+ * fixed magic number tuned for one particular gain. */
+static void run_closed_loop_step(int16_t tel_x_scaled, uint32_t now)
+{
+  float   error_px;
+  float   dt_s;
+  float   p_term;
+  float   i_term;
+  int32_t output;
+
+  error_px = (float)(g_target_x_scaled - (int32_t)tel_x_scaled) / (float)POSITION_SCALE;
+
+  dt_s = (float)(now - g_last_control_tick) / 1000.0f;
+  if (dt_s < 0.0f)
+  {
+    /* HAL_GetTick() wraps every ~49.7 days -- treat a negative delta as a
+     * skipped step (dt effectively 0, no integral contribution this
+     * round) rather than feed a huge bogus dt into the integral. */
+    dt_s = 0.0f;
+  }
+
+  if (g_ki_milli != 0)
+  {
+    float max_integral = ((float)(DAC_MAX_COUNT - DAC_MIN_COUNT)) / fabsf(g_ki);
+    g_integral_px_s += error_px * dt_s;
+    if (g_integral_px_s > max_integral)  { g_integral_px_s = max_integral; }
+    if (g_integral_px_s < -max_integral) { g_integral_px_s = -max_integral; }
+    i_term = g_ki * g_integral_px_s;
+  }
+  else
+  {
+    i_term = 0.0f;
+  }
+
+  p_term = g_kp * error_px;
+  output = g_closed_loop_base_dac_y + (int32_t)(p_term + i_term);
+
+  apply_dac(AXIS_Y, output);  /* clamps internally to [DAC_MIN_COUNT, DAC_MAX_COUNT] */
+  g_last_control_tick = now;
+}
+
 /* --- Amp / safety -------------------------------------------------------- */
 
 static void amp_enable(void)
@@ -748,6 +880,18 @@ static void process_command_line(char *line)
   {
     cmd_get_status();
   }
+  else if (strcmp(cmd, "set_target_x") == 0)
+  {
+    cmd_set_target_x(arg);
+  }
+  else if (strcmp(cmd, "set_kp") == 0)
+  {
+    cmd_set_kp(arg);
+  }
+  else if (strcmp(cmd, "set_ki") == 0)
+  {
+    cmd_set_ki(arg);
+  }
   else
   {
     char resp[64];
@@ -772,10 +916,27 @@ static void cmd_set_mode(const char *arg)
   }
   else if (strcmp(arg, "closed_loop") == 0)
   {
-    /* PID phase not implemented yet -- reject explicitly rather than
-     * silently accepting a mode that does nothing (deliberate phase-1
-     * scope decision, see CLAUDE.md architecture decision v2). */
-    send_line("ERR closed_loop not yet implemented\r\n");
+    if (!g_target_x_set)
+    {
+      /* Refuse to engage with whatever g_target_x_scaled's zero-init
+       * default happens to be -- that's an arbitrary, almost certainly
+       * wrong pixel target, not a safe "do nothing" value. Forces an
+       * intentional set_target_x first. */
+      send_line("ERR set_target_x first\r\n");
+      return;
+    }
+    /* Bumpless transfer: bias the output off wherever dac_y already is
+     * and start the integral at 0, rather than jumping straight to a raw
+     * Kp*error value computed from an implicit zero base -- see
+     * run_closed_loop_step's docstring for the control law itself.
+     * g_last_control_tick is reset too so the first real step after this
+     * gets a small, sane dt instead of however long it's been since
+     * boot. */
+    g_closed_loop_base_dac_y = g_last_dac_y;
+    g_integral_px_s = 0.0f;
+    g_last_control_tick = HAL_GetTick();
+    g_mode = MODE_CLOSED_LOOP;
+    send_line("OK mode=closed_loop\r\n");
   }
   else
   {
@@ -789,6 +950,17 @@ static void cmd_set_axis(fta_axis_t axis, const char *arg)
   char *endptr;
   char  resp[48];
   int   len;
+
+  if (axis == AXIS_Y && g_mode == MODE_CLOSED_LOOP)
+  {
+    /* dac_y is under closed-loop control in this mode (run_closed_loop_step
+     * writes it every telemetry packet) -- a manual set_y here would just
+     * get overwritten on the next control step, or fight it in between.
+     * Reject explicitly rather than silently accepting a command that
+     * wouldn't do what it looks like it does. */
+    send_line("ERR set_y is under closed-loop control -- set_mode open_loop first\r\n");
+    return;
+  }
 
   if (arg == NULL || arg[0] == '\0')
   {
@@ -808,6 +980,115 @@ static void cmd_set_axis(fta_axis_t axis, const char *arg)
   len = snprintf(resp, sizeof(resp), "OK %s=%ld\r\n",
                   (axis == AXIS_X) ? "x" : "y",
                   (long)((axis == AXIS_X) ? g_last_dac_x : g_last_dac_y));
+  if (len > 0)
+  {
+    send_line(resp);
+  }
+}
+
+/* Sets the closed-loop pixel setpoint for cx (plain integer pixels, NOT
+ * POSITION_SCALE-scaled -- friendlier to type over the VCP than requiring
+ * the operator to pre-multiply by 10; converted to scaled units here to
+ * compare directly against g_latest_beam.x). Does not itself touch
+ * g_mode -- has no effect on an already-running closed loop's output
+ * until the next control step picks up the new target naturally (no
+ * special-case bump needed, target changes are supposed to move the
+ * setpoint). */
+static void cmd_set_target_x(const char *arg)
+{
+  long  val;
+  char *endptr;
+  char  resp[48];
+  int   len;
+
+  if (arg == NULL || arg[0] == '\0')
+  {
+    send_line("ERR set_target_x requires an argument (pixels)\r\n");
+    return;
+  }
+
+  val = strtol(arg, &endptr, 10);
+  if (endptr == arg)
+  {
+    send_line("ERR invalid integer\r\n");
+    return;
+  }
+
+  g_target_x_scaled = (int32_t)val * POSITION_SCALE;
+  g_target_x_set = 1;
+
+  len = snprintf(resp, sizeof(resp), "OK target_x=%ld\r\n", val);
+  if (len > 0)
+  {
+    send_line(resp);
+  }
+}
+
+/* Kp/Ki are taken as milli-units integers (e.g. "set_kp 2500" -> Kp=2.5)
+ * rather than a float string -- strtol only, no strtof/newlib float-scanf
+ * dependency, same rationale as decode_scaled's existing avoidance of
+ * float-printf (see that function's docstring and the Includes comment
+ * near math.h above). Kp is DAC counts per pixel of error; Ki is DAC
+ * counts per (pixel*second) of accumulated error -- see
+ * run_closed_loop_step. */
+static void cmd_set_kp(const char *arg)
+{
+  long  val;
+  char *endptr;
+  char  resp[48];
+  int   len;
+
+  if (arg == NULL || arg[0] == '\0')
+  {
+    send_line("ERR set_kp requires an argument (milli-units, e.g. 2500 = Kp 2.5)\r\n");
+    return;
+  }
+
+  val = strtol(arg, &endptr, 10);
+  if (endptr == arg)
+  {
+    send_line("ERR invalid integer\r\n");
+    return;
+  }
+
+  g_kp_milli = (int32_t)val;
+  g_kp = (float)g_kp_milli / 1000.0f;
+
+  len = snprintf(resp, sizeof(resp), "OK kp_milli=%ld\r\n", val);
+  if (len > 0)
+  {
+    send_line(resp);
+  }
+}
+
+static void cmd_set_ki(const char *arg)
+{
+  long  val;
+  char *endptr;
+  char  resp[48];
+  int   len;
+
+  if (arg == NULL || arg[0] == '\0')
+  {
+    send_line("ERR set_ki requires an argument (milli-units, e.g. 500 = Ki 0.5)\r\n");
+    return;
+  }
+
+  val = strtol(arg, &endptr, 10);
+  if (endptr == arg)
+  {
+    send_line("ERR invalid integer\r\n");
+    return;
+  }
+
+  g_ki_milli = (int32_t)val;
+  g_ki = (float)g_ki_milli / 1000.0f;
+  /* Changing Ki mid-flight invalidates whatever the old integral
+   * accumulated under the previous gain -- reset rather than let a stale
+   * accumulator produce a sudden i_term jump under the new one. */
+  g_integral_px_s = 0.0f;
+
+  len = snprintf(resp, sizeof(resp), "OK ki_milli=%ld\r\n", val);
   if (len > 0)
   {
     send_line(resp);
@@ -845,7 +1126,7 @@ static void cmd_get_status(void)
   int16_t  tel_x_scaled, tel_y_scaled;
   uint32_t pkt_count, err_count, last_tel_tick, now;
   int32_t  dac_x, dac_y;
-  char     line[160];
+  char     line[220];
   int      len;
 
   __disable_irq();
@@ -865,17 +1146,19 @@ static void cmd_get_status(void)
   now = HAL_GetTick();
 
   {
-    const char *tx_sign, *ty_sign;
-    int         tx_whole, tx_frac, ty_whole, ty_frac;
+    const char *tx_sign, *ty_sign, *tgt_sign;
+    int         tx_whole, tx_frac, ty_whole, ty_frac, tgt_whole, tgt_frac;
     uint32_t    tel_age_ms = (pkt_count > 0U) ? (now - last_tel_tick) : 0U;
 
     decode_scaled(tel_x_scaled, &tx_sign, &tx_whole, &tx_frac);
     decode_scaled(tel_y_scaled, &ty_sign, &ty_whole, &ty_frac);
+    decode_scaled(g_target_x_scaled, &tgt_sign, &tgt_whole, &tgt_frac);
 
     len = snprintf(line, sizeof(line),
                     "STATUS mode=%s amp=%u estop=%u dac_x=%ld dac_y=%ld "
                     "tel_x=%s%d.%01d tel_y=%s%d.%01d tel_seq=%u tel_status=%u "
-                    "tel_age_ms=%lu pkts=%lu errs=%lu uptime=%lus\r\n",
+                    "tel_age_ms=%lu pkts=%lu errs=%lu uptime=%lus "
+                    "target_x_set=%u target_x=%s%d.%01d kp_milli=%ld ki_milli=%ld\r\n",
                     (g_mode == MODE_OPEN_LOOP) ? "open_loop" : "closed_loop",
                     (unsigned)amp_en, (unsigned)estop_latched,
                     (long)dac_x, (long)dac_y,
@@ -883,7 +1166,9 @@ static void cmd_get_status(void)
                     (unsigned)seq, (unsigned)status,
                     (unsigned long)tel_age_ms,
                     (unsigned long)pkt_count, (unsigned long)err_count,
-                    (unsigned long)(now / 1000U));
+                    (unsigned long)(now / 1000U),
+                    (unsigned)g_target_x_set, tgt_sign, tgt_whole, tgt_frac,
+                    (long)g_kp_milli, (long)g_ki_milli);
   }
   if (len > 0)
   {
