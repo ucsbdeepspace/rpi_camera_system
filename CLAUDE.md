@@ -2364,6 +2364,76 @@ fresh flash or power cycle resets them to 0.
    committed tool if this hysteresis-aware operating strategy is kept
    long-term.
 
+### Ki escalation search at dac_y=2048 — no overshoot found up to 200x the original value; settled on Ki=30 for ongoing work (2026-08-13, same day)
+
+Followed up on item 2 above (Kp/Ki not yet pushed) by escalating Ki
+specifically, to find where overshoot actually starts — useful to know
+the real margin rather than just picking a number that happened to work
+once. Single-direction step test per trial (target 25px below baseline,
+Kp fixed at 1.75 counts/px), re-entering `closed_loop` fresh each trial
+(resets the integral + rebiases via bumpless transfer) so trials don't
+contaminate each other.
+
+**Result: no meaningful overshoot anywhere in the tested range, all the
+way up to Ki=300 counts/(px·s) — 200x the first working value (1.5).**
+Convergence just kept getting faster with no stability cost:
+
+| Ki (counts/px/s) | time to converge (\|err\|<3px) |
+|---|---|
+| 1.5 | not fully converged in 12s |
+| 3.0 | 8.4s |
+| 5.0 | 4.9s |
+| 8.0 | 3.7s |
+| 12.0 | 2.3s |
+| 20.0 | 1.6s |
+| 40.0 | 1.1s |
+| 80.0 – 300.0 | ~0.36s (flat from here) |
+
+Every trial's error stayed monotonic, no real sign-flip past ~0.2px
+(noise-level), no divergence, no DAC clamp.
+
+**Why it never overshoots, even at absurd gains — a real, useful
+mechanism worth understanding, not just an empirical curiosity.** The
+firmware's anti-windup clamp in `run_closed_loop_step` bounds the
+integral state to `max_integral = DAC_range / Ki`, which means the
+*maximum possible* contribution from the integral term is always
+`Ki × max_integral = DAC_range` — a constant, independent of Ki.
+Cranking Ki doesn't let the integral term push harder, it just lets it
+reach that same fixed ceiling faster. This is a genuinely good
+anti-windup design already present in the firmware (see the "Anti-
+windup" note in `run_closed_loop_step`'s own docstring) — it
+structurally prevents integral-driven overshoot by construction, which
+is exactly why this search never found a break point. **Practical
+implication**: overshoot risk in this system, if there is one, will not
+show up in a quasi-static step-and-hold search like this one — it would
+have to come from Kp/plant-dynamics interaction under an actual
+disturbance (the real 10-20Hz band), not from the integral term. Not
+worth pushing Ki any higher for this reason.
+
+**Chosen for ongoing work: Ki=30 counts/(px·s) (`set_ki 30000`)** —
+comfortably inside the flat, fast, zero-overshoot region (converges in
+~1-1.5s), with margin on both sides. Kp stays at 1.75 counts/px for now
+(still untouched since the very first attempt, despite item 2 above
+noting it's likely well below what the plant could support at 2048 —
+still not explored).
+
+**Not yet done**: everything from the "Not yet done" list above still
+applies (no dynamic/sine validation of the closed loop yet, Kp untried
+at higher values, other DAC regions uncharacterized, scripts
+uncommitted). This session's escalation-search script
+(`ki_overshoot_search.py`, scratchpad only) reuses the same
+paced-write/get_status-polling pattern as the rest of this session's
+tooling — not proper high-rate logging or plotting, just a terminal
+readout. **Next planned step (per user, same session): a proper
+closed-loop step-response test with real data logging and a plot**
+(matching the rigor of the existing open-loop `fta_step_response_test_vcp.py`,
+rather than this session's crude ~3Hz terminal-polling checks) at
+Kp=1.75/Ki=30, before moving on to closed-loop sine tracking across the
+actual 5-20Hz disturbance band — the step test first, per this
+project's own established methodology (see "PI control law designed,"
+2026-07-23: step-response dynamics before sine, same logic applied here
+to the closed loop instead of the open-loop plant).
+
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 
 Frequency-domain complement to the step-response tests, motivated by the
