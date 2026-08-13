@@ -30,6 +30,21 @@ import matplotlib.pyplot as plt
 
 DEFAULT_CALIB_PATH = "results/fta_calibration_vcp_20260806T191230Z.npz"  # 13x13, 200-3800 step 300
 
+MICRONS_PER_PIXEL = 3.0  # OV9281 pixel pitch, same constant/derivation as
+                          # fta_sine_response_test_vcp.py. Applies directly
+                          # here even though every calibration sweep this
+                          # script has plotted was collected with the Pi's
+                          # camera in FULL-FRAME (v_bin=1) mode, not the
+                          # binned 640x200 mode used for the sine tests --
+                          # no adjustment needed either way, since the
+                          # Pi-side streamer always multiplies its detected
+                          # centroid by whatever v_bin is in effect before
+                          # sending (camera_view_tool.py /
+                          # beam_position_streamer.py), so the coordinates
+                          # here are already in native-pixel-equivalent
+                          # units regardless of capture mode. Also 1:1 to
+                          # real fiber-tip motion (no external magnification).
+
 ROW_COLOR = "#2a78d6"    # constant dac_y, dac_x varies
 COL_COLOR = "#eb6834"    # constant dac_x, dac_y varies
 MUTED = "#898781"
@@ -89,10 +104,20 @@ def main():
     ax.set_xlabel("cx (pixel)")
     ax.set_ylabel("cy (pixel)")
     ax.set_title("Commanded DAC grid drawn in centroid (pixel) space\n"
-                  "— rectangular & evenly spaced = clean; sheared/bunched = distorted",
+                  "— rectangular & evenly spaced = clean; sheared/bunched = distorted\n"
+                  "3.0µm/px (OV9281 pixel pitch, 1:1 fiber-to-sensor)",
                   fontsize=12.5, fontweight="bold")
     ax.grid(True, color="#e1e0d9", linewidth=0.6)
     ax.set_aspect("equal", adjustable="datalim")
+
+    sec_x = ax.secondary_xaxis(
+        "top",
+        functions=(lambda px: px * MICRONS_PER_PIXEL, lambda um: um / MICRONS_PER_PIXEL))
+    sec_x.set_xlabel("cx (µm)")
+    sec_y = ax.secondary_yaxis(
+        "right",
+        functions=(lambda px: px * MICRONS_PER_PIXEL, lambda um: um / MICRONS_PER_PIXEL))
+    sec_y.set_ylabel("cy (µm)")
 
     fig.tight_layout()
     fig.savefig(args.out_path)
@@ -109,7 +134,8 @@ def main():
         order = np.argsort(dac_x[mask])
         xs, ys = cx[mask][order], cy[mask][order]
         span = np.hypot(xs[-1] - xs[0], ys[-1] - ys[0])
-        print(f"  dac_y={int(y):5d}: total pixel-space travel across dac_x sweep = {span:7.1f}px")
+        print(f"  dac_y={int(y):5d}: total travel across dac_x sweep = {span:7.1f}px "
+              f"({span*MICRONS_PER_PIXEL:7.1f}um)")
 
     print("\nColumn extents (cx,cy) span per dac_x value, i.e. how far dac_y sweeps the point "
           "in pixel space at each dac_x:")
@@ -118,7 +144,8 @@ def main():
         order = np.argsort(dac_y[mask])
         xs, ys = cx[mask][order], cy[mask][order]
         span = np.hypot(xs[-1] - xs[0], ys[-1] - ys[0])
-        print(f"  dac_x={int(x):5d}: total pixel-space travel across dac_y sweep = {span:7.1f}px")
+        print(f"  dac_x={int(x):5d}: total travel across dac_y sweep = {span:7.1f}px "
+              f"({span*MICRONS_PER_PIXEL:7.1f}um)")
 
 
 if __name__ == "__main__":

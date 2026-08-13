@@ -75,6 +75,22 @@ import numpy as np
 FTA_BAUD = 115200  # camera_centroid_receiver's USART2 rate, NOT the old
                     # "FTA Controller"'s 460800.
 
+MICRONS_PER_PIXEL = 3.0  # OV9281 pixel pitch, same constant/derivation as
+                          # fta_step_response_test.py: confirmed live via
+                          # Picamera2(0).camera_properties["UnitCellSize"]
+                          # = (3000, 3000)nm, not a datasheet guess.
+                          # Applies directly to every x/y sample here
+                          # without a separate binning correction: the Pi-
+                          # side streamer (camera_view_tool.py /
+                          # beam_position_streamer.py) already multiplies
+                          # its detected centroid by v_bin before sending
+                          # over I2C, so what arrives over the VCP relay
+                          # is already in pre-bin/native-pixel-equivalent
+                          # coordinates regardless of which capture mode
+                          # the Pi is actually running. Fiber-to-sensor
+                          # motion is 1:1 (no external magnification), so
+                          # this is also real fiber-tip displacement.
+
 TELEMETRY_RE = re.compile(
     r"^seq=\s*(\d+)\s+status=(\d+)\s+x=(-?\d+\.\d)\s+y=(-?\d+\.\d)\s+pkts=(\d+)\s+errs=(\d+)$")
 
@@ -346,17 +362,19 @@ def main():
     lag_ms_other = -lag_rad_other / w * 1000.0
 
     print(f"\n--- Driven axis ({driven_name}) ---")
-    print(f"fitted gain: {gain_driven:+.2f}px for {args.amplitude:+d} commanded DAC counts "
+    print(f"fitted gain: {gain_driven:+.2f}px ({gain_driven*MICRONS_PER_PIXEL:+.1f}um) for "
+          f"{args.amplitude:+d} commanded DAC counts "
           f"({'DAC up -> pixel up' if gain_driven > 0 else 'DAC up -> pixel down'})")
     print(f"lag: {lag_ms_driven:.1f}ms  ({lag_rad_driven * 180/math.pi:.1f} deg at {args.freq}Hz, "
           "relative to the fitted gain direction, not raw phase)")
-    print(f"offset: {off_driven:.2f}px")
+    print(f"offset: {off_driven:.2f}px ({off_driven*MICRONS_PER_PIXEL:.1f}um)")
 
     print(f"\n--- Cross-coupled axis ({other_name}) ---")
-    print(f"fitted gain: {gain_other:+.2f}px  ({100*abs(gain_other)/max(abs(gain_driven),1e-9):.1f}% "
+    print(f"fitted gain: {gain_other:+.2f}px ({gain_other*MICRONS_PER_PIXEL:+.1f}um)  "
+          f"({100*abs(gain_other)/max(abs(gain_driven),1e-9):.1f}% "
           f"of driven-axis magnitude, {'same' if gain_other*gain_driven > 0 else 'opposite'} sign)")
     print(f"lag: {lag_ms_other:.1f}ms")
-    print(f"offset: {off_other:.2f}px")
+    print(f"offset: {off_other:.2f}px ({off_other*MICRONS_PER_PIXEL:.1f}um)")
 
     # True displacement magnitude/direction, not just the driven axis's own
     # projection -- gain_driven alone underreports real motion whenever
@@ -371,7 +389,8 @@ def main():
     vector_mag = math.hypot(gain_x, gain_y)
     vector_angle_deg = math.degrees(math.atan2(gain_y, gain_x))
     print(f"\n--- True displacement vector (both axes combined) ---")
-    print(f"magnitude: {vector_mag:.2f}px  ({100*(vector_mag/max(abs(gain_driven),1e-9)-1):.1f}% "
+    print(f"magnitude: {vector_mag:.2f}px ({vector_mag*MICRONS_PER_PIXEL:.1f}um)  "
+          f"({100*(vector_mag/max(abs(gain_driven),1e-9)-1):.1f}% "
           f"more than the driven-axis-only number above)")
     print(f"direction: {vector_angle_deg:.1f}deg (atan2(y,x) in pixel space)")
 

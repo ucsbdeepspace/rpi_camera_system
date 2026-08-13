@@ -25,6 +25,13 @@ import matplotlib.pyplot as plt
 FREQS = [5, 10, 15, 20]
 FILES = [f"results/fta_sine_response_vcp_y_roi_{f}Hz.npz" for f in FREQS]
 
+MICRONS_PER_PIXEL = 3.0  # OV9281 pixel pitch, same constant/derivation as
+                          # fta_sine_response_test_vcp.py -- applies
+                          # directly to these streamed coordinates (already
+                          # pre-bin-equivalent) with no separate binning
+                          # correction, and 1:1 to real fiber-tip motion
+                          # since the optical path has no magnification.
+
 BLUE = "#2a78d6"
 DAC_COLOR = "#52514e"
 MUTED = "#898781"
@@ -33,8 +40,8 @@ GRID = "#e1e0d9"
 
 def plot_traces(runs):
     fig, axes = plt.subplots(
-        2, 4, figsize=(13.33, 5.6), dpi=200,
-        gridspec_kw={"height_ratios": [1, 2.4], "hspace": 0.12, "wspace": 0.30},
+        2, 4, figsize=(15.5, 5.6), dpi=200,
+        gridspec_kw={"height_ratios": [1, 2.4], "hspace": 0.12, "wspace": 0.55},
     )
     fig.patch.set_facecolor("white")
 
@@ -60,8 +67,15 @@ def plot_traces(runs):
         ax_px.set_xlabel("time (s)", fontsize=8.5, color=MUTED)
         if col == 0:
             ax_px.set_ylabel("cx (px)\n(driven by dac_y)", fontsize=8.5, color=MUTED)
+        sec = ax_px.secondary_yaxis(
+            "right",
+            functions=(lambda px: px * MICRONS_PER_PIXEL, lambda um: um / MICRONS_PER_PIXEL))
+        sec.tick_params(colors=MUTED, labelsize=8, length=3)
+        if col == 3:
+            sec.set_ylabel("cx (µm)", fontsize=8.5, color=MUTED)
 
-        subtitle = (f"|gain|: {run['vector_mag']:.1f}px  ·  "
+        subtitle = (f"|gain|: {run['vector_mag']:.1f}px "
+                    f"({run['vector_mag']*MICRONS_PER_PIXEL:.0f}µm)  ·  "
                     f"dir: {run['vector_angle_deg']:.1f}°")
         ax_px.text(0.02, 0.03, subtitle, transform=ax_px.transAxes, fontsize=7.8,
                    color=MUTED, va="bottom", ha="left",
@@ -71,8 +85,9 @@ def plot_traces(runs):
     cx_line = plt.Line2D([0], [0], color=BLUE, linewidth=1.3, label="measured cx")
     fig.legend(handles=[dac_line, cx_line], loc="upper center",
                bbox_to_anchor=(0.5, 1.05), ncol=2, frameon=False, fontsize=9.5)
-    fig.suptitle("dac_y → cx sine tracking, amplitude 400, ROI telemetry rate (~207Hz)",
-                 fontsize=12.5, fontweight="bold", y=1.16, color="#0b0b0b")
+    fig.suptitle("dac_y → cx sine tracking, amplitude 400, ROI telemetry rate (~207Hz)\n"
+                 "3.0µm/px (OV9281 pixel pitch, 1:1 fiber-to-sensor)",
+                 fontsize=12.5, fontweight="bold", y=1.20, color="#0b0b0b")
 
     out_png = "results/fta_sine_response_y_roi_traces.png"
     fig.savefig(out_png, bbox_inches="tight", facecolor="white")
@@ -95,6 +110,10 @@ def plot_summary(runs):
     ax_mag.set_ylabel("true displacement magnitude (px)")
     ax_mag.set_title("Gain vs. frequency")
     ax_mag.set_xticks(freqs)
+    sec_mag = ax_mag.secondary_yaxis(
+        "right",
+        functions=(lambda px: px * MICRONS_PER_PIXEL, lambda um: um / MICRONS_PER_PIXEL))
+    sec_mag.set_ylabel("true displacement magnitude (µm)")
 
     ax_ang.plot(freqs, angles, color="#eb6834", linewidth=2, marker="o", markersize=6)
     ax_ang.axhline(0, color=MUTED, linewidth=0.8, linestyle=(0, (2, 2)))

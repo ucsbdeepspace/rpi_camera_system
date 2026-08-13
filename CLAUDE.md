@@ -2078,6 +2078,27 @@ visual style as the earlier slide-10 rotated-axis plots) and
 frequency, makes the flat-then-rises-at-20Hz shape and the pinned-near-0°
 direction easy to see at a glance).
 
+**Microns added** (2026-08-12): all pixel-based displacement/gain
+numbers going forward can be converted to real physical units via
+`MICRONS_PER_PIXEL = 3.0` (OV9281 pixel pitch, confirmed live via
+`Picamera2(0).camera_properties["UnitCellSize"]`, same constant already
+used in `fta_step_response_test.py`). This applies directly and
+uniformly to every VCP-relayed x/y sample this project produces,
+**regardless of which capture mode the Pi's camera is in** (full-frame
+or a binned windowed mode like 640x200) — the Pi-side streamer
+(`camera_view_tool.py`/`beam_position_streamer.py`) already multiplies
+its detected centroid by `v_bin` before sending over I2C, so what
+arrives over the relay is always in native/pre-bin-pixel-equivalent
+coordinates. No separate binning correction is ever needed on the
+laptop side. Also 1:1 to real fiber-tip displacement, since the optical
+path has no external magnification. Added to
+`fta_sine_response_test_vcp.py` (µm alongside px in the printed
+gain/lag/offset/vector report), `fta_sine_response_plot.py` (µm
+secondary axes), and `fta_calibration_grid_mesh.py` (µm secondary axes
++ µm in the row/column travel printout) — e.g. the final calibration's
+full grid spans ~1088-1124µm of travel per dac_x sweep and
+~1275-1363µm per dac_y sweep (`results/fta_calibration_grid_mesh_final.png`).
+
 **Next step**: implement the actual PID loop on the Nucleo (`cmd_set_mode`'s
 `closed_loop` branch is currently a deliberate stub, `ERR closed_loop not
 yet implemented` — nothing PID-related exists in firmware yet: no
