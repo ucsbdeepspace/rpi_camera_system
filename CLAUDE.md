@@ -2609,6 +2609,103 @@ any of these gain choices. Result files:
 Kp-only trial) — not all committed as of this entry, only the original
 baseline run was.
 
+Combined comparison plot (both this entry's 6 runs, ordered baseline →
+chosen): `results/fta_closed_loop_step_response_tuning_panel.png`, built
+by the new `fta_closed_loop_step_response_plot.py` (reuses `analyze_step`
+from the test script itself rather than re-deriving metrics, zoomed to
+the interesting ~1.5s window around each step, color-coded clean/ringing
+by the same >5%-overshoot threshold used in this file's prose).
+
+### Pushed further per the user's request ("get to a usable region") — found a real Kp instability boundary (~6-6.5 counts/px), best result 63-156ms settling depending on overshoot tolerance (2026-08-13, same day)
+
+**Real, safety-relevant finding: Kp above ~6 counts/px is genuinely
+closed-loop UNSTABLE at this operating point, not just "more overshoot."**
+Tried Kp=8.0 with the previously-untested Ki=50 (chosen to pair with the
+plant's measured local gain, ~0.09 px/count at 2048, whose matched
+static Kp would be `1/0.09≈11`): the recorded trace showed large,
+sustained, chaotic-looking oscillation (up to ~800px against a ~25px
+step) **present even during the pre-step baseline hold**, i.e. this
+combination is unstable just sitting at a fixed setpoint, not only in
+response to a step. Isolated whether Ki was implicated: Kp=8.0 with
+Ki=0 (pure P) was *also* unstable — small ripple at rest, but the step
+itself triggered a clearly GROWING oscillation that never settled in the
+3s recorded window. This is Kp alone, nothing to do with Ki or the
+anti-windup mechanism discussed in the two entries above.
+
+**Bisected with Ki=0 to isolate the boundary**: Kp=5.5 stable (damped
+ringing, settles by 156ms, real steady-state offset expected since
+Ki=0); Kp=6.0 marginal (settles, but only after ~5-6 visibly decaying
+oscillation cycles, 484ms); Kp=6.5 and Kp=8.0 both genuinely unstable
+(growing, never settling). **The real closed-loop instability boundary
+for this operating point sits between Kp=6.0 and Kp=6.5** — far below
+the naive "matched-to-plant-gain" estimate of ~11, almost certainly
+because that estimate only accounts for static gain and ignores the
+real phase lag already characterized elsewhere in this project (the
+~41ms pipeline delay, the actuator's own dynamics/resonance near 11Hz) —
+phase lag is exactly what erodes stability margin as loop gain rises,
+so a naive static-gain match was never going to be safe. **Practical
+lesson: don't estimate a safe Kp from static plant gain alone on this
+rig — the real ceiling is roughly half the naive estimate, found only by
+testing.** All of this stayed physically safe throughout: `apply_dac`'s
+own `[95,4000]` clamp bounded every excursion regardless of how bad the
+tuning was, and every test script run returned hardware to idle
+afterward regardless of outcome.
+
+**Also found: pushing toward the instability boundary is not a good way
+to get speed.** Kp=6.0's marginal case took LONGER to settle (484ms)
+than the comfortably-stable Kp=5.5 (156ms) — near a stability boundary,
+damping drops and oscillation cycles multiply, which costs time even
+though the "loop gain" is nominally higher. The better lever, confirmed
+again here, stayed Ki: combining a moderate, comfortably-stable Kp (3.5,
+scaled up from 1.75 but well clear of the ~6 boundary) with Ki=200 gave
+a clean single-transition response (78ms rise, 1.1% overshoot, 156ms
+settling) — comparable to, not better than, the Ki-alone result from the
+entry above (Kp=1.75/Ki=200: 141ms rise and settling). Pushing that same
+Kp=3.5 combo to Ki=300 got faster (94ms settling) but reintroduced real
+ringing (28.6% overshoot) — and notably, this was WORSE (slower, more
+overshoot) than simply cranking Ki alone at the original low Kp
+(Kp=1.75/Ki=400: 63ms settling, 15.1% overshoot, see the entry above).
+**Net conclusion: raising Kp did not help anywhere in this session's
+testing** — every combination that added Kp was either no faster than
+the equivalent Ki-alone result, or strictly worse (more overshoot for
+similar or worse settling). Ki alone, kept away from its own (separately
+bracketed, see the prior entry) overshoot onset around 200-400, remains
+the best lever found on this rig.
+
+**Where this leaves tuning, answering the user's "usable region"
+question**: two real candidates, both far better than the un-tuned
+1000ms starting point, trading settling speed against overshoot:
+
+| candidate | rise | overshoot | settling | character |
+|---|---|---|---|---|
+| Kp=1.75, Ki=200 | 141ms | 1.1% | 141ms | clean, single transition, no visible ringing |
+| Kp=1.75, Ki=400 | 32ms | 15.1% | 63ms | fast, but real (if brief) ringing each correction |
+
+Neither has been validated against the actual 10-20Hz sine disturbance
+this project targets — step-response settling time is a reasonable
+proxy for closed-loop bandwidth but not a substitute for measuring it
+directly, and repeated overshoot on every correction cycle (the Ki=400
+case) could plausibly matter more under continuous oscillatory tracking
+than it does on a single one-off step. **Recommendation, not yet
+executed**: start closed-loop sine tracking with the clean Kp=1.75/Ki=200
+choice first (lower risk of exciting resonance under sustained
+correction), and only reach for Ki=400 if 141ms of step-settling turns
+out to translate into inadequate 10-20Hz rejection.
+
+Second combined comparison plot (stability search + combined-gain
+candidates): `results/fta_closed_loop_step_response_stability_panel.png`,
+built by `fta_closed_loop_step_response_plot2.py` — unstable runs shown
+over the full recorded window (the sustained oscillation IS the finding)
+and color-coded red, distinct from the clean/ringing blue/orange coding
+used in the first panel.
+
+**Not yet done**: the Kp instability boundary (6.0-6.5) is only
+bracketed to within 0.5 counts/px, not precisely located; no Kp×Ki 2D
+sweep away from the two 1D slices tried (Ki=0 for the Kp search, Kp
+fixed at 1.75/3.5/5.0 for the Ki searches); closed-loop sine tracking
+across 5-20Hz — the real deliverable — still not attempted with either
+candidate gain set.
+
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 
 Frequency-domain complement to the step-response tests, motivated by the
