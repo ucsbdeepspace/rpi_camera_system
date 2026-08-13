@@ -2071,6 +2071,13 @@ this time. **Treat the full-frame numbers in the section above as
 superseded by this table** — kept for the record, not as the reference
 data going forward.
 
+Plotted (`fta_sine_response_plot.py`): `results/fta_sine_response_y_roi_traces.png`
+(commanded `dac_y` vs. measured `cx`, one column per frequency, same
+visual style as the earlier slide-10 rotated-axis plots) and
+`results/fta_sine_response_y_roi_summary.png` (magnitude/direction vs.
+frequency, makes the flat-then-rises-at-20Hz shape and the pinned-near-0°
+direction easy to see at a glance).
+
 **Next step**: implement the actual PID loop on the Nucleo (`cmd_set_mode`'s
 `closed_loop` branch is currently a deliberate stub, `ERR closed_loop not
 yet implemented` — nothing PID-related exists in firmware yet: no
