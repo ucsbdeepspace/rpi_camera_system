@@ -117,24 +117,18 @@ void HAL_I2C_MspInit(I2C_HandleTypeDef* hi2c)
     /* Peripheral clock enable */
     __HAL_RCC_I2C1_CLK_ENABLE();
     /* I2C1 interrupt Init */
-    /* Priority hand-lowered to 1 (below USART2's 0, see USART2_MspInit's
-     * comment) -- NOT what CubeMX would regenerate from the .ioc (still
-     * 0,0 there), re-apply by hand if this project is ever regenerated.
-     * Bench testing 2026-08-04 found the VCP dropping characters out of
-     * commands, up to 100% of the first few in one session, while I2C
-     * held this priority above USART2's: a UART byte arriving mid-I2C-ISR
-     * had to wait, and the single-byte receive/re-arm cycle sometimes
-     * missed the next byte entirely. I2C1 can absorb the reverse (a UART
-     * ISR preempting it) for free -- NoStretchMode is disabled above, so
-     * the Pi's I2C master just sees SCL held a few extra us, a protocol-
-     * legal clock stretch, not an error. UART RX has no equivalent
-     * tolerance (no HW flow control), so it's the one that needs to win. */
     HAL_NVIC_SetPriority(I2C1_EV_IRQn, 1, 0);
     HAL_NVIC_EnableIRQ(I2C1_EV_IRQn);
     HAL_NVIC_SetPriority(I2C1_ER_IRQn, 1, 0);
     HAL_NVIC_EnableIRQ(I2C1_ER_IRQn);
     /* USER CODE BEGIN I2C1_MspInit 1 */
 
+    /* Priority reapplied by hand -- 2026-08-13, after a clock-speed/I2C-
+     * timing CubeMX regeneration reset this to CubeMX's default (0),
+     * same as it did the first time this was tuned (2026-08-04). This
+     * block is CubeMX-generated (not USER-CODE-protected) so it always
+     * resets on regeneration; see USART2_MspInit 1 below for why I2C1
+     * must stay LOWER priority (numerically higher) than USART2. */
     /* USER CODE END I2C1_MspInit 1 */
 
   }

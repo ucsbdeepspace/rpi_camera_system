@@ -110,11 +110,14 @@ MIN_BLOB_AREA_PX = 15
 CONTRAST_CONFIDENCE_K = 5.0
 MASK_THRESH_K = 3.0
 
-FTA_BAUD = 115200  # camera_centroid_receiver's USART2 rate (unchanged from
-# the original heartbeat-only firmware) -- NOT the old "FTA Controller"'s
-# 460800. Get this wrong and every reply is baud-mismatch garbage, not a
-# clean protocol error (same signature CLAUDE.md already documented once,
-# 2026-07-23, when the two firmwares' baud rates were mixed up).
+FTA_BAUD = 460800  # camera_centroid_receiver's USART2 rate -- raised from
+# 115200 back to 460800 on 2026-08-13, now matching the old "FTA
+# Controller"'s rate again. Needed the whole project's clock tree raised
+# too (4MHz -> 16MHz HSI) since 460800 was unreachable at 4MHz -- see
+# CLAUDE.md for the full story. Get this wrong and every reply is
+# baud-mismatch garbage, not a clean protocol error (same signature
+# CLAUDE.md already documented once, 2026-07-23, when the two firmwares'
+# baud rates were mixed up).
 # camera_centroid_receiver's phase-1 firmware (nucleo_firmware/, 2026-08-04),
 # not the old "FTA Controller" -- reply format changed from positional CSV
 # ("status:x,y,...") to keyed text. dac_x/dac_y (the last commanded DAC

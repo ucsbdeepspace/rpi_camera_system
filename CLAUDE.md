@@ -2806,6 +2806,147 @@ rather than the original (wrong) fire-and-forget assumption — default
 `--update-rate` changed from 200 to 3 to reflect reality rather than
 imply a false choice.
 
+### Firmware queue rewrite + clock/baud raise — real ~13x VCP command throughput improvement, several regeneration regressions found and fixed along the way (2026-08-13, same day)
+
+Prompted by the user asking why this project couldn't hit the ~1600Hz
+command rate the old "FTA Controller" firmware achieved. Real answer,
+worked out before touching hardware: three compounding differences, not
+one. (1) The old firmware had a real 64-deep command queue; this
+firmware's VCP RX held exactly one pending line and silently dropped
+anything arriving before the main loop drained it — its own source
+comment said why: "VCP commands are low-rate ... not a hot path," an
+assumption that stopped being true once host scripts started streaming
+setpoints. (2) USART2 ran at 115200 baud here vs. 460800 on the old
+firmware. (3) The old firmware had no I2C telemetry traffic at all
+(driven by an onboard photodiode, not the Pi) — this one prints a full
+relay line over the *same wire* for every I2C packet, ~150-200Hz, which
+bandwidth math showed was already eating ~60% of 115200 baud's raw
+capacity on its own.
+
+**Firmware rewrite #1 — real command queue + non-blocking TX.** Replaced
+the single-pending-line VCP RX buffer with an 8-deep ring buffer of
+complete lines (ISR fills, main loop drains one per pass — see
+`vcp_rx_queue`/`vcp_rx_head`/`vcp_rx_tail`/`vcp_rx_count` in `main.c`).
+Replaced every blocking `HAL_UART_Transmit(..., 100)` call (heartbeat,
+the per-packet relay print, every command reply) with `enqueue_tx()` — a
+small TX ring buffer (8 deep, `tx_queue`) drained by interrupt-driven
+`HAL_UART_Transmit_IT` + a new `HAL_UART_TxCpltCallback`, so the main
+loop never blocks on transmission again. Clean rebuild, zero warnings.
+
+**Attempted raising baud to 460800 alone first — total silent failure,
+not a partial improvement.** After flashing, zero bytes came out at
+*any* baud rate, not even the heartbeat. Root cause: this project's
+whole clock tree ran at just 4MHz (`SystemClock_Config`, `MSIRANGE_6`,
+no PLL) — at 4MHz with standard 16x oversampling, the maximum
+achievable UART baud is ~250,000, so 460800 was mathematically
+unreachable and the firmware silently hung in `Error_Handler` before
+ever reaching `main()`'s loop. Reverted immediately rather than push
+further blind.
+
+**User raised the clock via CubeMX** (switched `SystemClockMux` from
+MSI to HSI16, 16MHz, no PLL needed — the simple option, recommended
+specifically to minimize risk over a full PLL-based 80MHz config) and
+regenerated code. This is exactly the kind of change flagged as needing
+CubeMX's own tool rather than a hand-derived value: I2C1's `Timing`
+register (`hi2c1.Init.Timing`) is a hand-tuned magic value correct only
+for the clock it was computed against, and CubeMX recomputed it
+correctly for 16MHz (`0x00100D14` → `0x00503D58`) as part of the same
+regeneration.
+
+**Regeneration broke several things that needed manual reapplication —
+all found and fixed before flashing, not after:**
+1. **The DAC HAL driver source files were deleted outright**
+   (`stm32l4xx_hal_dac[_ex].c/.h`) — CubeMX cleaned up driver files for
+   a peripheral it doesn't think is used, since DAC1 was never added to
+   the `.ioc` (same "hand-added outside CubeMX" situation as the pins
+   themselves). Restored via `git checkout --` (still safely committed).
+2. **`HAL_DAC_MODULE_ENABLED` was re-commented-out** in
+   `stm32l4xx_hal_conf.h` — the exact gotcha this file already warned
+   about elsewhere, hit for real this time. Re-enabled by hand.
+3. **I2C1's NVIC priority reset to CubeMX's default (0)**, undoing the
+   2026-08-04 tuning that put USART2 at priority 0 and I2C1 at 1 (I2C
+   can tolerate a delay via clock stretching; UART RX cannot). This
+   block is CubeMX-generated, not USER-CODE-protected, so it will always
+   reset on regeneration — reapplied by hand, comment updated to say so
+   explicitly for next time.
+4. **A genuine compile-breaking regression**: `stm32l4xx_it.c` still
+   calls `HAL_UART_IRQHandler(&huart2)` from `USART2_IRQHandler`, but
+   the `extern UART_HandleTypeDef huart2;` declaration that makes that
+   legal was silently dropped from the regenerated "External variables"
+   section. Re-added — this time *inside* a USER CODE block so it
+   survives the next regeneration too.
+5. **Self-inflicted, separate from the regeneration**: while checking
+   the CLI rebuild for warnings, ran `rm -rf Debug/Core Debug/Drivers`
+   to force a clean rebuild — this deleted STM32CubeIDE's auto-generated
+   per-folder build rules (`subdir.mk` etc.), which are gitignored and
+   only created by the IDE's own build system, not by plain `make`. Broke
+   the CLI-only rebuild path entirely (link stage silently skipped
+   compiling anything and failed on missing .o files). Recovered by
+   asking the user to do one normal Build in STM32CubeIDE, which
+   regenerated the missing files properly. **Lesson: don't `rm -rf`
+   inside a CubeIDE-managed Debug/ directory to force a "clean" CLI
+   rebuild — `make clean` (if the generated makefile supports it) or
+   just trust incremental rebuilds instead.**
+
+**Raised USART2 to 460800 baud** (now safely inside the 16MHz clock's
+range, `16MHz/(16×460800)=2.17`, a valid divisor with margin) — not
+`.ioc`-tracked (same situation as the other hand-added settings), so
+flagged inline to reapply by hand if ever regenerated again.
+
+**Real, measured result after all of this — a genuine ~13x throughput
+improvement, but burst writes remain fundamentally broken regardless:**
+- **True single-burst writes** (one `ser.write()` call for the whole
+  command line) are **still 0% reliable** at the new clock+baud — proves
+  this specific failure mode was never about raw bandwidth or CPU speed
+  at all; something about how a burst gets chunked/timed at the
+  USB↔UART bridge causes it to lose bytes regardless.
+- **Paced writes are where the real win is.** A back-to-back reliability
+  test (real multi-threaded context, a concurrent reader thread
+  draining telemetry, matching how the actual test scripts operate) at
+  460800 baud with the queue fix: 0.1-0.5ms/char pacing all landed
+  ~99-100% clean, achieving **~38-39 commands/s** — throughput plateaus
+  there regardless of pushing the delay lower (per-`write()`-call
+  overhead becomes the bottleneck, not the sleep itself). That's a
+  **~13x improvement over the ~3Hz ceiling** this project was stuck at
+  immediately before this fix (see the entry above). Undelayed
+  per-character writes (still individual `ser.write()` calls, just no
+  explicit `time.sleep`) reached **~739/s at 85% reliability** — faster
+  but not fully reliable, not recommended over the ~38-39Hz/~100% option
+  for anything that needs to actually land.
+- **Real end-to-end sanity check, not just raw command echo**: reran
+  `fta_closed_loop_step_response_vcp.py` (Kp=1.75/Ki=200, -25px step) —
+  93ms rise, 2.0% overshoot, 140ms settling, matching the pre-existing
+  validated numbers closely (previously 141ms/1.1%/141ms) — confirms
+  the whole closed-loop control pipeline (DAC output, I2C telemetry,
+  PID math, `HAL_GetTick()`-based timing) survived the clock change
+  intact. Telemetry relay rate during this run averaged ~233/s, up from
+  the earlier ~135-150/s — plausibly more CPU headroom at 16MHz, not
+  confirmed further.
+
+**Practical takeaway for any future VCP scripting on this rig**: use
+paced per-character writes (~0.2-1ms/char is now enough, previously
+needed ~20ms/char) for anything that must reliably land, never a single
+burst `ser.write()` call regardless of how fast the link is configured.
+`fta_manual_control.py`'s `send()` (previously an unpaced burst) and
+`fta_closed_loop_sine_response_test_vcp.py`'s target-update loop
+(previously 20ms/char, based on the now-corrected confounded finding)
+were both updated to the new faster pacing. All host-side `FTA_BAUD`/
+`BAUD` constants raised back to 460800 to match.
+
+**Not yet done**: the actual 10-20Hz closed-loop sine test (the real
+deliverable, see the entry above) has not been re-attempted with the
+new ~38-39Hz update ceiling — better than before, but still short of
+the >=10x-oversampling guideline for the full 10-20Hz band (comfortably
+covers <=~3.5Hz, only partial coverage up to ~10Hz). An on-board
+firmware setpoint generator (`start_sine freq amplitude center`,
+proposed in the entry above) would still be the more robust long-term
+fix if full-fidelity 10-20Hz sine characterization is needed. Windows
+timer-resolution fix (`winmm.timeBeginPeriod(1)`) is only applied in
+the sine-test script so far, not the other paced-write scripts — likely
+harmless to add elsewhere but not done. Full Kp re-exploration at the
+new, much healthier command throughput hasn't been attempted (all
+tuning-pass numbers above predate this fix).
+
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 
 Frequency-domain complement to the step-response tests, motivated by the

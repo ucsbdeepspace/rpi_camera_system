@@ -72,8 +72,16 @@ from datetime import datetime, timezone
 
 import numpy as np
 
-FTA_BAUD = 115200  # camera_centroid_receiver's USART2 rate, NOT the old
-                    # "FTA Controller"'s 460800.
+FTA_BAUD = 460800  # camera_centroid_receiver's USART2 rate -- raised from
+                    # 115200 back to 460800 on 2026-08-13, now matching
+                    # the old "FTA Controller"'s rate again. Needed the
+                    # whole project's clock tree raised too (4MHz -> 16MHz
+                    # HSI) since 460800 was unreachable at 4MHz -- see
+                    # CLAUDE.md for the full story. This script's set_x/
+                    # set_y update loop still uses unpaced burst writes
+                    # (tolerable there since it's a continuous stream, not
+                    # a single must-land command -- see that loop's own
+                    # comment) and could likely go faster now too.
 
 MICRONS_PER_PIXEL = 3.0  # OV9281 pixel pitch, same constant/derivation as
                           # fta_step_response_test.py: confirmed live via

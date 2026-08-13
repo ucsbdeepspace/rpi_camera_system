@@ -84,7 +84,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-FTA_BAUD = 115200  # camera_centroid_receiver's USART2 rate.
+FTA_BAUD = 460800  # camera_centroid_receiver's USART2 rate -- raised from
+                    # 115200 back to 460800 on 2026-08-13, now matching
+                    # the old "FTA Controller"'s rate again. Needed the
+                    # whole project's clock tree raised too (4MHz -> 16MHz
+                    # HSI) since 460800 was unreachable at 4MHz -- see
+                    # CLAUDE.md for the full story.
 MICRONS_PER_PIXEL = 3.0  # OV9281 pixel pitch, same constant used throughout this project.
 
 REPLY_RE = re.compile(r"^(OK|ERR|STATUS|WARN)\b")

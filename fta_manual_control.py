@@ -46,8 +46,16 @@ import re
 import threading
 import time
 
-FTA_BAUD = 115200  # camera_centroid_receiver's USART2 rate, NOT the old
-                    # "FTA Controller"'s 460800.
+FTA_BAUD = 460800  # camera_centroid_receiver's USART2 rate -- raised from
+                    # 115200 back to 460800 on 2026-08-13, now matching
+                    # the old "FTA Controller"'s rate again. Needed the
+                    # whole project's clock tree raised too (4MHz -> 16MHz
+                    # HSI) since 460800 was unreachable at 4MHz -- see
+                    # CLAUDE.md for the full story. send() below now
+                    # paces writes (~1ms/char, confirmed 100% reliable
+                    # even under real background-thread contention) --
+                    # a single burst write, this function's original
+                    # form, is NOT reliable regardless of baud/clock.
 REPLY_RE = re.compile(r"^(OK|ERR|STATUS)\b")
 
 HELP_TEXT = """\
@@ -101,7 +109,9 @@ def send(ser, reply_q, cmd, timeout=2.0):
             reply_q.get_nowait()
         except queue.Empty:
             break
-    ser.write((cmd + "\n").encode("ascii"))
+    for ch in cmd + "\n":
+        ser.write(ch.encode("ascii"))
+        time.sleep(0.001)
     try:
         return reply_q.get(timeout=timeout)
     except queue.Empty:

@@ -56,8 +56,16 @@
 
 /* External variables --------------------------------------------------------*/
 extern I2C_HandleTypeDef hi2c1;
-extern UART_HandleTypeDef huart2;
 /* USER CODE BEGIN EV */
+
+/* huart2 is used below by USART2_IRQHandler (HAL_UART_IRQHandler(&huart2))
+ * -- declared here, inside the USER CODE block, because CubeMX doesn't
+ * generate this extern itself (USART2's interrupt is hand-added, not
+ * .ioc-tracked -- see stm32l4xx_hal_msp.c's USART2_MspInit comment) and
+ * silently DROPPED the previously-hand-added extern on the 2026-08-13
+ * clock-speed regeneration, a real compile error until put back. Inside
+ * USER CODE this time so it survives the next regeneration too. */
+extern UART_HandleTypeDef huart2;
 
 /* USER CODE END EV */
 

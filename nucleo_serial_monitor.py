@@ -23,7 +23,11 @@ import time
 import serial
 from serial.tools import list_ports
 
-BAUD = 115200
+BAUD = 460800  # raised from 115200 back to 460800 on 2026-08-13, now
+                # matching the old "FTA Controller"'s rate again -- needed
+                # the whole project's clock tree raised too (4MHz ->
+                # 16MHz HSI) since 460800 was unreachable at 4MHz; see
+                # CLAUDE.md for the full story.
 
 
 def find_stlink_port():

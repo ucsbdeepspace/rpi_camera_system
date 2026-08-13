@@ -76,16 +76,22 @@ Usage:
                         settling candidate from the 2026-08-13 tuning
                         pass -- see CLAUDE.md).
     --duration SEC      sine duration, default max(2.0, 8/freq).
-    --update-rate HZ    REQUESTED target_x update rate, default 3 -- the
-                        real achievable ceiling with reliable ~20ms/char
-                        pacing (see above), not a free choice. Requesting
-                        higher just means the per-character pacing loop
-                        itself becomes the bottleneck and the achieved
-                        rate stays ~3Hz regardless (the loop self-limits,
-                        see the "achieved update rate" it prints). >=10x
-                        --freq is recommended for a non-staircased
-                        trajectory, which in practice caps any real test
-                        with this script to well under 1Hz for now.
+    --update-rate HZ    REQUESTED target_x update rate, default 35 -- close
+                        to the real measured ceiling (~38-39 commands/s,
+                        2026-08-13, after raising the clock to 16MHz and
+                        baud to 460800) at the 0.2ms/char pacing this
+                        loop uses, not a free choice -- requesting higher
+                        just means the pacing loop itself is the
+                        bottleneck and the achieved rate stays ~38-39Hz
+                        regardless (the loop self-limits, see the
+                        "achieved update rate" it prints). >=10x --freq is
+                        recommended for a non-staircased trajectory; at
+                        this ceiling that comfortably covers freq<=3.5Hz
+                        and gives partial (not ideal, but usable) coverage
+                        up to ~10Hz -- still short of cleanly covering the
+                        full 10-20Hz disturbance band, but a ~13x
+                        improvement over the ~3Hz ceiling this project was
+                        stuck at before that fix.
     --port PORT         Nucleo VCP serial port, default auto-detect.
     --out PATH          raw (t, x, cmd_t, cmd_v) npz path -- default
                         results/fta_closed_loop_sine_response_vcp_<freq>Hz_
@@ -106,7 +112,17 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-FTA_BAUD = 115200
+FTA_BAUD = 460800  # raised from 115200 back to 460800 on 2026-08-13, now
+                    # matching the old "FTA Controller"'s rate again --
+                    # needed the whole project's clock tree raised too
+                    # (4MHz -> 16MHz HSI) since 460800 was unreachable at
+                    # 4MHz. See CLAUDE.md for the full story, including
+                    # real measured throughput at the new baud+clock: a
+                    # paced ~1ms/char write is 100% reliable even under
+                    # real multi-threaded contention (~39 commands/s), a
+                    # dramatic improvement over the ~3Hz ceiling this
+                    # module's docstring below was written against -- that
+                    # docstring's throughput numbers are now stale.
 MICRONS_PER_PIXEL = 3.0
 
 REPLY_RE = re.compile(r"^(OK|ERR|STATUS|WARN)\b")
@@ -234,7 +250,7 @@ def main():
     parser.add_argument("--kp-milli", type=int, default=1750)
     parser.add_argument("--ki-milli", type=int, default=200000)
     parser.add_argument("--duration", type=float, default=None)
-    parser.add_argument("--update-rate", type=float, default=3.0)
+    parser.add_argument("--update-rate", type=float, default=35.0)
     parser.add_argument("--port", default=None)
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
@@ -324,19 +340,24 @@ def main():
     for i in range(n_samples):
         t_cmd = i * dt_cmd
         value = round(center_px + args.amplitude_px * math.sin(w * t_cmd))
-        # 1ms/char pacing, not a raw burst -- a first real run of this
-        # script (2026-08-13) found a pure burst write lost EVERY single
-        # one of 1600 attempts at 200Hz (target_x never moved from its
-        # primed value at all), matching the burst-corruption issue found
-        # earlier this session for one-shot commands. A back-to-back
-        # reliability probe (no gap between attempts, matching this
-        # loop's real firing pattern) found 1ms/char pacing held 100%
-        # reliable (60/60), a large improvement over the ~20ms/char used
-        # for one-shot setup commands elsewhere in this file -- still
-        # paced, just much faster pacing than first assumed necessary.
+        # 0.2ms/char pacing, not a raw burst -- a raw burst write reliably
+        # loses bytes regardless of baud/clock (confirmed again after the
+        # 2026-08-13 clock+baud fix: 0% clean at true single-burst). The
+        # original version of this loop used 20ms/char based on an
+        # earlier same-day finding that turned out to be confounded by a
+        # separate bug (Windows' default ~15.6ms timer tick silently
+        # inflating every requested delay -- see main()'s
+        # winmm.timeBeginPeriod(1) call and CLAUDE.md). After raising the
+        # system clock to 16MHz and USART2 to 460800 baud (also
+        # CLAUDE.md), a real measured back-to-back reliability test found
+        # 0.1-0.5ms/char all give ~99-100% clean delivery at ~38-39
+        # commands/s (throughput plateaus there regardless of further
+        # lowering the delay -- per-write()-call overhead, not the sleep
+        # itself, is the remaining bottleneck) -- a ~13x improvement over
+        # the ~3Hz ceiling this project was stuck at before that fix.
         for ch in f"set_target_x {value}\n":
             ser.write(ch.encode("ascii"))
-            time.sleep(0.020)
+            time.sleep(0.0002)
         commanded.append((t_cmd, value))
         target_t = t0 + t_cmd + dt_cmd
         sleep_s = target_t - time.monotonic()

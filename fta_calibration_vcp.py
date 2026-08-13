@@ -58,8 +58,16 @@ from datetime import datetime, timezone
 
 import numpy as np
 
-FTA_BAUD = 115200  # camera_centroid_receiver's USART2 rate, NOT the old
-                    # "FTA Controller"'s 460800.
+FTA_BAUD = 460800  # camera_centroid_receiver's USART2 rate -- raised from
+                    # 115200 back to 460800 on 2026-08-13, now matching
+                    # the old "FTA Controller"'s rate again. Needed the
+                    # whole project's clock tree raised too (4MHz -> 16MHz
+                    # HSI) since 460800 was unreachable at 4MHz -- see
+                    # CLAUDE.md for the full story. Single-BURST writes
+                    # (one ser.write() call per command) remain unreliable
+                    # regardless of baud/clock -- pace commands (~1ms/char
+                    # or slower) for reliable delivery, matching this
+                    # project's other VCP scripts.
 
 TELEMETRY_RE = re.compile(
     r"^seq=\s*(\d+)\s+status=(\d+)\s+x=(-?\d+\.\d)\s+y=(-?\d+\.\d)\s+pkts=(\d+)\s+errs=(\d+)$")

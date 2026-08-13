@@ -44,6 +44,11 @@
 /*#define HAL_CRC_MODULE_ENABLED   */
 /*#define HAL_CRYP_MODULE_ENABLED   */
 #define HAL_DAC_MODULE_ENABLED
+/* Hand-added: DAC1/PA4/PA5/PA12 (x/y setpoint outputs + amp-enable gate)
+ * were never added to the .ioc, so a regeneration always re-comments this
+ * out -- re-enable it by hand every time, per this file's own long-
+ * standing warning near MX_DAC1_Init()'s definition in main.c. Reapplied
+ * 2026-08-13 after the clock-speed/I2C-timing regeneration. */
 /*#define HAL_DCMI_MODULE_ENABLED   */
 /*#define HAL_DMA2D_MODULE_ENABLED   */
 /*#define HAL_DFSDM_MODULE_ENABLED   */

@@ -187,9 +187,48 @@ static uint32_t g_last_control_tick = 0;
  * reception below, just at the byte level instead of the packet level
  * since VCP commands are variable-length ASCII lines, not a fixed frame. */
 static uint8_t   vcp_rx_byte;
-static char      vcp_line_buf[VCP_LINE_BUF_LEN];
-static volatile uint16_t vcp_line_len   = 0;
-static volatile uint8_t  vcp_line_ready = 0;
+
+/* Multi-line RX queue -- 2026-08-13. The original design held exactly one
+ * pending line (a single buffer + ready flag) and silently dropped any
+ * byte that arrived before the main loop drained it -- fine under the
+ * "VCP commands are low-rate, occasional laptop input" assumption this
+ * project started with, but that assumption broke once host-side test
+ * scripts started streaming commands at real rates (e.g. an attempted
+ * closed-loop sine-tracking setpoint stream) against a main loop that's
+ * also busy handling ~150-200Hz I2C telemetry -- see
+ * rpi_camera_system CLAUDE.md, "First closed-loop PID bench test" and
+ * the closed-loop sine-test entry, same date. A queue means a command
+ * that arrives while the main loop is still finishing the previous one
+ * gets buffered, not dropped, as long as the queue doesn't fill. */
+#define VCP_RX_QUEUE_DEPTH 8U
+static char              vcp_rx_queue[VCP_RX_QUEUE_DEPTH][VCP_LINE_BUF_LEN];
+static volatile uint8_t  vcp_rx_head  = 0;  /* next slot the ISR fills */
+static volatile uint8_t  vcp_rx_tail  = 0;  /* next slot the main loop drains */
+static volatile uint8_t  vcp_rx_count = 0;
+static uint16_t          vcp_cur_len  = 0;  /* length assembled so far into vcp_rx_queue[vcp_rx_head] */
+
+/* TX queue -- 2026-08-13, paired with the RX queue above. Every outbound
+ * line (heartbeat, per-packet telemetry relay, command replies) used to
+ * go through a BLOCKING HAL_UART_Transmit(..., 100) call -- with the
+ * relay print firing on every I2C packet (~150-200Hz), the main loop
+ * spent a large fraction of its time inside that blocking call, which
+ * is exactly the window during which incoming VCP command bytes could
+ * arrive and, combined with the single-pending-line RX design (now also
+ * fixed above), get corrupted or dropped. enqueue_tx() copies a message
+ * into this ring buffer (fast, no HAL call) and kicks off
+ * HAL_UART_Transmit_IT if TX is currently idle; HAL_UART_TxCpltCallback
+ * below advances the queue and starts the next message, all without the
+ * main loop ever blocking on UART transmission again. 224 bytes covers
+ * the largest message (get_status's ~220-byte reply) with a little
+ * margin. */
+#define TX_QUEUE_DEPTH   8U
+#define TX_MSG_MAX_LEN   224U
+typedef struct { char data[TX_MSG_MAX_LEN]; uint16_t len; } tx_msg_t;
+static tx_msg_t          tx_queue[TX_QUEUE_DEPTH];
+static volatile uint8_t  tx_head  = 0;  /* next slot enqueue_tx fills */
+static volatile uint8_t  tx_tail  = 0;  /* slot currently being (or about to be) transmitted */
+static volatile uint8_t  tx_count = 0;
+static volatile uint8_t  tx_busy  = 0;
 
 /* USER CODE END PV */
 
@@ -209,6 +248,7 @@ static void amp_enable(void);
 static void amp_disable(void);
 static void estop(void);
 
+static void enqueue_tx(const char *s, uint16_t len);
 static void send_line(const char *s);
 static void process_command_line(char *line);
 static void cmd_set_mode(const char *arg);
@@ -326,22 +366,29 @@ int main(void)
                                 (unsigned long)g_checksum_error_count);
         if (hb_len > 0)
         {
-          HAL_UART_Transmit(&huart2, (uint8_t *)hb_line, (uint16_t)hb_len, 100);
+          enqueue_tx(hb_line, (uint16_t)hb_len);
         }
         last_heartbeat_tick = now;
       }
     }
 
-    /* Drain one completed VCP command line per main-loop pass. Dispatch
-     * happens here, not in the UART ISR, for the same reason the beam
-     * packet print is deferred to the main loop below: keep the ISR short,
-     * no blocking HAL_UART_Transmit (used by the command handlers' replies)
-     * from interrupt context. */
-    if (vcp_line_ready)
+    /* Drain one completed VCP command line per main-loop pass -- the
+     * ISR-side queue (VCP_RX_QUEUE_DEPTH deep, see vcp_rx_queue's
+     * declaration) means there may be several more waiting; each
+     * main-loop pass drains exactly one, same as before, so a burst of
+     * queued commands drains over consecutive passes rather than a
+     * single pass blocking on all of them. Dispatch happens here, not in
+     * the UART ISR, for the same reason the beam packet print is
+     * deferred to the main loop below: keep the ISR short. Replies are
+     * enqueued (enqueue_tx), not blocking-transmitted, so a slow/backed-
+     * up TX can no longer stall command draining either. */
+    if (vcp_rx_count > 0U)
     {
-      process_command_line(vcp_line_buf);
-      vcp_line_len   = 0;
-      vcp_line_ready = 0;
+      process_command_line(vcp_rx_queue[vcp_rx_tail]);
+      vcp_rx_tail = (uint8_t)((vcp_rx_tail + 1U) % VCP_RX_QUEUE_DEPTH);
+      __disable_irq();
+      vcp_rx_count--;
+      __enable_irq();
     }
 
     if (g_new_packet_ready)
@@ -398,7 +445,7 @@ int main(void)
       }
       if (len > 0)
       {
-        HAL_UART_Transmit(&huart2, (uint8_t *)line, (uint16_t)len, 100);
+        enqueue_tx(line, (uint16_t)len);
       }
     }
     /* USER CODE END WHILE */
@@ -427,10 +474,9 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_MSI;
-  RCC_OscInitStruct.MSIState = RCC_MSI_ON;
-  RCC_OscInitStruct.MSICalibrationValue = 0;
-  RCC_OscInitStruct.MSIClockRange = RCC_MSIRANGE_6;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
@@ -441,7 +487,7 @@ void SystemClock_Config(void)
   */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_MSI;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
@@ -468,7 +514,7 @@ static void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
-  hi2c1.Init.Timing = 0x00100D14;
+  hi2c1.Init.Timing = 0x00503D58;
   hi2c1.Init.OwnAddress1 = 132;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
@@ -516,7 +562,22 @@ static void MX_USART2_UART_Init(void)
 
   /* USER CODE END USART2_Init 1 */
   huart2.Instance = USART2;
-  huart2.Init.BaudRate = 115200;
+  /* Raised from 115200 to 460800 -- 2026-08-13, now that the system clock
+   * is 16MHz (HSI, see SystemClock_Config above) instead of the original
+   * 4MHz. At 4MHz, 460800 was mathematically unreachable (max ~250,000
+   * at 16x oversampling) and the firmware silently hung in Error_Handler
+   * before ever booting -- confirmed directly, not assumed, on a first
+   * attempt. At 16MHz there's ample margin (16MHz/(16x460800)=2.17, a
+   * valid divisor with room to spare) -- matches the old "FTA Controller"
+   * firmware's rate again, restoring real command headroom against the
+   * ~150-200Hz telemetry relay traffic sharing this same wire (see
+   * rpi_camera_system CLAUDE.md for the full bandwidth-budget math: at
+   * 115200 baud the relay print alone left room for only ~266 command
+   * bytes/s no matter how good the firmware's buffering was). Not
+   * tracked in the .ioc (same situation as the DAC1/USART2-interrupt
+   * settings noted elsewhere in this file) -- reapply by hand if this
+   * project is ever regenerated again. */
+  huart2.Init.BaudRate = 460800;
   huart2.Init.WordLength = UART_WORDLENGTH_8B;
   huart2.Init.StopBits = UART_STOPBITS_1;
   huart2.Init.Parity = UART_PARITY_NONE;
@@ -828,9 +889,51 @@ static void estop(void)
 
 /* --- VCP command link ----------------------------------------------------- */
 
+/* Copies s into the TX ring buffer and starts transmitting immediately if
+ * nothing else is currently in flight -- never blocks. Truncates (rather
+ * than drops) an oversized message, and drops the whole message if the
+ * queue itself is full (only expected under sustained flooding well past
+ * anything this firmware's own message rate produces -- heartbeat 1Hz +
+ * relay ~150-200Hz + occasional command replies, comfortably inside an
+ * 8-deep queue drained every main-loop pass). Only ever called from main-
+ * loop context (never from ISR context -- estop(), the only ISR-level
+ * caller of anything in this file, doesn't send), so the brief
+ * __disable_irq() here only needs to guard against HAL_UART_TxCpltCallback
+ * running concurrently, not true reentrancy. */
+static void enqueue_tx(const char *s, uint16_t len)
+{
+  uint8_t need_kick = 0;
+
+  if (len >= TX_MSG_MAX_LEN)
+  {
+    len = TX_MSG_MAX_LEN - 1U;
+  }
+
+  __disable_irq();
+  if (tx_count < TX_QUEUE_DEPTH)
+  {
+    memcpy(tx_queue[tx_head].data, s, len);
+    tx_queue[tx_head].len = len;
+    tx_head = (uint8_t)((tx_head + 1U) % TX_QUEUE_DEPTH);
+    tx_count++;
+    if (!tx_busy)
+    {
+      tx_busy = 1;
+      need_kick = 1;
+    }
+  }
+  /* else: TX queue full, message dropped -- see docstring above. */
+  __enable_irq();
+
+  if (need_kick)
+  {
+    HAL_UART_Transmit_IT(&huart2, (uint8_t *)tx_queue[tx_tail].data, tx_queue[tx_tail].len);
+  }
+}
+
 static void send_line(const char *s)
 {
-  HAL_UART_Transmit(&huart2, (const uint8_t *)s, (uint16_t)strlen(s), 100);
+  enqueue_tx(s, (uint16_t)strlen(s));
 }
 
 /* line is NUL-terminated, no trailing \r/\n (stripped by the ISR before
@@ -1172,7 +1275,7 @@ static void cmd_get_status(void)
   }
   if (len > 0)
   {
-    HAL_UART_Transmit(&huart2, (uint8_t *)line, (uint16_t)len, 100);
+    enqueue_tx(line, (uint16_t)len);
   }
 }
 
@@ -1190,23 +1293,31 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     }
     else if (c == '\r' || c == '\n')
     {
-      if ((vcp_line_len > 0U) && !vcp_line_ready)
+      if ((vcp_cur_len > 0U) && (vcp_rx_count < VCP_RX_QUEUE_DEPTH))
       {
-        vcp_line_buf[vcp_line_len] = '\0';
-        vcp_line_ready = 1;
+        vcp_rx_queue[vcp_rx_head][vcp_cur_len] = '\0';
+        vcp_rx_head = (uint8_t)((vcp_rx_head + 1U) % VCP_RX_QUEUE_DEPTH);
+        vcp_rx_count++;
+        vcp_cur_len = 0U;
+      }
+      else if (vcp_cur_len > 0U)
+      {
+        /* Queue is full (8 unprocessed lines already waiting) -- drop this
+         * completed line rather than overrun the ring buffer. Only
+         * expected under sustained flooding well past anything this
+         * firmware's command set is used for; reset assembly so the next
+         * line starts clean instead of concatenating onto a dropped one. */
+        vcp_cur_len = 0U;
       }
       /* A bare \n with nothing buffered (blank line, or the \n half of a
-       * \r\n pair whose \r already triggered ready) is silently ignored --
-       * vcp_line_len is only reset once the main loop drains the line. */
+       * \r\n pair whose \r already queued the line) is silently ignored. */
     }
-    else if (!vcp_line_ready && (vcp_line_len < (VCP_LINE_BUF_LEN - 1U)))
+    else if (vcp_cur_len < (VCP_LINE_BUF_LEN - 1U))
     {
-      vcp_line_buf[vcp_line_len++] = (char)c;
+      vcp_rx_queue[vcp_rx_head][vcp_cur_len++] = (char)c;
     }
-    /* else: line too long, or the previous line hasn't been drained by the
-     * main loop yet -- drop the byte rather than overrun/overwrite a
-     * pending line. VCP commands are low-rate (occasional laptop input),
-     * not a hot path, so this is not expected to matter in practice. */
+    /* else: single line too long (>VCP_LINE_BUF_LEN) -- drop the byte,
+     * same as the original design; not related to the queue-depth fix. */
 
     HAL_UART_Receive_IT(&huart2, &vcp_rx_byte, 1);
   }
@@ -1219,6 +1330,31 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
     /* Same re-arm-after-any-error rationale as HAL_I2C_ErrorCallback
      * above. */
     HAL_UART_Receive_IT(&huart2, &vcp_rx_byte, 1);
+  }
+}
+
+/* Fires once the current interrupt-driven transmit (started by
+ * enqueue_tx) completes. Advances the TX queue and starts the next
+ * message if one is waiting, otherwise clears tx_busy so the next
+ * enqueue_tx call kicks off a fresh transmit. This callback is what
+ * makes every send in this file non-blocking -- see enqueue_tx's
+ * docstring for why that matters (it's what used to let a relay-print
+ * transmit stall the main loop long enough to corrupt/drop incoming VCP
+ * command bytes). */
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART2)
+  {
+    tx_tail = (uint8_t)((tx_tail + 1U) % TX_QUEUE_DEPTH);
+    tx_count--;
+    if (tx_count > 0U)
+    {
+      HAL_UART_Transmit_IT(&huart2, (uint8_t *)tx_queue[tx_tail].data, tx_queue[tx_tail].len);
+    }
+    else
+    {
+      tx_busy = 0;
+    }
   }
 }
 
