@@ -2530,6 +2530,85 @@ this script (only the -25px convention used all session); closed-loop
 sine tracking across 5-20Hz — the actual next planned step per the prior
 entry — not started.
 
+### Real tuning pass with the new step-response script — 1000ms settling was the control loop under-using Ki, not a plant limit; a real correction to the earlier "no overshoot up to 300" claim (2026-08-13, same day)
+
+Prompted by the user asking, reasonably, why 1000ms settling (the
+`fta_closed_loop_step_response_vcp.py` baseline result above) wasn't
+"absurdly slow" given the project's actual 10-20Hz disturbance target (a
+50-100ms period). Root cause, worked out from numbers already on record
+before touching hardware: Kp=1.75 counts/px was never really tuned — it
+was a conservative guess from very early in this session, before the
+2048 operating point or its local gain (~0.09 px/count, from the
+minor-loop check) even existed. A Kp matched to that gain would be
+`1/0.09 ≈ 11 counts/px`; at the actual Kp=1.75, the P-term only ever
+supplies about 16% of the correction a 25px step needs (`1.75×25≈44`
+counts vs. the `≈278` counts the plant actually needs) — the rest has to
+come from the slow-accumulating Ki term, which is why the response was a
+gradual, Ki-dominated S-curve rather than a fast P-driven jump.
+
+**Escalated Kp and Ki together using the new script, comparing real
+plotted results (not the earlier interactive polling):**
+
+| Kp (counts/px) | Ki (counts/px/s) | rise | overshoot | settling | shape |
+|---|---|---|---|---|---|
+| 1.75 | 30 | 891ms | 0.4% | 1000ms | clean, slow (the original baseline) |
+| 5.0 | 30 | 984ms | 1.1% | 1125ms | visible ringing, **not faster** |
+| 1.75 | 100 | 234ms | 1.4% | 265ms | clean |
+| 5.0 | 100 | 16ms | 10.2% | 375ms | real ringing |
+| **1.75** | **200** | **141ms** | **1.1%** | **141ms** | **clean, single transition** |
+| 1.75 | 400 | 32ms | 15.1% | 63ms | real, visible oscillation |
+
+**Finding 1 — Ki was the actual bottleneck the whole session, not Kp.**
+Raising Kp alone (5.0 vs. 1.75, same Ki=30) made the response worse, not
+better: real oscillatory ringing appeared right at the step, but overall
+settling barely changed (1125ms vs. 1000ms) — because Ki's own
+accumulation rate, unchanged, still dominated the slow tail. Raising Ki
+alone (same Kp=1.75) is what actually worked: 30→100→200 took settling
+from 1000ms→265ms→141ms, each time staying clean with no visible
+ringing. **Chosen going forward: Kp=1.75 (unchanged), Ki=200** — a ~7x
+speedup from the original baseline, still a single clean transition, and
+comfortably below where Ki itself starts causing real overshoot (see
+Finding 2). Set as this script's new default.
+
+**Finding 2 — a real, useful correction to the earlier interactive Ki
+escalation search** ("Ki escalation search at dac_y=2048," earlier this
+same day): that search's headline claim — no overshoot found up to
+Ki=300, 200x the first working value — does not hold up against this
+script's higher-resolution data. That search polled `get_status` at only
+~3-4Hz (every ~250-300ms); this script logs the full ~135Hz telemetry
+relay stream. At Ki=400, this script found clear, real oscillatory
+ringing (15.1% overshoot, visible in the plot as several damped bounces)
+— a transient happening on a ~30-60ms timescale that a ~250-300ms
+polling interval cannot resolve at all (well below Nyquist for that
+signal). **The earlier "no overshoot" conclusion was very likely a
+measurement-resolution artifact, not a real absence of overshoot** — it's
+plausible real (smaller) overshoot was already present at some of the
+values between 80-300 that search called clean, just never visible at
+that sample rate. The earlier entry's *mechanism* explanation (the
+anti-windup clamp bounds the integral's total possible contribution to a
+fixed ceiling) is still correct as far as it goes, but is now known to be
+incomplete: it bounds the final settled contribution, not how fast the
+integral state can swing on the way there, and that swing rate is
+exactly what interacts with real plant lag to produce the overshoot seen
+here. **Practical lesson**: don't trust an overshoot/stability
+conclusion from a control-loop test sampled far slower than the
+loop itself runs — this is exactly why `fta_closed_loop_step_response_vcp.py`
+was built logging the real telemetry rate instead of polling
+`get_status` in the first place, and it's already paid for itself.
+
+**Not yet done**: the true Ki overshoot boundary is only bracketed
+(clean at 200, real ringing at 400), not precisely located; Kp was only
+tried at one elevated value (5.0) combined with two Ki values — a
+proper 2D sweep (Kp × Ki) has not been done; only the -25px step
+direction and dac_y=2048 operating point have been characterized under
+this rigorous method; closed-loop sine tracking across 5-20Hz (the
+actual disturbance-band deliverable) still hasn't been attempted with
+any of these gain choices. Result files:
+`results/fta_closed_loop_step_response_vcp_kp{5000,1750}_ki{30000,100000,200000,400000}.{npz,png}`
+(a subset also uses the bare `_kp5000.npz`/`.png` naming from the first
+Kp-only trial) — not all committed as of this entry, only the original
+baseline run was.
+
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 
 Frequency-domain complement to the step-response tests, motivated by the

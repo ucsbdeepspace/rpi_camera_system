@@ -18,10 +18,18 @@ defaults are built on:
   - dac_y=2048 is the cleanest, most linear region found on this rig this
     session (minor-loop hysteresis gap ~0.04px, consistent slope both
     directions) -- default --base-dac-y.
-  - Kp=1.75 counts/px, Ki=30 counts/(px*s) converge cleanly with no
-    overshoot in ~1-1.5s at this operating point (an escalation search up
-    to Ki=300 never found an overshoot point at all, see CLAUDE.md) --
-    default --kp-milli/--ki-milli.
+  - Kp=1.75 counts/px, Ki=200 counts/(px*s) give a clean, single-
+    transition step response in ~141ms (rise and settling both), used as
+    this script's own first real result. An EARLIER interactive escalation
+    search (crude ~3-4Hz terminal polling, not this script) claimed no
+    overshoot existed up to Ki=300 -- that claim turned out to be a
+    measurement-resolution artifact, not a real absence of overshoot: this
+    script's own high-rate (~135Hz) logging found real, visible ringing at
+    Ki=400 (15% overshoot), and the interactive search's polling rate was
+    too slow to resolve oscillation on that timescale. Raising Kp instead
+    of Ki was tried and made things WORSE (more ringing, no faster
+    settling) -- Ki was the actual bottleneck the whole time, not Kp.
+    See CLAUDE.md for the full comparison table.
   - A single ser.write() burst of a whole VCP command line reliably loses
     bytes at the Pi's current high telemetry rate (~150-200Hz) -- every
     SETUP command here is sent via send_command(), which paces the write
@@ -47,7 +55,7 @@ Usage:
                         elsewhere -- large steps haven't been
                         characterized for this control pathway).
     --kp-milli N        Kp * 1000 (firmware's own units), default 1750.
-    --ki-milli N        Ki * 1000, default 30000.
+    --ki-milli N        Ki * 1000, default 200000.
     --pre-s SEC         seconds recorded BEFORE the step, holding at
                         target=baseline under closed-loop control (not
                         open-loop -- this captures the loop's own hold
@@ -250,7 +258,7 @@ def main():
     parser.add_argument("--base-dac-y", type=int, default=2048)
     parser.add_argument("--step-px", type=float, default=-25.0)
     parser.add_argument("--kp-milli", type=int, default=1750)
-    parser.add_argument("--ki-milli", type=int, default=30000)
+    parser.add_argument("--ki-milli", type=int, default=200000)
     parser.add_argument("--pre-s", type=float, default=0.5)
     parser.add_argument("--post-s", type=float, default=3.0)
     parser.add_argument("--settle-tol-px", type=float, default=2.0)
