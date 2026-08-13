@@ -2282,6 +2282,88 @@ at a few points across the range, instead of one big monotonic pass each
 direction, to directly measure minor-loop width where real control
 actually has to operate.
 
+### Minor-loop hysteresis measured — tight and correctly-signed everywhere checked; a well-behaved operating point found near mid-range (dac_y≈2048); first real PI convergence, including a target reversal (2026-08-13, same day)
+
+Ran the recommended diagnostic from above: at four base points (200,
+300, 400, 500), traced a small closed loop (`base` → `base-20` →
+`base` → `base+20` → `base`, ~40 telemetry samples averaged per
+reading, same paced-write approach as the rest of this session) and
+compared `cx` arriving at `base` via a small ascend vs. a small descend.
+**Minor-loop gap was under 1px at every point** (500: -0.84px, 400:
+-0.37px, 300: -0.38px, 200: -0.25px), with every leg moving in the
+*correct, consistent* direction — a dramatic contrast with the ~10-25px
+major-loop gap found earlier. This is the standard "minor loop much
+tighter than major loop" signature of real mechanical hysteresis, and it
+directly answers the open question above: **small bidirectional
+corrections behave close to linearly away from the DAC floor, so the
+major-loop hysteresis does not look like a fundamental blocker for real
+disturbance rejection** — as long as the controller's operating point
+stays clear of the floor's U-shaped region (roughly below `dac_y≈200`).
+
+**Extended to a completely unexplored region: dac_y≈2048** (middle of
+the full DAC range — every prior test this session, calibration or
+control, stayed inside 95-600). Same minor-loop technique at base=2048,
+delta=40: gap **+0.04px** — essentially zero — with consistent slopes on
+both legs (down: +0.0786 px/count, up: +0.0981 px/count). This is the
+cleanest, most linear region found anywhere in this session.
+
+**Bidirectional closed-loop test at dac_y=2048, P-only (Kp=1.75
+counts/px, Ki=0)** — the first test this session to require the
+controller to correct in *both* directions rather than approach a target
+from one consistent side. Pre-positioned to 2048, set a target 25px
+below baseline: `dac_y` moved 2048→2009 and held there, error settling
+at a constant -22.4px. Then flipped the target to 25px *above* baseline
+while still in `closed_loop` (no mode toggle, no re-bias): `dac_y`
+immediately reversed direction, 2009→2083, holding steady at +20.0px.
+No oscillation, no overshoot, no divergence, no clamp — the reversal was
+handled correctly and immediately. The steady, non-zero residual in both
+phases isn't a hysteresis artifact: it's the textbook P-only
+steady-state offset, and the numbers confirm it exactly
+(`dac_y = base(2048) + Kp×error`, e.g. `2009 = 2048 + 1.75×(-22.3)`) —
+expected with `Ki=0`, not evidence of anything wrong with the plant.
+
+**Added a conservative `Ki` (0.5 counts/(px·s), `set_ki 500`) and
+re-ran the identical bidirectional test, 14s per phase.** Real PI
+behavior this time — error decayed **monotonically and without
+oscillation** in both directions instead of sitting at a flat P-only
+equilibrium: phase 1 (target below) went from -22.6px to -12.5px over
+14s; after the reversal, phase 2 (target above) went from +31.3px to
++17.4px over 14s. `dac_y` moved smoothly the whole time (1908→2121
+across both phases), no sign-flip/overshoot observed in either phase, no
+divergence, no clamp. Neither phase fully reached the <3px convergence
+threshold within the 14s window — the conservative Ki was deliberately
+slow — but the decay is clean and monotonic in both directions, which is
+the real result: **this is the first genuinely-working bidirectional PI
+closed-loop behavior in this project**, not just a one-way approach like
+every earlier successful run this session.
+
+**State left**: hardware safely idle (`mode=open_loop amp=0 estop=0
+dac_x=95 dac_y=95`). Firmware's live `kp_milli=1750`/`ki_milli=500`
+persist in RAM (not flash) until the next boot or explicit change — a
+fresh flash or power cycle resets them to 0.
+
+**Not yet done**:
+1. Full convergence to <3px wasn't confirmed within the tested window —
+   would need either a longer run or a larger Ki to actually watch it
+   settle, not just trend toward zero.
+2. Kp itself (1.75 counts/px) is low relative to the measured local
+   plant gain at 2048 (~0.09 px/count → a matching P-only Kp would be
+   roughly 11 counts/px) — likely could be raised substantially now that
+   a clean, linear region is confirmed there, for much faster response.
+   Not tried yet.
+3. Only the `dac_y`→`cx` pairing and only step/quasi-static setpoints
+   have been tested. No dynamic-bandwidth validation (sine tracking,
+   10-20Hz) has been done against this new PI implementation — everything
+   above is slow step-response behavior, not a real disturbance-rejection
+   demonstration yet.
+4. Regions other than 95-600 and the immediate neighborhood of 2048
+   remain uncharacterized — no claim is made about anywhere else in the
+   full [95,4000] range.
+5. Scratchpad-only scripts this session (minor-loop check, 2048 checks,
+   both closed-loop tests) are not committed — worth turning into a real
+   committed tool if this hysteresis-aware operating strategy is kept
+   long-term.
+
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 
 Frequency-domain complement to the step-response tests, motivated by the
