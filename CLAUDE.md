@@ -1995,6 +1995,57 @@ actively misleading for this calibration since the real per-axis signal
 now lives almost entirely in the *other* pixel axis; use the grid-mesh
 plot instead when checking alignment quality going forward.
 
+### Optics locked down, final reference calibration taken, first control axis chosen and sine-checked (2026-08-12)
+
+Final grid sweep (`results/fta_calibration_vcp_final.npz`, same fixed
+script/full-frame/long-dwell protocol) after locking the optics down —
+matrix confirms the same near-anti-diagonal mapping as the last
+recollimation check, consistent/stable: `dac_y`'s effect on `cx` is
+**+0.126 px/count, the single largest coefficient in the matrix** (vs.
+-0.007 for `dac_x`→`cx`, -0.104 for `dac_x`→`cy`, +0.006 for
+`dac_y`→`cy`). Determinant 0.0131, clean evenly-spaced grid mesh
+(`results/fta_calibration_grid_mesh_final.png`), both axes' travel
+consistent across the full range (no saturation).
+
+**Chosen first control axis: `dac_y` → `cx`** (actuator's Y drives the
+camera's X), matching this coefficient and the plan to start with 1D
+PID. Sine-checked at amplitude 400 (the amplitude previously found to
+avoid the small-signal threshold nonlinearity), 5/10/15/20Hz, gain-sign
+fixed to +1.0 (`fta_sine_response_test_vcp.py --axis y`, since this
+pathway's sign is positive — opposite the old axis-x default of -1.0 that
+every prior sine test used, so `--gain-sign` must be passed explicitly
+now). Driving `dac_y` moves `cy` (the "driven" axis in the script's own
+terminology) almost not at all (+0.5-3.4px) while moving `cx` (the
+"cross-coupled" axis) strongly — confirms the pathway is clean:
+
+| freq | true displacement magnitude | direction (0°=pure camera-x) |
+|---|---|---|
+| 5Hz | 29.0px | 1.0° |
+| 10Hz | 24.6px | 3.2° |
+| 15Hz | 19.1px | 6.4° |
+| 20Hz | 19.4px | 10.0° (only 100 telemetry samples this run, script's own low-sample-count warning fired — lower confidence than the other three) |
+
+Only a mild rolloff across the whole 5-20Hz band (not the severe
+small-amplitude collapse found earlier at amp=200) and the signal is
+still strong at 20Hz — this pathway looks usable for the actual
+disturbance-rejection target band. Direction drifting from ~1° to ~10°
+with frequency is a small, secondary effect (likely relative timing
+skew between how `cx`/`cy` get sampled/fitted, not a real alignment
+problem) — worth a closer look eventually but not blocking.
+
+Raw data: `results/fta_sine_response_vcp_y_check2Hz.npz`,
+`results/fta_sine_response_vcp_y_final_{5,10,15,20}Hz.npz`.
+
+**Next step**: implement the actual PID loop on the Nucleo (`cmd_set_mode`'s
+`closed_loop` branch is currently a deliberate stub, `ERR closed_loop not
+yet implemented` — nothing PID-related exists in firmware yet: no
+setpoint command, no gain storage, no control loop). Plan: single axis
+first (`dac_y` against a `cx` pixel setpoint), add a setpoint command +
+live-tunable Kp/Ki + the loop itself + a telemetry-staleness fail-safe,
+bench-test with a step setpoint before a sine setpoint, then work up to
+10-20Hz. See the assistant's response in-session (2026-08-12) for the
+fuller architecture writeup if picking this up fresh.
+
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 
 Frequency-domain complement to the step-response tests, motivated by the
