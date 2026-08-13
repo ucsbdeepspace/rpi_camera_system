@@ -2434,6 +2434,102 @@ project's own established methodology (see "PI control law designed,"
 2026-07-23: step-response dynamics before sine, same logic applied here
 to the closed loop instead of the open-loop plant).
 
+### `fta_closed_loop_step_response_vcp.py` built and committed — real closed-loop step-response data, plus two real analysis bugs found and fixed (2026-08-13, same day)
+
+Built the closed-loop equivalent of `fta_step_response_test_vcp.py`:
+pre-positions to `--base-dac-y` (default 2048, this session's cleanest
+region), primes `target_x` to baseline (zero-error hold), engages
+`closed_loop`, records via the same telemetry-relay reader-thread pattern
+as the open-loop script, steps `target_x` by `--step-px` (default -25),
+records `--post-s` more, then computes rise time / overshoot / settling
+time via a (fixed, see below) `analyze_step` and saves both a raw
+`results/*.npz` and a plot.
+
+**Every setup command uses the paced-write fix from earlier in this
+session** (`send_command`, ~20ms/char) rather than a single burst —
+necessary given the demonstrated corruption risk under the Pi's current
+telemetry rate. **The measured step itself does NOT use a bare burst
+write either, and this mattered on the very first live run**: an initial
+version sent the step as one `ser.write()` burst (to preserve precise
+step-onset timing the way the open-loop script does) and added a
+post-recording `get_status` check to verify `target_x` actually changed
+as a safety net. First real run: the safety net fired for real — the
+burst-written step command silently lost bytes, `target_x` never
+changed, and the "run" was just 3.5s of flat noise. Not a hypothetical
+risk once again, a real failure on the first try. Fixed by pacing the
+step command's write too (still not reading a reply during it, to avoid
+racing the reader thread's exclusive `ser.readline()` for the whole
+recording window — `t_step` is stamped after the last character is sent,
+not after a confirmed reply). Rerun immediately after: `target_x`
+verified correct, clean data. **Practical lesson for any future VCP
+scripting on this rig**: pace every write, including one-off "the thing
+being measured" commands, not just interactive setup commands — a burst
+write is not safe here even for a single carefully-timed send.
+
+**Second real bug, found from the data itself, not anticipated:** the
+very first paced-step run reported "rise time: could not be determined"
+despite clearly-real, clean-looking data (delta -25.9px, 0% overshoot,
+settling in ~1015ms). Traced to `analyze_step`'s `first_crossing` helper
+— duplicated from `fta_step_response_test_vcp.py`'s own version, which
+conditionally flips the crossing comparison (`frac >= target` vs.
+`frac <= target`) based on whether `delta` is positive or negative. That
+conditional is wrong: `frac = (v - baseline) / delta` is already
+sign-normalized by the division, so it climbs 0→1 as the signal moves
+from baseline to final **regardless of whether the raw value is rising
+or falling** (hand-verified with a synthetic example, and against this
+script's own real falling-step data). With the old conditional, any
+falling step (every closed-loop test this session steps in the negative
+direction) has `first_crossing(0.90)` triggering on the very first
+post-step sample — any frac below 0.90, including near-zero opening
+noise, satisfies `frac <= 0.90` — landing `t90` before `t10` and hitting
+the `t90 >= t10` guard, silently returning `None` every time. **Same
+root issue affects the overshoot calculation** (`-np.min(frac)` for
+`delta<0` measures something unrelated to the real peak and could
+silently under-report real overshoot) — fixed the same way, to a plain
+`np.max(frac)` in both cases. Both fixes only changed `first_crossing`
+and the overshoot line; baseline/final/settling-time logic was already
+correct and untouched. **This same latent bug likely exists in
+`fta_step_response_test_vcp.py` and `fta_step_response_test.py`**
+(neither has been patched — out of scope for this entry, but worth
+knowing: any of their historical "rise time unresolved" results for a
+falling/negative step should be treated as possibly this bug, not
+necessarily the "detection confidence gate drops fast frames" explanation
+recorded elsewhere in this file for the open-loop tests. The two
+explanations aren't mutually exclusive and haven't been distinguished).
+
+**Real closed-loop step-response numbers, Kp=1.75/Ki=30, -25px step at
+dac_y=2048** (`results/fta_closed_loop_step_response_vcp_20260813T214602Z.{npz,png}`):
+
+| metric | value |
+|---|---|
+| rise time (10-90%) | 891ms |
+| overshoot | 0.4% (noise-level) |
+| settling time (within 2px / 6µm) | 1000ms |
+
+Clean single S-curve in the plot, no ringing, no oscillation — matches
+the qualitative behavior from the interactive Ki-escalation search
+earlier this session. **Worth flagging**: this closed-loop settling time
+(~1000ms) is noticeably *slower* than the open-loop plant's own
+small-step settling times measured much earlier in this project
+(45-470ms, "PI control law designed" section, 2026-07-23) — consistent
+with the already-noted observation that Kp=1.75 is likely well below
+what this plant could actually support at 2048 (~11 counts/px would
+match the measured local gain there, vs. the 1.75 used throughout this
+session) — the control loop itself, not the actuator, is the current
+speed bottleneck. Kp has still never been increased from its original
+value; that's the natural next lever now that a real quantified baseline
+exists to compare against.
+
+**State left**: hardware safely idle. Script committed at repo root
+(`fta_closed_loop_step_response_vcp.py`), results committed
+(`results/fta_closed_loop_step_response_vcp_20260813T214602Z.{npz,png}`).
+
+**Not yet done**: Kp untried at higher values (see above); no repeats
+for statistical confidence (n=1); positive-direction steps untested with
+this script (only the -25px convention used all session); closed-loop
+sine tracking across 5-20Hz — the actual next planned step per the prior
+entry — not started.
+
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 
 Frequency-domain complement to the step-response tests, motivated by the
