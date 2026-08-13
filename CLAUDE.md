@@ -2036,6 +2036,41 @@ problem) — worth a closer look eventually but not blocking.
 Raw data: `results/fta_sine_response_vcp_y_check2Hz.npz`,
 `results/fta_sine_response_vcp_y_final_{5,10,15,20}Hz.npz`.
 
+**Re-run at full ROI telemetry rate — the full-frame numbers above were
+degraded, superseded** (2026-08-12): the above sine check ran while the
+Pi's camera was still in full-frame mode (left over from the final
+calibration sweep, which needed the wide FOV). Full sensor detection is
+known-slow (see "fps root-cause" section below: ~45fps at full sensor
+vs. ~527fps binned/windowed) and the 20Hz run above had already thrown
+the script's own low-sample-count warning — a real red flag. Switched
+the Pi back to `camera_view_tool.py`'s own default fast mode
+(`640x200`, one `h` keypress) and confirmed the improvement directly
+from the Nucleo's own relay counter before re-testing: `pkts` delta
+over 2s went from full-frame's effective ~45-50Hz to **~207Hz**,
+`tel_age_ms` staying at 0-10ms.
+
+Re-ran the same 5/10/15/20Hz / amplitude-400 sweep
+(`results/fta_sine_response_vcp_y_roi_{5,10,15,20}Hz.npz`) — materially
+different, more trustworthy result:
+
+| freq | true displacement magnitude | direction (0°=pure camera-x) |
+|---|---|---|
+| 5Hz | 26.8px | 0.9° |
+| 10Hz | 26.5px | 1.1° |
+| 15Hz | 24.5px | 0.1° |
+| 20Hz | 33.8px | 0.5° |
+
+Direction now stays pinned to ~0-1° at every frequency (vs. drifting
+1°→10° in the degraded full-frame run — that drift was a sampling
+artifact, not a real alignment effect). Magnitude is roughly flat
+5-15Hz then **rises** at 20Hz rather than declining — consistent with
+the resonance/anti-resonance behavior already found on the old axis-x
+pathway (see "fine 3-12Hz sweep" section below), not the full-frame
+run's misleading monotonic-rolloff shape. No low-sample-count warning
+this time. **Treat the full-frame numbers in the section above as
+superseded by this table** — kept for the record, not as the reference
+data going forward.
+
 **Next step**: implement the actual PID loop on the Nucleo (`cmd_set_mode`'s
 `closed_loop` branch is currently a deliberate stub, `ERR closed_loop not
 yet implemented` — nothing PID-related exists in firmware yet: no
