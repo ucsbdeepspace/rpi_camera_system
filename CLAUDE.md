@@ -2706,6 +2706,106 @@ fixed at 1.75/3.5/5.0 for the Ki searches); closed-loop sine tracking
 across 5-20Hz — the real deliverable — still not attempted with either
 candidate gain set.
 
+### Closed-loop sine test attempted — hit a real, hard VCP throughput ceiling (~3Hz) that blocks any real 10-20Hz characterization; root cause chain untangled but not fixed (2026-08-13, same day)
+
+Built `fta_closed_loop_sine_response_test_vcp.py`: the closed-loop analog
+of the open-loop `fta_sine_response_test_vcp.py`, driving `target_x`
+(pixels) through a sinusoid instead of a raw DAC value, and fitting the
+measured `cx` against the known-frequency reference. The rationale for
+why this measures disturbance rejection at all (not just tracking): for
+a unity-feedback loop, reference-tracking T(s) and disturbance-rejection
+sensitivity S(s) are complementary, S+T=1 — good tracking of a moving
+target_x at some frequency directly implies good rejection of a real
+disturbance there. This is the actual project deliverable.
+
+**First real run (1Hz, 200Hz requested update rate, fire-and-forget
+bursts like the open-loop script uses): tracking gain came back exactly
+0.000.** Checked `target_x` via `get_status` after the run — it was
+still sitting at its original primed value, unchanged. **100% of 1600
+attempted `set_target_x` updates were silently dropped** — not a tuning
+problem, the setpoint never moved from its starting value for the entire
+8s recording. This is a much more severe version of the burst-write
+corruption already found earlier this session (see "First closed-loop
+PID bench test," which needed ~20ms/char pacing to reliably land a
+single one-shot command) — here EVERY attempt failed, most likely
+because 200Hz fire-and-forget also collides with the firmware's
+one-pending-line VCP buffer (a new command's bytes arriving before the
+previous line's reply has been drained get silently dropped, a
+mechanism already documented in this file's 2026-08-12 fix to
+`fta_calibration_vcp.py`), not just the timing-critical-section race the
+20ms/char fix was built for.
+
+**Switched to per-character pacing (matching the 20ms/char approach used
+for one-shot commands) and immediately hit a second, confounding bug,
+independent of the firmware entirely: Windows' default ~15.6ms timer
+tick.** Measured directly: `time.sleep(0.001)` (intended: 1ms) actually
+took ~15.6ms on this machine — a 15x inflation. This means an earlier
+same-day reliability probe (in "First closed-loop PID bench test") that
+seemed to show 1ms/char pacing was just as reliable as 20ms/char was
+**comparing two settings that were secretly running at the same real
+delay the whole time** — that probe's conclusion needs the same kind of
+asterisk as the Ki-escalation "no overshoot" claim corrected earlier
+this session: not wrong about what it measured, wrong about what it
+thought it was varying. Fixed with `winmm.timeBeginPeriod(1)` (a
+standard Windows high-resolution-timer request, wrapped in `atexit` so
+it's restored on every exit path) — confirmed directly, this dropped
+`sleep(0.001)`'s real duration to ~1.5ms, a genuine ~10x improvement.
+
+**With the timer fix in place and pacing now genuinely fast, reliability
+collapsed again** — 1.5ms/char (now real) landed only 0.2% of attempts
+in the actual sine-loop context, even though an ISOLATED single-threaded
+probe at the same delay measured 100% reliable (60/60). The likely
+difference: the sine script runs a concurrent background reader thread
+draining telemetry throughout the update loop, and that thread appears
+to introduce enough GIL/scheduler jitter to reintroduce the
+critical-section race that isolated single-threaded pacing doesn't
+suffer from. Escalated pacing empirically in the real multi-threaded
+context: 4ms/char reached only 14.5% applied; **the only pacing that
+reproduced this whole session's proven 100% reliability was the original
+~20ms/char**, which caps real achievable `target_x` updates at **~3Hz**
+(a ~17-character `set_target_x N` line takes ~340ms to send paced).
+
+**Practical conclusion: ~3Hz is nowhere near enough to trace a valid
+sine anywhere close to the project's actual target.** Confirmed
+empirically, not just by the math (10x-oversampling would need ~10Hz for
+a 1Hz test, itself 30x short of the real 10-20Hz band): a 1Hz test at
+the honest 3Hz update ceiling produced a coarse triangle wave, not a
+sine — visible directly in the plot
+(`results/fta_closed_loop_sine_response_vcp_1Hz_20260813T222143Z.png`)
+— and the real closed-loop response visibly saturates against that
+triangle rather than tracking a clean sinusoid, an encouraging sign the
+control loop itself is responding correctly, but not usable frequency-
+response data. Fitted gain/lag numbers from this run (27.5%, -35.5ms)
+should not be trusted as real closed-loop tracking-gain/phase-lag
+measurements — they're an artifact of fitting a sine model against a
+trajectory that was never actually sinusoidal.
+
+**This is a real architectural blocker, not a parameter to keep
+tuning.** The current design — the laptop streaming individual
+`set_target_x` VCP commands to trace the disturbance waveform — cannot
+reliably exceed ~3 commands/second under the Pi's current telemetry
+load, regardless of pacing strategy tried. Real options, not yet
+decided:
+1. **Most likely the real fix**: give the firmware an on-board sine (or
+   general trajectory) generator — a new command like
+   `start_sine freq amplitude center` that has the Nucleo itself compute
+   the moving setpoint every control tick, eliminating the need for
+   ~150+ host commands/second entirely. This is genuine new firmware
+   work, not yet designed or attempted.
+2. Investigate whether the Pi's telemetry rate could be reduced for this
+   specific test (lower packet rate might leave more main-loop headroom
+   for servicing VCP commands) — not controllable from this laptop-only
+   session, would need Pi access.
+3. Accept the ~3Hz ceiling and only characterize frequencies low enough
+   for it to give valid (if not project-relevant) data — doesn't reach
+   the actual 10-20Hz deliverable, of limited value.
+
+**State left**: hardware safely idle. Script committed with its
+docstring corrected to describe the real, measured throughput ceiling
+rather than the original (wrong) fire-and-forget assumption — default
+`--update-rate` changed from 200 to 3 to reflect reality rather than
+imply a false choice.
+
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 
 Frequency-domain complement to the step-response tests, motivated by the
