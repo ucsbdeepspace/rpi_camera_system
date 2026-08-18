@@ -94,7 +94,8 @@ MICRONS_PER_PIXEL = 3.0  # OV9281 pixel pitch, same constant used throughout thi
 
 REPLY_RE = re.compile(r"^(OK|ERR|STATUS|WARN)\b")
 TELEMETRY_RE = re.compile(
-    r"^seq=\s*(\d+)\s+status=(\d+)\s+x=(-?\d+\.\d)\s+y=(-?\d+\.\d)\s+pkts=(\d+)\s+errs=(\d+)$")
+    r"^seq=\s*(\d+)\s+status=(\d+)\s+x=(-?\d+\.\d)\s+y=(-?\d+\.\d)\s+"
+    r"tgt=(-?\d+\.\d)\s+dac_y=(-?\d+)\s+pkts=(\d+)\s+errs=(\d+)$")
 STATUS_FIELD_RE = {
     "dac_x": re.compile(r"dac_x=(-?\d+)"),
     "dac_y": re.compile(r"dac_y=(-?\d+)"),
@@ -264,6 +265,10 @@ def main():
     parser.add_argument("--step-px", type=float, default=-25.0)
     parser.add_argument("--kp-milli", type=int, default=1750)
     parser.add_argument("--ki-milli", type=int, default=200000)
+    parser.add_argument("--kd-milli", type=int, default=0)
+    parser.add_argument("--fc-milli", type=int, default=None,
+                         help="derivative filter cutoff, milli-Hz (e.g. 5000 = 5.0Hz); "
+                              "omit to leave firmware's current fc unchanged")
     parser.add_argument("--pre-s", type=float, default=0.5)
     parser.add_argument("--post-s", type=float, default=3.0)
     parser.add_argument("--settle-tol-px", type=float, default=2.0)
@@ -312,11 +317,14 @@ def main():
     target_to = round(baseline_cx + args.step_px)
     print(f"baseline cx={baseline_cx:.1f}  target_from={target_from}  "
           f"target_to={target_to} (step {args.step_px:+.1f}px)  "
-          f"Kp_milli={args.kp_milli} Ki_milli={args.ki_milli}")
+          f"Kp_milli={args.kp_milli} Ki_milli={args.ki_milli} Kd_milli={args.kd_milli}")
 
     print(send_command(ser, f"set_target_x {target_from}"))
     print(send_command(ser, f"set_kp {args.kp_milli}"))
     print(send_command(ser, f"set_ki {args.ki_milli}"))
+    print(send_command(ser, f"set_kd {args.kd_milli}"))
+    if args.fc_milli is not None:
+        print(send_command(ser, f"set_fc {args.fc_milli}"))
     print(send_command(ser, "set_mode closed_loop"))
     time.sleep(0.3)  # let it settle at the zero-error hold before recording
 
@@ -398,7 +406,7 @@ def main():
     np.savez(out_path, t=t, x=x, y=y, t_step=t_step,
               base_dac_y=args.base_dac_y, step_px=args.step_px,
               target_from=target_from, target_to=target_to,
-              kp_milli=args.kp_milli, ki_milli=args.ki_milli)
+              kp_milli=args.kp_milli, ki_milli=args.ki_milli, kd_milli=args.kd_milli)
     print(f"Saved raw time series to {out_path}")
 
     # --- plot ---
@@ -426,7 +434,7 @@ def main():
 
     if metrics is not None:
         parts = [f"step: {args.step_px:+.1f}px @ dac_y={args.base_dac_y}",
-                 f"Kp={args.kp_milli/1000:.2f} Ki={args.ki_milli/1000:.2f}"]
+                 f"Kp={args.kp_milli/1000:.2f} Ki={args.ki_milli/1000:.2f} Kd={args.kd_milli/1000:.2f}"]
         if metrics["rise_time_s"] is not None:
             parts.append(f"rise: {metrics['rise_time_s']*1000:.0f}ms")
         if metrics["overshoot_pct"] is not None:

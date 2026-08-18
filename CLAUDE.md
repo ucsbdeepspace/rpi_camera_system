@@ -2947,6 +2947,531 @@ harmless to add elsewhere but not done. Full Kp re-exploration at the
 new, much healthier command throughput hasn't been attempted (all
 tuning-pass numbers above predate this fix).
 
+### On-board sine setpoint generator built — sidesteps the VCP throughput ceiling entirely; real closed-loop 1-20Hz frequency response captured; a negative-lag artifact found, root-caused, and fixed twice (once cheaply, once properly) (2026-08-13, same day)
+
+After the entry above left off with "the actual 10-20Hz closed-loop sine
+test... has not been re-attempted," the user made a decisive call rather
+than continuing to chase VCP throughput further: **"i feel like we took
+a wrong turn a long time ago- lets just do your onboard sine generation
+idea as an emergency solution to get some plots today, and come back to
+this [the VCP root-cause investigation] later."** Deprioritized the
+remaining VCP-throughput work (still not resumed as of this entry — the
+~38-39Hz paced-write ceiling from the entry above is where that thread
+stands) and built a firmware-side sine generator instead, eliminating
+the need for host-streamed per-sample setpoints entirely.
+
+**Firmware additions** (`main.c`): `start_sine FREQ_MILLIHZ AMPLITUDE_PX
+CENTER_PX` / `stop_sine` VCP commands; `update_sine_target()` computes
+`target_x(t) = center + amplitude*sin(2*pi*freq*(t-t0))` using the
+firmware's own `HAL_GetTick()`, called once per confident telemetry
+packet (same cadence `run_closed_loop_step` already runs at) right
+before the control step. No host involvement needed once started — this
+is what actually removes the throughput ceiling as a constraint, since
+the setpoint no longer needs streaming at all.
+
+**First negative-lag bug — user caught it immediately, correctly called
+it impossible.** First test run (1Hz) reported `lag=-71.9ms`; 5Hz and
+10Hz also came back negative. User: *"im looking at the plot, why does
+the cx lead the commanded position, that seems impossible"* — correct: a
+passive causal system cannot lead its own commanded reference. Root
+cause: the test script's `t_sine_start = time.monotonic()` was captured
+**after** the full paced round-trip for the `start_sine` command
+completed (~20ms/char × ~23 chars ≈ 460ms of transmission, plus the
+reply's own transit time) — but the firmware's real `g_sine_start_tick`
+is latched the instant the command line finishes parsing, well before
+it even starts transmitting the `OK` reply. This is a systematic
+"host's assumed t=0 is late relative to the sine's real start" offset,
+which reads exactly like negative lag once the recorded samples are fit
+against a sine assumed to start at that too-late t=0 — not a real
+physical effect, not a sign/phase-ambiguity bug in the fit itself (the
+`fit_tracking()` math for extracting phase from an
+`A*sin(wt)+B*cos(wt)+C` fit was independently re-derived and confirmed
+correct for a real positive lag).
+
+**Fix #1 (cheap, partial): `send_command_timed()`** — captures the
+host-side timestamp right after the last character (`\n`) is
+transmitted, not after the reply arrives, and uses that as the t=0
+reference instead. Rerunning 1Hz with just this fix: `lag=+32.7ms` —
+sane and positive. Better, but still an *estimate* subject to residual
+USB-CDC/OS scheduling jitter on the write path.
+
+**Fix #2 (proper, per the user's suggestion): report the live setpoint
+in every telemetry line instead of reconstructing it from any host-side
+clock at all.** User: *"why not transmit a field in the telemetry that
+indicates the current setpoint, then the timing will match perfectly"*
+— the better fix, adopted immediately. Added a `tgt=` field to the
+per-packet VCP relay line (`seq=... status=... x=... y=... tgt=...
+pkts=... errs=...`, sourced from `g_target_x_scaled` at the exact same
+point in the main loop that just fed it to `run_closed_loop_step`, so
+it's not a stale/asynchronous read). Host-side `fit_tracking()` rewritten
+to fit **both** the measured `cx` trace and the firmware-reported `tgt`
+trace against the same `sin(wt)/cos(wt)` basis (same `t` array, whatever
+it is), then take the **difference** of their fitted phases as the lag.
+This is deliberately immune to any t0 error — a constant offset in `t`
+shifts both fitted phases equally, which cancels out of the difference —
+and no longer needs to trust that the firmware's `sinf()`/integer
+rounding produced exactly the requested amplitude/center either, since
+both are read from the real `tgt` fit rather than assumed. `line[]`
+buffer grown 80→100 bytes to fit the new field.
+
+**Second bug, found immediately after switching to the tgt-based fit**:
+15Hz came back `lag=-50.1ms` (`-270.4°`) — again impossible-looking, but
+this time a genuine remaining math bug, not a physical or timing issue:
+`atan2()` alone only guarantees each individual phase lands in
+`(-pi,pi]`, not their *difference*, so a real ~90°+ lag could surface as
+e.g. -270° instead of the equivalent, sensible +90°. Fixed by wrapping
+`phase_x - phase_t` into `(-pi,pi]` (smallest-magnitude branch) before
+converting to a lag — same standard treatment, different specific bug,
+as the sign/phase-disambiguation work this project already did for the
+open-loop `fit_sine()` (see "RESOLVED (2026-08-06)" above) — still the
+same fundamental single-frequency wraparound ambiguity (can't
+distinguish a lag from `lag ± n*period` off one test tone), just
+resolved to its least-aliased branch rather than left unwrapped.
+
+**Real, final, validated closed-loop frequency response, `dac_y`→`cx`,
+Kp=1.75/Ki=200, amplitude=25px @ dac_y=2048** (the same clean operating
+point characterized throughout the last several entries), full
+telemetry-rate data (~210-216 samples/s throughout, no longer
+command-throughput-limited at all):
+
+| freq | gain (T) | lag |
+|---|---|---|
+| 1 Hz | 0.956 | 57.6ms (20.7°) |
+| 5 Hz | 0.507 | 36.0ms (64.9°) |
+| 10 Hz | 0.298 | 21.8ms (78.5°) |
+| 15 Hz | 0.281 | 16.7ms (90.4°) |
+| 20 Hz | 0.262 | 12.5ms (89.8°) |
+
+Gain and lag both decrease smoothly and monotonically with frequency —
+no sign flips, no impossible values, no discontinuities. **Flagged
+honestly, not hidden**: 15Hz and 20Hz sit right at the ~90° mark, the
+edge of what a single test frequency's phase fit can resolve
+unambiguously (same limit noted for the open-loop 10Hz+ results
+elsewhere in this file) — those two lag numbers are lower-confidence
+than 1/5/10Hz, not wrong, but shouldn't be over-trusted to more than
+about ±(half the period) without a corroborating method (e.g. a
+two-tone or swept-sine test) if that precision ever matters. Gain
+values were trustworthy throughout this whole debugging arc (magnitude
+`hypot(A,B)` is phase-independent, never affected by either bug) — only
+the lag/phase numbers needed fixing.
+
+Raw data: `results/fta_closed_loop_onboard_sine_{1,5,10,15,20}Hz_*.npz`
+(now includes `t`, `x`, and `tgt` arrays). Earlier, pre-fix runs at each
+frequency (negative-lag and/or pre-phase-wrap) were deleted from
+`results/` rather than left alongside the corrected ones — the plot
+script keys files by frequency via a glob + dict, so stale duplicates
+were a real risk of silently feeding wrong data into a future summary
+plot, not just clutter. Combined summary figure built via
+`fta_closed_loop_onboard_sine_plot.py` (also updated to plot the real
+`tgt` trace instead of a reconstructed ideal reference):
+`results/fta_closed_loop_onboard_sine_summary.png`.
+
+**This is the project's first real closed-loop frequency-response
+characterization actually spanning the full 10-20Hz disturbance target**
+(every closed-loop attempt before today was blocked by the VCP
+throughput ceiling documented in the entries above). Gain at 10-20Hz
+(26-30%) is in a broadly similar range to what the open-loop plant
+itself showed in this same band (see "Pushed sine tracking to
+5/10/15/20Hz" and the fine-sweep/resonance entries above) — consistent
+with the closed loop's rejection being limited more by the plant's own
+10-20Hz rolloff than by anything control-loop-specific, though a direct
+side-by-side comparison hasn't been done.
+
+**Not yet done**: the deliberately-deferred VCP root-cause investigation
+(DMA + idle-line UART RX, see the entry above) — still not resumed, per
+the user's explicit "come back to this later"; Kp is still untried at
+higher values against this new on-board-sine measurement (all of today's
+closed-loop tuning work used step response, not sine, as the target
+metric); axis y not tested with the on-board sine generator; no repeats
+for statistical confidence (n=1 per frequency); the 15-20Hz phase-wrap
+ambiguity noted above isn't resolved by anything short of a different
+measurement method.
+
+**Follow-up, same session: repeated at a much smaller, more
+disturbance-realistic amplitude (10um peak-to-peak) — required a
+firmware precision fix first.** User asked to rerun at 10um peak-to-peak
+instead of the original 25px/150um-peak-to-peak amplitude. `start_sine`'s
+`AMPLITUDE_PX` argument was whole-pixels-only (`strtol`, no decimal
+support) — 10um peak-to-peak needs 1.667px amplitude
+(`5um / MICRONS_PER_PIXEL(3.0)`), which would only round to 1 or 2 whole
+px (6 or 12um peak-to-peak), not close enough. Changed the wire format:
+`start_sine` now takes `AMPLITUDE_X10` (tenths of a pixel, i.e. the same
+`POSITION_SCALE` units `g_target_x_scaled`/`tel_x_scaled` already use
+elsewhere in this firmware) instead of whole pixels — `g_sine_amplitude_scaled`
+is now set directly from the parsed integer rather than re-deriving it
+via another `*POSITION_SCALE`. The `OK sine_started` reply's `amplitude=`
+field now reports the real decoded value (e.g. `amplitude=1.7`) instead
+of echoing the raw integer, so a caller can see exactly what was applied
+after rounding. `fta_closed_loop_onboard_sine_test.py` updated to send
+`round(amplitude_px * 10)`. Rebuilt, reflashed — **hit the same
+total-silence-after-reflash glitch documented earlier this session, same
+fix (reflash again, no code change) resolved it.**
+
+Reran all 5 frequencies at `--amplitude-px 1.6667` (firmware applied
+1.7px = 10.2um peak-to-peak, confirmed via the `OK sine_started` reply
+each time):
+
+| freq | gain (T) | lag |
+|---|---|---|
+| 1 Hz | 0.941 | 63.5ms (22.8°) |
+| 5 Hz | 0.470 | 36.3ms (65.4°) |
+| 10 Hz | 0.328 | 22.6ms (81.3°) |
+| 15 Hz | 0.268 | 16.0ms (86.5°) |
+| 20 Hz | 0.332 | 13.8ms (99.2°) |
+
+Broadly similar shape to the 25px/150um sweep (gain rolls off from ~0.94
+at 1Hz down to the 0.27-0.33 range by 10-20Hz; lag decreases smoothly
+from 63.5ms to 13.8ms) — **not a dramatically different regime**, unlike
+the sharp small-amplitude stiction/threshold collapse this project found
+in the *open-loop* plant early on (see "RETRACTED: ... a clean amplitude
+comparison finds the 10-20Hz 'rolloff' was mostly a nonlinear threshold
+effect" above, ±200 vs ±800 DAC counts). One visible wrinkle: gain dips
+to a minimum at 15Hz (0.27) then rises slightly at 20Hz (0.33) rather
+than monotonically decreasing — consistent with, though not the same
+frequencies as, the resonance/anti-resonance plateau-dip-recovery shape
+already documented for the open-loop plant's fine 3-12Hz sweep. 20Hz's
+phase (99.2°) is past the ±90° smallest-magnitude-branch boundary this
+session's phase-wrap fix resolves to, so that one lag number in
+particular should be read as lower-confidence, same caveat as 15-20Hz in
+the 25px sweep above.
+
+`fta_closed_loop_onboard_sine_plot.py` updated to select which
+amplitude's sweep to summarize by each npz's own stored `amplitude_px`
+(via `--amplitude-px`, defaulting to the largest available for backward
+compatibility) rather than assuming one file per frequency — `results/`
+now holds both the 25px and 1.667px sweeps side by side, and a filename-
+only match would have silently picked whichever happened to glob last.
+Two summary figures now exist:
+`results/fta_closed_loop_onboard_sine_summary.png` (25px/150um) and
+`results/fta_closed_loop_onboard_sine_summary_10um.png` (1.667px/10um).
+
+**Follow-up, same session: added the live commanded actuator output
+(`dac_y`) to the telemetry relay line, and re-ran the 10um sweep at half
+duration to plot it.** User asked to see the actual DAC command
+alongside cx/target, not just infer it from the control law offline.
+Added a `dac_y=` field to the per-packet VCP relay line, sourced from
+`g_last_dac_y` (the real value `apply_dac()` last wrote to the DAC,
+plain counts, not `POSITION_SCALE`-scaled since it's a hardware setpoint
+not a pixel measurement) — `line[]` grown 100→120 bytes. Rebuilt,
+reflashed — **hit the same total-silence-after-reflash glitch documented
+twice already this session, same fix (reflash again, no code change)
+resolved it a third time**, reinforcing that this really is a one-off
+flash/reset artifact on this hardware, not something to chase further.
+
+`fta_closed_loop_onboard_sine_test.py`'s `TELEMETRY_RE`/`_reader_thread`
+updated to parse and record `dac_y`; `save_plot()` refactored out of
+`main()` into a standalone function and given a second stacked panel
+(`dac_y` vs. time, sharing the x-axis) below the existing cx panel.
+Also added a `--replot PATH` mode (loads an existing `results/*.npz` and
+regenerates just its PNG, no hardware touched) — used it to apply a
+legend-readability fix (opaque background, since the two-panel layout
+left less room for the previous frameless legend to avoid overlapping
+data) without re-running any test, and to backfill-safe older npz files
+that predate `dac_y` (falls back to a NaN gap in that panel rather than
+erroring).
+
+**Re-ran the full 1/5/10/15/20Hz sweep at 1.667px/10um pk-pk, half the
+original duration** (`--duration 4` at 1Hz, `--duration 1` at
+5/10/15/20Hz, vs. 8s/2s before) — still ~200+ samples per run at the
+~210Hz telemetry rate, plenty for a stable fit at these frequencies:
+
+| freq | gain (T) | lag |
+|---|---|---|
+| 1 Hz | 0.933 | 64.2ms (23.1°) |
+| 5 Hz | 0.458 | 36.7ms (66.1°) |
+| 10 Hz | 0.286 | 22.7ms (81.7°) |
+| 15 Hz | 0.279 | 16.9ms (91.1°) |
+| 20 Hz | 0.382 | 12.9ms (93.1°) |
+
+Matches the full-duration 10um sweep's numbers closely (within noise) —
+halving duration didn't change the result, as expected given sample
+count stayed well above what the linear-lstsq fit needs. Superseded the
+prior (dac_y-less, full-duration) 10um sweep files in `results/` (deleted
+rather than kept alongside, to avoid the summary-plot amplitude-matching
+logic picking arbitrarily between two files at the same commanded
+amplitude). `fta_closed_loop_onboard_sine_plot.py` also updated with a
+matching `dac_y` row (3-row grid: cx traces, dac_y traces, gain/lag
+summary) and the same NaN-fallback for pre-dac_y files — the 25px sweep's
+summary figure still renders correctly, just with an empty `dac_y` row,
+since those runs predate the field. Both summary PNGs regenerated.
+
+### Off-the-shelf PID adopted per Phil's e-mail — `PIDController.hpp` (his class, verbatim) integrated via a thin C-callable shim, hardware-validated, replacing the hand-rolled P+I control law (2026-08-18)
+
+Phil e-mailed a short survey of C++ PID options (WPILib's `PIDController`,
+`PatrickBaus/PID-CPP`, and a self-contained custom class pasted directly
+in the e-mail) and asked which to use. Recommended against the first two
+(WPILib: wrong domain, FRC-ecosystem dependency tree; PID-CPP: still C++
+for no real benefit over the pasted snippet) and suggested porting just
+the pasted class's filtered-derivative-on-measurement technique into the
+existing hand-rolled C loop, since this firmware had never had a D term.
+**User asked to use the e-mailed code completely instead, no mish-mash of
+hand-rolled and borrowed control logic.**
+
+**Decision: keep the project a plain-C CubeIDE project, add the class as
+new C++ files rather than converting the whole project to C++.** Reasons
+specific to this codebase, not generic caution: this project has already
+been hit once by a CubeMX regeneration silently reverting multiple hand-
+added settings (DAC driver files deleted, `HAL_DAC_MODULE_ENABLED` re-
+commented-out, the I2C1/USART2 NVIC priority swap reset, an `extern
+huart2` dropped — see "Firmware queue rewrite" above) — a project-wide
+language-mode flip was judged too large a blast radius against a
+one-class need. `main.c` is also the single most interrupt-sensitive,
+heavily-tuned file in this project; touching all of it for a change that
+doesn't affect Phil's class's fidelity either way wasn't worth the risk.
+
+**What was added, all new files (no existing file renamed):**
+- `Core/Inc/PIDController.hpp` — Phil's class, byte-for-byte as pasted in
+  his e-mail. Not modified at all, including keeping `double` throughout
+  despite this MCU's FPU (`fpv4-sp-d16`) being single-precision-only
+  (software-emulated double math) — a deliberate, flagged tradeoff to
+  honor "use it completely," not an oversight; negligible cost against
+  this loop's real timing budget.
+- `Core/Inc/pid_wrapper.h` / `Core/Src/pid_wrapper.cpp` — a thin
+  `extern "C"` shim owning one `PIDController` instance and forwarding
+  `pid_wrapper_init/_set_gains/_calculate/_reset` calls, so `main.c`
+  (still plain C) can drive it. No control-law logic of its own.
+  Constructed via placement-new into a `alignas(PIDController)` byte
+  buffer, not a function-local `static` — deliberately avoids the
+  compiler's thread-safe "magic statics" guard-variable machinery
+  (`__cxa_guard_acquire/release`, lives in libstdc++/libsupc++), which
+  this firmware's link line doesn't otherwise pull in. Compiled with
+  `-fno-exceptions -fno-rtti -fno-threadsafe-statics`; empirically links
+  clean against the existing `-lc -lm`-only link line (confirmed by
+  actually building it, not just reasoned about) — no libstdc++
+  dependency needed at all, since the class touches nothing (virtual
+  functions, heap, exceptions) that would require it.
+
+**Two real, project-specific integration decisions, not part of "just
+call the class":**
+1. **Correction, not absolute output.** `pid_wrapper_calculate()` returns
+   a value relative to `g_closed_loop_base_dac_y` (this firmware's
+   existing bumpless-transfer bias), not an absolute DAC value — `main.c`
+   adds its own base and does the final `[DAC_MIN_COUNT, DAC_MAX_COUNT]`
+   clamp via `apply_dac()`, exactly as before. That bumpless-transfer/
+   final-clamp design is this firmware's own architecture, not something
+   `PIDController.hpp` needs to know about; `setOutputLimits()` is set to
+   a generous symmetric ±(DAC_MAX-DAC_MIN) so the class's own back-
+   calculation anti-windup stays meaningful without fighting the outer
+   clamp.
+2. **Fixed `ts_`, not measured `dt`.** The previous hand-rolled loop
+   measured a real (slightly variable) `dt` via `HAL_GetTick()` every
+   step, specifically because control steps fire on telemetry arrival,
+   not a fixed timer. `PIDController::calculate()` takes no `dt` argument
+   at all — `ts_` is baked in at construction. Using the class unmodified
+   means accepting this as a known, deliberate approximation (`ts_s =
+   1/210`, this firmware's typical closed-loop telemetry rate measured
+   repeatedly across 2026-08-13/14) rather than working around it.
+   `g_last_control_tick` (no longer needed) was removed entirely rather
+   than left dead.
+
+**Build system: hand-extended, not CubeIDE-regenerated.** This project's
+command-line build (`make.exe all` in `Debug/`, used all session to
+bypass the IDE) runs off CubeIDE's auto-generated `subdir.mk`/`sources.mk`
+files, which only get new-file compile rules when CubeIDE's own indexer
+sees a file added *through the IDE*. Rather than requiring that GUI step,
+hand-extended the generated files directly: added `CPP_SRCS`/`CPP_DEPS`
+to `sources.mk`, a `.cpp` pattern rule (`arm-none-eabi-g++`, `-std=gnu++17`)
+to `Core/Src/subdir.mk`, a `CPP_DEPS` include to the top-level `makefile`,
+switched the final link driver from `arm-none-eabi-gcc` to
+`arm-none-eabi-g++` (standard practice once any C++ translation unit is
+in the mix), and added the new `.o` to `objects.list`. **Flagged inline
+in both `sources.mk` and `Core/Src/subdir.mk`** (matching this project's
+existing convention for every other hand-added-outside-CubeMX setting):
+if this project is ever regenerated or rebuilt fresh from inside CubeIDE
+without the IDE's own project settings also knowing about the `.cpp`
+file, these hand-added blocks will be silently lost and need reapplying.
+
+**`main.c` wiring**: `run_closed_loop_step()` now just descales
+target/measured to real px doubles, calls `pid_wrapper_calculate()`, adds
+the base, and calls `apply_dac()` — the P+I+anti-windup math that used to
+live inline is gone, replaced by the class. `cmd_set_kp`/`cmd_set_ki` now
+call `pid_wrapper_set_gains()` (which reconstructs the class — it has no
+gain setters by design — implicitly clearing integral/derivative history
+the same way this file's old code explicitly zeroed the integral on a Ki
+change). Added `cmd_set_kd`/`set_kd` (milli-units, matching `set_kp`/
+`set_ki`'s existing convention) since the class now makes a real D term
+available — defaults to `Kd=0`, i.e. behaviorally P+I until deliberately
+tuned. `cmd_set_mode`'s closed_loop bumpless-transfer branch now calls
+`pid_wrapper_reset()` instead of zeroing a local integral variable.
+`cmd_get_status`'s STATUS line gained `kd_milli=` (`line[]` grown
+250→280 bytes for headroom, matching this project's established pattern
+of bumping buffer sizes when adding fields).
+
+**Build verified clean** (zero warnings, `main.c` via `gcc -std=gnu11`,
+`pid_wrapper.cpp` via `g++ -std=gnu++17`, link via `g++`) before ever
+touching hardware. Flashed — **hit the same total-silence-after-reflash
+glitch documented several times already this session; reflashed again
+with no code change, resolved it, same as every prior occurrence.**
+`get_status` confirmed `kd_milli=0` present and correctly initialized.
+
+**Hardware-validated two ways:**
+1. A quick manual `get_status`-polling diagnostic (target set 25px off
+   baseline before engaging closed_loop, Kp=1.75/Ki=200/Kd=0, `dac_y`
+   watched over ~3s): `dac_y` moved cleanly from base 2048 toward ~1810
+   and `tel_x` converged smoothly to within ~0.1px of the exact target —
+   confirms the new PID path drives real hardware correctly.
+2. Reran `fta_closed_loop_step_response_vcp.py` (same Kp=1.75/Ki=200
+   baseline this project has used throughout). **First attempt found a
+   real, unrelated regression**: that script's `TELEMETRY_RE` predated
+   the `tgt=`/`dac_y=` fields added to the telemetry relay line earlier
+   this same session (see the two entries above) and could no longer
+   match any line at all — "0 usable telemetry samples." Fixed by
+   updating the regex to the current wire format (this script only
+   consumes the `x`/`y` groups, so no other code needed to change). A
+   second, separate hiccup on the very next run (`set_mode closed_loop`'s
+   reply went unconfirmed by `send_command`, a known, recurring VCP
+   flakiness this project has hit repeatedly all session under live
+   telemetry load) resolved itself on a plain retry — the command had
+   actually landed both times, only the confirmation read was lost.
+   **Real result once both were sorted out**: delta -24.99px (essentially
+   exact against the commanded -25px step), rise time 78ms, overshoot
+   13.9%, settling 297ms (`results/fta_closed_loop_step_response_vcp_20260818T172003Z.{npz,png}`)
+   — clean convergence, a few damped oscillations, no divergence, no
+   clamp. **Somewhat more overshoot/slower settling than the old hand-
+   rolled controller's best-known result at this exact Kp/Ki (1.1%/141ms,
+   see "Real tuning pass" above)** — plausible explanations, not yet
+   distinguished: the fixed-`ts_` approximation vs. the old measured-`dt`,
+   or Phil's back-calculation anti-windup behaving differently in the
+   transient than the old pre-clamped-integral approach. Not necessarily
+   a problem (still comfortably damped, no divergence), but worth knowing
+   before assuming the old Kp/Ki are still optimal for this new
+   implementation.
+
+**Not yet done**: Kp/Ki/Kd have not been re-tuned against this new
+implementation at all (everything above reused the old hand-rolled
+controller's best-known gains as a parity check, not a fresh search); Kd
+has never been set away from 0, so the derivative-on-measurement/filter
+path this whole integration was originally motivated by is unexercised;
+the same `TELEMETRY_RE`-predates-`tgt=`/`dac_y=` bug almost certainly
+still affects other scripts sharing the old fixed-format assumption
+(`fta_calibration_vcp.py`, `fta_manual_control.py`,
+`fta_sine_response_test_vcp.py`, the open-loop `fta_step_response_test_vcp.py`)
+— only the one script actually run today was fixed; sine-tracking
+against this new controller (the real 10-20Hz deliverable) hasn't been
+re-run either. Nothing committed to git yet as of this entry.
+
+### D-term evaluated properly: a direct free-decay test confirms a real ~15.3Hz resonance, D does not help at any tested filter cutoff, and the PID rate/cross-axis questions are answered (2026-08-18, same day)
+
+Follow-up questions from the user after the PID integration above, addressed
+in order:
+
+**Does the PID loop run faster than telemetry?** No — `run_closed_loop_step()`
+only fires inside `if (g_new_packet_ready) { ... }`, i.e. once per I2C
+packet, capped by telemetry exactly as before. What changed is that
+`PIDController::calculate()` has no `dt` argument (`ts_` fixed at
+construction, `~1/210s`), vs. the old controller's real per-call
+`HAL_GetTick()` measurement — a known, already-documented tradeoff, not a
+new finding.
+
+**Is cross-axis coupling causing the "wild x jumping"?** Checked directly
+against already-captured data rather than guessing: `cy` (the telemetry
+`y` channel) stays flat (~0.3px std, ~1.6px range) through the Kd=0
+step response — cross-axis coupling is NOT excited at Kd=0. The
+`cy` std=14.4 / range=109px seen at Kd=0.05 tracks the *whole loop* going
+unstable at that gain (matches `cx`'s own blow-up there), not an
+axis-coupling-specific effect. **A second PID axis would not fix the
+overshoot** — the wildness is `cx` itself (the controlled axis)
+overshooting more than the old hand-rolled controller did at identical
+nominal Kp/Ki (13.9%/297ms new vs. 1.1%/141ms old, see the integration
+entry above) — a same-axis effect, most likely from a real anti-windup
+*mechanism* difference (old code proactively clamped the integral state
+every step; `PIDController.hpp` only reactively claws back integral when
+the *combined* `p+i+d` output saturates its configured limits, which
+were set generously wide — so for a small ±25px step the anti-windup
+essentially never engages). **Not yet tested** — tightening
+`pid_wrapper_init`'s output limits to force earlier engagement is a
+concrete, cheap next experiment, flagged but not done this session.
+
+**Ring-down resonance test — user's own idea, executed directly, real
+finding.** With the amp OFF, `set_y` has no physical effect (the DAC
+register changes but the amplifier stage isn't gating current to the
+coil) — pre-load a step target while off, pulse the amp briefly on (a
+real force step) then back off, and watch the mechanical system decay
+under its own free dynamics, unconfounded by any control loop or
+telemetry-rate-limited phase fitting. Built `fta_ringdown_test.py`.
+
+**Real bug on the first attempt, caught and fixed before trusting the
+result**: the pulse-sequence commands (`set_y`/`amp_enable`/`amp_disable`)
+were sent via `send_command()` (which reads replies) while the background
+reader thread was *already* consuming `ser.readline()` on the same
+`Serial` object — exactly the two-threads-racing-for-`readline()` mistake
+`fta_closed_loop_step_response_vcp.py`'s own docstring already warns
+against, made fresh in the new script. All three commands exhausted their
+full retry budget waiting for replies the reader thread kept stealing,
+stretching an intended ~80ms pulse into ~24 real seconds. Fixed by
+switching the pulse sequence to paced writes with no reply read (matching
+that script's established pattern), same as every other "send something
+mid-recording" case in this project.
+
+**Result, second (fixed) attempt: a clean, textbook free decay.** Flat
+baseline, forced ringing while the amp is driven, then — the instant the
+amp cuts — a smooth, visibly-decaying oscillation matched closely by a
+fitted damped sinusoid: **freq=15.35Hz, damping ratio ζ≈0.105**
+(`results/fta_ringdown_20260818T174119Z.{npz,png}`). This is a genuine
+mechanical resonance measurement, independent of the control loop or any
+sine-fit ambiguity — confirms (and sharpens, from the earlier fine-sweep's
+rougher ~11Hz estimate) that this rig has a lightly-damped resonance
+sitting *inside* the project's own 10-20Hz disturbance-rejection target.
+Q = 1/(2ζ) ≈ 4.8 — a real, noticeable peak, not an extreme one; not
+obviously fatal to the control goal on its own, but a hard constraint any
+controller (not just D) has to respect near 15Hz, not something tuning
+alone dissolves. Standard mitigations if more aggressive rejection is
+ever needed: a notch filter at ~15.3Hz, or physically stiffening/damping
+the flexure (hardware, out of firmware's reach).
+
+**This directly explains the D-term instability found earlier**: the
+20Hz derivative filter cutoff barely attenuates a 15.3Hz resonance at
+all — the filter was passing the plant's worst dynamics straight through
+into the correction.
+
+**Exposed the filter cutoff as live-tunable to test that properly.**
+Added `pid_wrapper_set_fc()` (`pid_wrapper.cpp`/`.h`) — reconstructs the
+`PIDController` with a new `fc` using the last-commanded gains (now
+tracked in module-level `g_kp`/`g_ki`/`g_kd` statics, since the class
+itself has no getters). Added `set_fc MILLIHZ` VCP command + `fc_millihz=`
+in `get_status` (same milli-units integer convention as `set_kp`/`ki`/`kd`).
+Rebuilt, reflashed (same post-reflash silence glitch as every other
+reflash this session, resolved by reflashing again). Added `--fc-milli`
+to `fta_closed_loop_step_response_vcp.py`.
+
+**Systematic result: D does not help at ANY tested (Kd, fc) combination**
+— `results/fta_closed_loop_dterm_comparison.png`:
+
+| Kd | fc | overshoot | settling |
+|---|---|---|---|
+| 0 (baseline) | — | 13.9% | 297ms |
+| 0.001 | 20Hz | 34.7% | 1047ms |
+| 0.005 | 20Hz | 45.4% | 2469ms |
+| 0.05 | 20Hz | unstable at rest | never |
+| 0.005 | 3Hz | 30.2% | 2187ms |
+| 0.001 | 3Hz | 23.5% | 343ms |
+| 0.001 | 1Hz | 14.2% | 391ms |
+
+Clear, consistent trend: lowering `fc` monotonically converges back
+*toward* the `Kd=0` baseline (as expected — a lower cutoff attenuates the
+derivative signal toward zero) but never actually beats it, at any `Kd`
+or `fc` tried. **Conclusion: for this plant, a simple single-pole
+low-pass-filtered derivative-on-measurement term (the technique
+`PIDController.hpp` implements) does not help** — any cutoff low enough
+to avoid exciting the 15.3Hz resonance also filters away whatever useful
+rate information D could have contributed; any cutoff high enough to let
+D respond usefully also passes the resonance straight through. **Kept
+`Kd=0` as the working configuration** — P+I alone remains the best result
+found on this rig. A real notch filter targeting 15.3Hz specifically
+(not just a low-pass) is the more principled next step if D/higher
+bandwidth is still wanted later, not attempted this session.
+
+**State left**: hardware safely idle (`mode=open_loop amp=0 estop=0
+dac_x=95 dac_y=95`) after every test. `fta_ringdown_test.py` committed-
+style (repo root, not yet git-committed); `scratch_kd_compare_plot.py`
+(repo root) is genuinely ad hoc/one-off, not written to project
+convention. **Not yet done**: the anti-windup output-limits experiment
+flagged above; a full sine-tracking sweep was deliberately NOT re-run
+with any D configuration, since none beat the P+I baseline on the much
+cheaper step-response test — no reason to spend the extra hardware time
+confirming the same negative result at 5 frequencies. Nothing committed
+to git yet as of this entry.
+
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 
 Frequency-domain complement to the step-response tests, motivated by the

@@ -27,6 +27,8 @@
 #include <stdlib.h>
 #include <math.h>
 
+#include "pid_wrapper.h"
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -38,12 +40,14 @@ typedef enum
   AXIS_Y = 1
 } fta_axis_t;
 
-/* CLOSED_LOOP: single-axis (dac_y -> cx) P+I position control -- the
+/* CLOSED_LOOP: single-axis (dac_y -> cx) position control -- the
  * architecture was decided 2026-08-04 (CLAUDE.md v2) but left
  * unimplemented until the optics were locked down and dac_y->cx
  * confirmed as by far the cleanest DAC->pixel pairing (2026-08-12, same
- * file). Derivative action and a second controlled axis are both
- * deliberately deferred -- see run_closed_loop_step's docstring below. */
+ * file). Originally P+I only (hand-rolled); as of 2026-08-18 the P/I/D
+ * math itself lives in PIDController.hpp (used verbatim, per Phil's
+ * e-mail) via pid_wrapper.h/.cpp -- see run_closed_loop_step's docstring
+ * below. A second controlled axis is still deliberately deferred. */
 typedef enum
 {
   MODE_OPEN_LOOP   = 0,
@@ -166,27 +170,71 @@ static volatile int32_t    g_last_dac_y = DAC_MIN_COUNT;
  * main-loop context (command processing and run_closed_loop_step, both
  * called from the main while(1) loop, never from ISR context), so unlike
  * g_latest_beam/g_last_dac_x/y above these don't need `volatile` for
- * cross-context visibility. Kp/Ki are taken over the VCP as milli-units
- * integers (strtol, no float parsing) and converted to float once here --
- * matches decode_scaled's existing avoidance of pulling in newlib's
- * float-formatting support for the small dedicated purpose of *display*,
- * while still doing the actual control arithmetic in float (cheap, this
- * MCU has a hardware FPU, see -mfpu=fpv4-sp-d16 in the build). */
+ * cross-context visibility. Kp/Ki/Kd are taken over the VCP as milli-
+ * units integers (strtol, no float parsing) -- matches decode_scaled's
+ * existing avoidance of pulling in newlib's float-formatting support for
+ * the small dedicated purpose of *display*. The actual P/I/D math itself
+ * (as of 2026-08-18) lives in PIDController.hpp via pid_wrapper.h/.cpp,
+ * not here -- g_kp_milli/g_ki_milli/g_kd_milli below exist only so this
+ * file can echo the last-commanded gains back in cmd_get_status. */
 static int32_t g_target_x_scaled = 0;   /* pixel setpoint for cx, POSITION_SCALE-scaled */
 static uint8_t g_target_x_set    = 0;   /* set_mode closed_loop refuses to engage until this is 1 */
 static int32_t g_kp_milli = 0;          /* Kp = g_kp_milli/1000, DAC counts per pixel of error */
 static int32_t g_ki_milli = 0;          /* Ki = g_ki_milli/1000, DAC counts per (pixel*second) */
-static float   g_kp = 0.0f;
-static float   g_ki = 0.0f;
-static float   g_integral_px_s = 0.0f;  /* running integral of error_px*dt_s, anti-windup clamped */
+static int32_t g_kd_milli = 0;          /* Kd = g_kd_milli/1000, DAC counts per (pixel/second) */
+static int32_t g_fc_millihz = 20000;    /* derivative filter cutoff = g_fc_millihz/1000 Hz --
+                                          * default matches PIDController.hpp's own example value,
+                                          * found 2026-08-18 to be far too high relative to this
+                                          * rig's ~15.3Hz resonance (see pid_wrapper.cpp) --
+                                          * live-settable via set_fc so this can be retried without
+                                          * a reflash per attempt. */
 static int32_t g_closed_loop_base_dac_y = DAC_MIN_COUNT;  /* bumpless-transfer bias, see cmd_set_mode */
-static uint32_t g_last_control_tick = 0;
+
+/* On-board sine setpoint generator -- 2026-08-13 "emergency" addition,
+ * added after this session spent a very long time chasing why the VCP
+ * link can't reliably stream target_x updates fast enough to trace a
+ * real 10-20Hz sine from the host (root cause never fully resolved --
+ * see rpi_camera_system CLAUDE.md). Rather than keep debugging the link,
+ * sidestep it: have the firmware itself compute
+ * target_x(t) = center + amplitude*sin(2*pi*freq*(t-t0)) once per
+ * control step, using its own HAL_GetTick() as the time base, so the
+ * only VCP traffic needed is ONE start_sine command instead of ~150+
+ * target_x updates per second. The host already knows the exact
+ * function it asked for, so it can fit the measured response against
+ * the theoretical sin(wt) directly -- no need for the firmware to also
+ * report the commanded value back over the (bandwidth-limited) link.
+ * freq is stored in milli-Hz (matching the Kp/Ki milli-units-integer
+ * convention elsewhere in this file) so non-integer Hz values (e.g.
+ * 0.5Hz = 500) don't need float parsing over VCP. */
+static uint8_t  g_sine_active          = 0;
+static int32_t  g_sine_center_scaled   = 0;  /* POSITION_SCALE-scaled, same units as g_target_x_scaled */
+static int32_t  g_sine_amplitude_scaled = 0; /* POSITION_SCALE-scaled */
+static int32_t  g_sine_freq_millihz    = 0;
+static uint32_t g_sine_start_tick      = 0;
 
 /* Single-byte interrupt-driven VCP (USART2) receive, re-armed on every
  * completion/error -- same one-shot-then-rearm pattern as the I2C
  * reception below, just at the byte level instead of the packet level
  * since VCP commands are variable-length ASCII lines, not a fixed frame. */
 static uint8_t   vcp_rx_byte;
+
+/* Diagnostic counters -- 2026-08-13, added to get a direct, real answer
+ * for why single-burst VCP commands corrupt in a deterministic way
+ * (e.g. "get_status" always becomes "getsa") that hasn't changed across
+ * several different fixes (RX queue, non-blocking TX, faster clock,
+ * faster baud). Exposed in the heartbeat line, not get_status, since
+ * get_status itself needs RX to work to even request it -- the
+ * heartbeat is free-running and doesn't depend on any command landing.
+ * huart2.ErrorCode is checked in HAL_UART_ErrorCallback to distinguish
+ * a genuine hardware overrun (ORE -- a new byte arrived before the
+ * previous one was read out, i.e. reception genuinely couldn't keep up)
+ * from framing/noise/parity errors (which would point somewhere else
+ * entirely, e.g. a real electrical/wiring issue rather than a timing
+ * one). */
+static volatile uint32_t g_uart_ore_count = 0;
+static volatile uint32_t g_uart_fe_count  = 0;
+static volatile uint32_t g_uart_ne_count  = 0;
+static volatile uint32_t g_uart_pe_count  = 0;
 
 /* Multi-line RX queue -- 2026-08-13. The original design held exactly one
  * pending line (a single buffer + ready flag) and silently dropped any
@@ -222,7 +270,7 @@ static uint16_t          vcp_cur_len  = 0;  /* length assembled so far into vcp_
  * the largest message (get_status's ~220-byte reply) with a little
  * margin. */
 #define TX_QUEUE_DEPTH   8U
-#define TX_MSG_MAX_LEN   224U
+#define TX_MSG_MAX_LEN   256U
 typedef struct { char data[TX_MSG_MAX_LEN]; uint16_t len; } tx_msg_t;
 static tx_msg_t          tx_queue[TX_QUEUE_DEPTH];
 static volatile uint8_t  tx_head  = 0;  /* next slot enqueue_tx fills */
@@ -260,6 +308,11 @@ static void cmd_get_status(void);
 static void cmd_set_target_x(const char *arg);
 static void cmd_set_kp(const char *arg);
 static void cmd_set_ki(const char *arg);
+static void cmd_set_kd(const char *arg);
+static void cmd_set_fc(const char *arg);
+static void cmd_start_sine(const char *arg);
+static void cmd_stop_sine(void);
+static void update_sine_target(uint32_t now);
 static void run_closed_loop_step(int16_t tel_x_scaled, uint32_t now);
 
 /* USER CODE END PFP */
@@ -326,6 +379,19 @@ int main(void)
   /* Safe boot default: amp stays disabled (g_amp_enabled=0, GPIOA12 low
    * from MX_GPIO_Init) until a VCP amp_enable command arrives. */
 
+  /* Construct the PIDController instance (see pid_wrapper.h) with all-
+   * zero gains -- matches the previous hand-rolled controller's boot
+   * default exactly (Kp=Ki=Kd=0 until a set_kp/set_ki/set_kd command
+   * arrives, so a stray early set_mode closed_loop just holds dac_y at
+   * its bumpless-transfer base, not garbage). Output limits are a
+   * symmetric correction range spanning the full DAC span -- the
+   * correction is added to g_closed_loop_base_dac_y and then hard-
+   * clamped to [DAC_MIN_COUNT, DAC_MAX_COUNT] by apply_dac() regardless,
+   * so this only needs to be wide enough not to clip a legitimate
+   * correction before that final clamp does. */
+  pid_wrapper_init(0.0, 0.0, 0.0, 1.0 / 210.0, (double)g_fc_millihz / 1000.0,
+                    -(double)(DAC_MAX_COUNT - DAC_MIN_COUNT), (double)(DAC_MAX_COUNT - DAC_MIN_COUNT));
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -356,14 +422,17 @@ int main(void)
           send_line("WARN closed-loop estop: telemetry stale\r\n");
         }
 
-        char hb_line[96];
+        char hb_line[160];
         int  hb_len = snprintf(hb_line, sizeof(hb_line),
-                                "heartbeat uptime=%lus mode=%s amp=%u estop=%u pkts=%lu errs=%lu\r\n",
+                                "heartbeat uptime=%lus mode=%s amp=%u estop=%u pkts=%lu errs=%lu "
+                                "uart_ore=%lu uart_fe=%lu uart_ne=%lu uart_pe=%lu\r\n",
                                 (unsigned long)(now / 1000U),
                                 (g_mode == MODE_OPEN_LOOP) ? "open_loop" : "closed_loop",
                                 (unsigned)g_amp_enabled, (unsigned)g_estop_latched,
                                 (unsigned long)g_packet_count,
-                                (unsigned long)g_checksum_error_count);
+                                (unsigned long)g_checksum_error_count,
+                                (unsigned long)g_uart_ore_count, (unsigned long)g_uart_fe_count,
+                                (unsigned long)g_uart_ne_count, (unsigned long)g_uart_pe_count);
         if (hb_len > 0)
         {
           enqueue_tx(hb_line, (uint16_t)hb_len);
@@ -386,9 +455,15 @@ int main(void)
     {
       process_command_line(vcp_rx_queue[vcp_rx_tail]);
       vcp_rx_tail = (uint8_t)((vcp_rx_tail + 1U) % VCP_RX_QUEUE_DEPTH);
-      __disable_irq();
+      /* Guards against the RX ISR's vcp_rx_count++ -- genuinely a
+       * USART2-only race (I2C1 never touches this), so scope the mask
+       * to USART2_IRQn rather than a global __disable_irq() (see the
+       * 2026-08-13 fix a few lines below for why that distinction turned
+       * out to matter a lot). This window is a single decrement, tiny
+       * either way, but there's no reason to leave it global. */
+      HAL_NVIC_DisableIRQ(USART2_IRQn);
       vcp_rx_count--;
-      __enable_irq();
+      HAL_NVIC_EnableIRQ(USART2_IRQn);
     }
 
     if (g_new_packet_ready)
@@ -399,13 +474,33 @@ int main(void)
       int16_t  y;
       uint32_t pkt_count;
       uint32_t err_count;
-      char     line[80];
+      char     line[120];
       int      len;
 
       /* Snapshot under a brief IRQ-disable so a new packet landing
        * mid-copy can't tear these fields -- cheap here (a few loads),
-       * not worth a double-buffer for a ~20Hz smoke test. */
-      __disable_irq();
+       * not worth a double-buffer for a ~20Hz smoke test.
+       *
+       * REAL BUG fixed here 2026-08-13: these fields are only ever
+       * written by the I2C1 ISR (process_beam_packet) -- USART2 never
+       * touches them -- so this only ever needed to guard against I2C1,
+       * not a global __disable_irq(). But __disable_irq() masks
+       * EVERYTHING via PRIMASK, including USART2, and NVIC preemption
+       * priority (USART2 configured higher than I2C1 specifically so it
+       * can preempt) can't help against a blanket PRIMASK mask -- it
+       * only affects priority-based preemption between IRQs that are
+       * both individually enabled. This snapshot runs once per
+       * telemetry packet (~150-200Hz) and was silently blocking UART RX
+       * reception during every single one, which a direct hardware
+       * check confirmed: HAL_UART_ErrorCallback's ORE (overrun) counter
+       * climbed by ~1 per burst-written VCP command sent while this was
+       * in place, exactly matching the long-standing "get_status" ->
+       * "getsa" corruption chased all session. Narrowed to only disable
+       * the two IRQs that can actually write these fields, leaving
+       * USART2 free to preempt (and actually service RX bytes) the
+       * entire time. */
+      HAL_NVIC_DisableIRQ(I2C1_EV_IRQn);
+      HAL_NVIC_DisableIRQ(I2C1_ER_IRQn);
       seq       = g_latest_beam.seq;
       status    = g_latest_beam.status;
       x         = g_latest_beam.x;
@@ -413,7 +508,8 @@ int main(void)
       pkt_count = g_packet_count;
       err_count = g_checksum_error_count;
       g_new_packet_ready = 0;
-      __enable_irq();
+      HAL_NVIC_EnableIRQ(I2C1_EV_IRQn);
+      HAL_NVIC_EnableIRQ(I2C1_ER_IRQn);
 
       /* Closed-loop control step -- only on a CONFIDENT detection (status
        * bit0), matching the same "don't trust this position" convention
@@ -427,20 +523,48 @@ int main(void)
        * catches a fully-dead stream. */
       if (g_mode == MODE_CLOSED_LOOP && (status & 1U))
       {
-        run_closed_loop_step(x, HAL_GetTick());
+        uint32_t ctrl_now = HAL_GetTick();
+        if (g_sine_active)
+        {
+          update_sine_target(ctrl_now);
+        }
+        run_closed_loop_step(x, ctrl_now);
       }
 
       {
-        const char *x_sign, *y_sign;
-        int x_whole, x_frac, y_whole, y_frac;
+        const char *x_sign, *y_sign, *tgt_sign;
+        int x_whole, x_frac, y_whole, y_frac, tgt_whole, tgt_frac;
 
         decode_scaled(x, &x_sign, &x_whole, &x_frac);
         decode_scaled(y, &y_sign, &y_whole, &y_frac);
+        /* g_target_x_scaled reflects whatever run_closed_loop_step just
+         * used this cycle (including update_sine_target's write above,
+         * if sine mode is active) -- reporting it alongside x/y lets a
+         * host-side fit compare measured cx directly against the
+         * setpoint that was ACTUALLY in effect for this sample, instead
+         * of reconstructing an assumed setpoint from a host-side start
+         * time + elapsed wall-clock, which is exactly what produced the
+         * impossible negative-lag ("cx leads its own command") artifact
+         * in fta_closed_loop_onboard_sine_test.py (2026-08-13) -- that
+         * script trusted a t=0 captured after a paced multi-hundred-ms
+         * command round trip, systematically late relative to the
+         * firmware's real start moment. Reporting the setpoint per-
+         * sample removes the need to trust any host-side clock at all. */
+        decode_scaled(g_target_x_scaled, &tgt_sign, &tgt_whole, &tgt_frac);
 
+        /* g_last_dac_y is the actual commanded actuator output this
+         * cycle (whatever apply_dac() last wrote to DAC1 channel 2) --
+         * plain DAC counts, not POSITION_SCALE-scaled, since it's a
+         * hardware setpoint, not a pixel measurement. Reporting it lets
+         * a host-side plot show the real actuator command alongside the
+         * resulting cx/tgt trace, instead of having to infer it from the
+         * control law offline. */
         len = snprintf(line, sizeof(line),
-                        "seq=%3u status=%u x=%s%d.%01d y=%s%d.%01d pkts=%lu errs=%lu\r\n",
+                        "seq=%3u status=%u x=%s%d.%01d y=%s%d.%01d tgt=%s%d.%01d dac_y=%ld pkts=%lu errs=%lu\r\n",
                         (unsigned)seq, (unsigned)status,
                         x_sign, x_whole, x_frac, y_sign, y_whole, y_frac,
+                        tgt_sign, tgt_whole, tgt_frac,
+                        (long)g_last_dac_y,
                         (unsigned long)pkt_count, (unsigned long)err_count);
       }
       if (len > 0)
@@ -794,13 +918,12 @@ static void apply_dac(fta_axis_t axis, int32_t value)
   }
 }
 
-/* Single-axis (dac_y -> cx) closed-loop control step -- P+I only,
- * derivative deliberately deferred (no filtering/kick-avoidance work has
- * been done for it yet). Called once per fresh, confidently-detected
- * telemetry packet while g_mode == MODE_CLOSED_LOOP (see the call site in
- * main()'s while(1) loop) -- never during open_loop, and never for stale/
- * unconfident packets. tel_x_scaled is g_latest_beam.x, still
- * POSITION_SCALE-scaled, same as everywhere else in this file.
+/* Single-axis (dac_y -> cx) closed-loop control step. Called once per
+ * fresh, confidently-detected telemetry packet while
+ * g_mode == MODE_CLOSED_LOOP (see the call site in main()'s while(1)
+ * loop) -- never during open_loop, and never for stale/unconfident
+ * packets. tel_x_scaled is g_latest_beam.x, still POSITION_SCALE-scaled,
+ * same as everywhere else in this file.
  *
  * The sign here (positive error -> positive dac_y correction) and the
  * choice of dac_y/cx as the controlled pair both come directly from the
@@ -810,48 +933,32 @@ static void apply_dac(fta_axis_t axis, int32_t value)
  * are ever recollimated again, both of those may need to change together
  * with a fresh calibration -- this function does not re-derive them.
  *
- * Anti-windup: the integral accumulator is clamped so its contribution
- * (g_ki * g_integral_px_s) can never exceed the full DAC output range --
- * Ki-agnostic (the bound is computed from the current g_ki each step), so
- * it stays correct across a live set_ki change rather than needing a
- * fixed magic number tuned for one particular gain. */
+ * As of 2026-08-18, the P/I/D math + anti-windup that used to live
+ * directly in this function is PIDController.hpp (via pid_wrapper.h),
+ * used verbatim per Phil's e-mail -- see that header for the class
+ * itself and pid_wrapper.h for the calling convention/unit choices.
+ * pid_wrapper_calculate() returns a CORRECTION relative to
+ * g_closed_loop_base_dac_y, not an absolute DAC value; apply_dac()
+ * still does the final hardware clamp exactly as before. */
 static void run_closed_loop_step(int16_t tel_x_scaled, uint32_t now)
 {
-  float   error_px;
-  float   dt_s;
-  float   p_term;
-  float   i_term;
+  double  target_px;
+  double  measured_px;
+  double  correction;
   int32_t output;
 
-  error_px = (float)(g_target_x_scaled - (int32_t)tel_x_scaled) / (float)POSITION_SCALE;
+  (void)now;  /* PIDController.hpp's calculate() has no dt argument --
+               * ts_ is fixed at construction (see pid_wrapper.h's
+               * docstring on why), so the real per-packet tick is no
+               * longer needed here. */
 
-  dt_s = (float)(now - g_last_control_tick) / 1000.0f;
-  if (dt_s < 0.0f)
-  {
-    /* HAL_GetTick() wraps every ~49.7 days -- treat a negative delta as a
-     * skipped step (dt effectively 0, no integral contribution this
-     * round) rather than feed a huge bogus dt into the integral. */
-    dt_s = 0.0f;
-  }
+  target_px   = (double)g_target_x_scaled / (double)POSITION_SCALE;
+  measured_px = (double)tel_x_scaled / (double)POSITION_SCALE;
 
-  if (g_ki_milli != 0)
-  {
-    float max_integral = ((float)(DAC_MAX_COUNT - DAC_MIN_COUNT)) / fabsf(g_ki);
-    g_integral_px_s += error_px * dt_s;
-    if (g_integral_px_s > max_integral)  { g_integral_px_s = max_integral; }
-    if (g_integral_px_s < -max_integral) { g_integral_px_s = -max_integral; }
-    i_term = g_ki * g_integral_px_s;
-  }
-  else
-  {
-    i_term = 0.0f;
-  }
-
-  p_term = g_kp * error_px;
-  output = g_closed_loop_base_dac_y + (int32_t)(p_term + i_term);
+  correction = pid_wrapper_calculate(target_px, measured_px);
+  output = g_closed_loop_base_dac_y + (int32_t)correction;
 
   apply_dac(AXIS_Y, output);  /* clamps internally to [DAC_MIN_COUNT, DAC_MAX_COUNT] */
-  g_last_control_tick = now;
 }
 
 /* --- Amp / safety -------------------------------------------------------- */
@@ -897,11 +1004,32 @@ static void estop(void)
  * relay ~150-200Hz + occasional command replies, comfortably inside an
  * 8-deep queue drained every main-loop pass). Only ever called from main-
  * loop context (never from ISR context -- estop(), the only ISR-level
- * caller of anything in this file, doesn't send), so the brief
- * __disable_irq() here only needs to guard against HAL_UART_TxCpltCallback
- * running concurrently, not true reentrancy. */
+ * caller of anything in this file, doesn't send).
+ *
+ * REAL BUG fixed here 2026-08-13, found only after the user pushed back
+ * hard on "whole-line sends used to be reliable, why do we suddenly need
+ * per-character pacing" -- and they were right to. The first version of
+ * this function did the memcpy (up to ~40 bytes, for the per-packet relay
+ * line) INSIDE the __disable_irq()/__enable_irq() critical section. That
+ * section now runs on every telemetry packet (~150-200Hz) -- a copy that
+ * size can easily take longer than one UART byte period at 460800 baud
+ * (~21.7us), so this fix, meant to stop the relay print from blocking the
+ * main loop, was instead creating a NEW, more frequent RX-blocking window
+ * than the original blocking-HAL_UART_Transmit code ever did (that code
+ * never disabled interrupts at all, just occupied the main loop). This is
+ * the most likely real explanation for burst-write commands staying
+ * unreliable (even fully corruption-free single-threaded, zero-contention
+ * synchronous tests still failed) despite every other fix this session
+ * (RX queue, faster baud, faster clock). Fixed by only holding the lock
+ * for the cheap integer bookkeeping (reserve a slot, do the memcpy
+ * UNLOCKED, then publish it) -- see the two-phase reserve/publish split
+ * below; the slot isn't visible to the consumer ISR (HAL_UART_TxCpltCallback)
+ * until tx_count is incremented in the second locked section, which only
+ * happens after the memcpy completes, so there's no window where the ISR
+ * could transmit not-yet-written data. */
 static void enqueue_tx(const char *s, uint16_t len)
 {
+  uint8_t my_slot;
   uint8_t need_kick = 0;
 
   if (len >= TX_MSG_MAX_LEN)
@@ -909,21 +1037,39 @@ static void enqueue_tx(const char *s, uint16_t len)
     len = TX_MSG_MAX_LEN - 1U;
   }
 
-  __disable_irq();
-  if (tx_count < TX_QUEUE_DEPTH)
+  /* Guards against HAL_UART_TxCpltCallback (a genuine USART2-IRQn race --
+   * scoped to just that IRQ, not a global __disable_irq(), so I2C1 is
+   * never needlessly blocked here; RX-complete shares the same IRQn as
+   * TX-complete on this MCU so it's still briefly affected, unavoidably,
+   * but only for these few integer ops, not a memcpy -- see this
+   * function's main docstring above for the 2026-08-13 history). */
+  HAL_NVIC_DisableIRQ(USART2_IRQn);
+  if (tx_count >= TX_QUEUE_DEPTH)
   {
-    memcpy(tx_queue[tx_head].data, s, len);
-    tx_queue[tx_head].len = len;
-    tx_head = (uint8_t)((tx_head + 1U) % TX_QUEUE_DEPTH);
-    tx_count++;
-    if (!tx_busy)
-    {
-      tx_busy = 1;
-      need_kick = 1;
-    }
+    /* Queue full, message dropped -- see docstring above. */
+    HAL_NVIC_EnableIRQ(USART2_IRQn);
+    return;
   }
-  /* else: TX queue full, message dropped -- see docstring above. */
-  __enable_irq();
+  my_slot = tx_head;
+  tx_head = (uint8_t)((tx_head + 1U) % TX_QUEUE_DEPTH);
+  HAL_NVIC_EnableIRQ(USART2_IRQn);
+
+  /* Unlocked on purpose -- see docstring. Safe: this slot index was
+   * claimed above (tx_head already moved past it) so nothing else will
+   * try to write it, and it isn't visible to the consumer ISR until
+   * tx_count is incremented below, which happens only after this copy
+   * finishes. */
+  memcpy(tx_queue[my_slot].data, s, len);
+  tx_queue[my_slot].len = len;
+
+  HAL_NVIC_DisableIRQ(USART2_IRQn);
+  tx_count++;
+  if (!tx_busy)
+  {
+    tx_busy = 1;
+    need_kick = 1;
+  }
+  HAL_NVIC_EnableIRQ(USART2_IRQn);
 
   if (need_kick)
   {
@@ -995,6 +1141,22 @@ static void process_command_line(char *line)
   {
     cmd_set_ki(arg);
   }
+  else if (strcmp(cmd, "set_kd") == 0)
+  {
+    cmd_set_kd(arg);
+  }
+  else if (strcmp(cmd, "set_fc") == 0)
+  {
+    cmd_set_fc(arg);
+  }
+  else if (strcmp(cmd, "start_sine") == 0)
+  {
+    cmd_start_sine(arg);
+  }
+  else if (strcmp(cmd, "stop_sine") == 0)
+  {
+    cmd_stop_sine();
+  }
   else
   {
     char resp[64];
@@ -1028,16 +1190,14 @@ static void cmd_set_mode(const char *arg)
       send_line("ERR set_target_x first\r\n");
       return;
     }
-    /* Bumpless transfer: bias the output off wherever dac_y already is
-     * and start the integral at 0, rather than jumping straight to a raw
-     * Kp*error value computed from an implicit zero base -- see
-     * run_closed_loop_step's docstring for the control law itself.
-     * g_last_control_tick is reset too so the first real step after this
-     * gets a small, sane dt instead of however long it's been since
-     * boot. */
+    /* Bumpless transfer: bias the output off wherever dac_y already is,
+     * rather than jumping straight to a raw correction computed from an
+     * implicit zero base -- see run_closed_loop_step's docstring for the
+     * control law itself. pid_wrapper_reset() clears the PIDController's
+     * integral/derivative history for the same reason this file's
+     * previous hand-rolled version zeroed its own integral here. */
     g_closed_loop_base_dac_y = g_last_dac_y;
-    g_integral_px_s = 0.0f;
-    g_last_control_tick = HAL_GetTick();
+    pid_wrapper_reset();
     g_mode = MODE_CLOSED_LOOP;
     send_line("OK mode=closed_loop\r\n");
   }
@@ -1127,13 +1287,124 @@ static void cmd_set_target_x(const char *arg)
   }
 }
 
-/* Kp/Ki are taken as milli-units integers (e.g. "set_kp 2500" -> Kp=2.5)
- * rather than a float string -- strtol only, no strtof/newlib float-scanf
- * dependency, same rationale as decode_scaled's existing avoidance of
- * float-printf (see that function's docstring and the Includes comment
- * near math.h above). Kp is DAC counts per pixel of error; Ki is DAC
- * counts per (pixel*second) of accumulated error -- see
- * run_closed_loop_step. */
+/* start_sine FREQ_MILLIHZ AMPLITUDE_PX CENTER_PX -- three
+ * space-separated integers, e.g. "start_sine 10000 25 250" for a 10Hz,
+ * +-25px sine around cx=250. Parses all three from `arg` by hand (unlike
+ * every other command here, which takes at most one argument) since
+ * process_command_line only splits the line on its FIRST space. Sets
+ * g_target_x_set=1 too, same as cmd_set_target_x, so `set_mode
+ * closed_loop` doesn't need a separate priming call first if this is
+ * used to start things from scratch -- though the intended flow is
+ * still prime -> engage closed_loop -> start_sine, for a bumpless
+ * transfer into the sine (see cmd_set_mode's own docstring). */
+static void cmd_start_sine(const char *arg)
+{
+  /* amplitude_x10 is in POSITION_SCALE units (tenths of a pixel), NOT
+   * whole pixels -- whole-pixel-only amplitude (the original design)
+   * was too coarse for small-amplitude tests (e.g. a ~10um peak-to-peak
+   * target is ~1.7px amplitude at MICRONS_PER_PIXEL=3.0, which could
+   * only round to 1 or 2px -- a 6 or 12um result, not close to 10). This
+   * matches the precision g_target_x_scaled/tel_x_scaled already carry
+   * elsewhere in this firmware, just exposed on the wire directly rather
+   * than re-deriving it by another *POSITION_SCALE multiply here. */
+  long  freq_millihz, amplitude_x10, center_px;
+  char *p = (char *)arg;
+  char *endptr;
+  char  resp[80];
+  int   len;
+
+  if (arg == NULL || arg[0] == '\0')
+  {
+    send_line("ERR start_sine requires FREQ_MILLIHZ AMPLITUDE_X10 CENTER_PX\r\n");
+    return;
+  }
+
+  freq_millihz = strtol(p, &endptr, 10);
+  if (endptr == p)
+  {
+    send_line("ERR invalid freq_millihz\r\n");
+    return;
+  }
+  p = endptr;
+  while (*p == ' ') { p++; }
+
+  amplitude_x10 = strtol(p, &endptr, 10);
+  if (endptr == p)
+  {
+    send_line("ERR invalid amplitude_x10\r\n");
+    return;
+  }
+  p = endptr;
+  while (*p == ' ') { p++; }
+
+  center_px = strtol(p, &endptr, 10);
+  if (endptr == p)
+  {
+    send_line("ERR invalid center_px\r\n");
+    return;
+  }
+
+  if (freq_millihz <= 0)
+  {
+    send_line("ERR freq_millihz must be positive\r\n");
+    return;
+  }
+
+  g_sine_freq_millihz     = (int32_t)freq_millihz;
+  g_sine_amplitude_scaled = (int32_t)amplitude_x10;
+  g_sine_center_scaled    = (int32_t)center_px * POSITION_SCALE;
+  g_sine_start_tick       = HAL_GetTick();
+  g_sine_active           = 1;
+  g_target_x_set          = 1;
+
+  {
+    const char *amp_sign;
+    int amp_whole, amp_frac;
+    decode_scaled(g_sine_amplitude_scaled, &amp_sign, &amp_whole, &amp_frac);
+    len = snprintf(resp, sizeof(resp),
+                    "OK sine_started freq_millihz=%ld amplitude=%s%d.%01d center=%ld start_tick=%lu\r\n",
+                    freq_millihz, amp_sign, amp_whole, amp_frac, center_px, (unsigned long)g_sine_start_tick);
+  }
+  if (len > 0)
+  {
+    send_line(resp);
+  }
+}
+
+static void cmd_stop_sine(void)
+{
+  g_sine_active = 0;
+  send_line("OK sine_stopped\r\n");
+}
+
+/* Called once per control step (see the call site in main()'s while(1)
+ * loop, right before run_closed_loop_step) while g_sine_active -- computes
+ * target_x(t) = center + amplitude*sin(2*pi*freq*(t-t0)) using the
+ * firmware's own HAL_GetTick() as the time base and writes it directly
+ * into g_target_x_scaled, so run_closed_loop_step itself needs no changes
+ * at all -- it just sees a target that happens to be moving. sinf() (not
+ * sin()) since everything else in this control path is single-precision
+ * float already (see run_closed_loop_step's docstring on why: this MCU
+ * has a hardware FPU for single precision only). */
+static void update_sine_target(uint32_t now)
+{
+  float elapsed_s = (float)(now - g_sine_start_tick) / 1000.0f;
+  float freq_hz = (float)g_sine_freq_millihz / 1000.0f;
+  float phase = 2.0f * 3.14159265358979323846f * freq_hz * elapsed_s;  /* M_PI isn't guaranteed defined by newlib's math.h without extra feature macros -- literal instead */
+  float amplitude_scaled = (float)g_sine_amplitude_scaled;
+  float center_scaled = (float)g_sine_center_scaled;
+
+  g_target_x_scaled = (int32_t)(center_scaled + amplitude_scaled * sinf(phase));
+}
+
+/* Kp/Ki/Kd are taken as milli-units integers (e.g. "set_kp 2500" ->
+ * Kp=2.5) rather than a float string -- strtol only, no strtof/newlib
+ * float-scanf dependency, same rationale as decode_scaled's existing
+ * avoidance of float-printf (see that function's docstring and the
+ * Includes comment near math.h above). Kp is DAC counts per pixel of
+ * error; Ki is DAC counts per (pixel*second) of accumulated error; Kd is
+ * DAC counts per (pixel/second) of error rate-of-change -- see
+ * PIDController.hpp (via pid_wrapper.h) for the actual control law. */
 static void cmd_set_kp(const char *arg)
 {
   long  val;
@@ -1155,7 +1426,14 @@ static void cmd_set_kp(const char *arg)
   }
 
   g_kp_milli = (int32_t)val;
-  g_kp = (float)g_kp_milli / 1000.0f;
+
+  /* Reconstructs the PIDController instance with the new gain set (see
+   * pid_wrapper.h -- the class has no gain setters by design, so a
+   * live gain change means rebuilding it). This also resets the
+   * integral/derivative history, same as this file's previous hand-
+   * rolled version did explicitly on a Ki change -- now implicit in
+   * every gain change, Kp included, which is at least as safe. */
+  pid_wrapper_set_gains((double)g_kp_milli / 1000.0, (double)g_ki_milli / 1000.0, (double)g_kd_milli / 1000.0);
 
   len = snprintf(resp, sizeof(resp), "OK kp_milli=%ld\r\n", val);
   if (len > 0)
@@ -1185,13 +1463,82 @@ static void cmd_set_ki(const char *arg)
   }
 
   g_ki_milli = (int32_t)val;
-  g_ki = (float)g_ki_milli / 1000.0f;
-  /* Changing Ki mid-flight invalidates whatever the old integral
-   * accumulated under the previous gain -- reset rather than let a stale
-   * accumulator produce a sudden i_term jump under the new one. */
-  g_integral_px_s = 0.0f;
+  pid_wrapper_set_gains((double)g_kp_milli / 1000.0, (double)g_ki_milli / 1000.0, (double)g_kd_milli / 1000.0);
 
   len = snprintf(resp, sizeof(resp), "OK ki_milli=%ld\r\n", val);
+  if (len > 0)
+  {
+    send_line(resp);
+  }
+}
+
+static void cmd_set_kd(const char *arg)
+{
+  long  val;
+  char *endptr;
+  char  resp[48];
+  int   len;
+
+  if (arg == NULL || arg[0] == '\0')
+  {
+    send_line("ERR set_kd requires an argument (milli-units, e.g. 100 = Kd 0.1)\r\n");
+    return;
+  }
+
+  val = strtol(arg, &endptr, 10);
+  if (endptr == arg)
+  {
+    send_line("ERR invalid integer\r\n");
+    return;
+  }
+
+  g_kd_milli = (int32_t)val;
+  pid_wrapper_set_gains((double)g_kp_milli / 1000.0, (double)g_ki_milli / 1000.0, (double)g_kd_milli / 1000.0);
+
+  len = snprintf(resp, sizeof(resp), "OK kd_milli=%ld\r\n", val);
+  if (len > 0)
+  {
+    send_line(resp);
+  }
+}
+
+/* Derivative low-pass filter cutoff, milli-Hz units (e.g. "set_fc 5000"
+ * -> fc=5.0Hz), same integer-only convention as set_kp/set_ki/set_kd.
+ * Added 2026-08-18 after the default 20Hz cutoff (PIDController.hpp's
+ * own example value) turned out to barely attenuate this rig's ~15.3Hz
+ * resonance at all (see the ring-down test in CLAUDE.md) -- live-
+ * settable so a much lower cutoff can be tried without a reflash per
+ * attempt. */
+static void cmd_set_fc(const char *arg)
+{
+  long  val;
+  char *endptr;
+  char  resp[48];
+  int   len;
+
+  if (arg == NULL || arg[0] == '\0')
+  {
+    send_line("ERR set_fc requires an argument (milli-Hz, e.g. 5000 = 5.0Hz)\r\n");
+    return;
+  }
+
+  val = strtol(arg, &endptr, 10);
+  if (endptr == arg)
+  {
+    send_line("ERR invalid integer\r\n");
+    return;
+  }
+
+  if (val <= 0)
+  {
+    send_line("ERR fc_millihz must be positive\r\n");
+    return;
+  }
+
+  g_fc_millihz = (int32_t)val;
+  pid_wrapper_set_fc((double)g_fc_millihz / 1000.0);
+
+  len = snprintf(resp, sizeof(resp), "OK fc_millihz=%ld\r\n", val);
   if (len > 0)
   {
     send_line(resp);
@@ -1229,10 +1576,20 @@ static void cmd_get_status(void)
   int16_t  tel_x_scaled, tel_y_scaled;
   uint32_t pkt_count, err_count, last_tel_tick, now;
   int32_t  dac_x, dac_y;
-  char     line[220];
+  char     line[280];
   int      len;
 
-  __disable_irq();
+  /* Same 2026-08-13 fix as the telemetry snapshot in main()'s while(1)
+   * loop -- only g_latest_beam/g_latest_beam_tick/g_packet_count/
+   * g_checksum_error_count are ever written by an ISR (I2C1's), so only
+   * I2C1 needs masking here. amp_en/estop_latched/dac_x/dac_y are only
+   * ever written by main-loop command handlers, never an ISR -- reading
+   * them under this lock is just convenience/consistency, not a real
+   * race. A global __disable_irq() here would block USART2 (and thus
+   * risk corrupting the very reply this function is about to send)
+   * during every get_status call, not just every telemetry packet. */
+  HAL_NVIC_DisableIRQ(I2C1_EV_IRQn);
+  HAL_NVIC_DisableIRQ(I2C1_ER_IRQn);
   seq           = g_latest_beam.seq;
   status        = g_latest_beam.status;
   tel_x_scaled  = g_latest_beam.x;
@@ -1244,7 +1601,8 @@ static void cmd_get_status(void)
   estop_latched = g_estop_latched;
   dac_x         = g_last_dac_x;
   dac_y         = g_last_dac_y;
-  __enable_irq();
+  HAL_NVIC_EnableIRQ(I2C1_EV_IRQn);
+  HAL_NVIC_EnableIRQ(I2C1_ER_IRQn);
 
   now = HAL_GetTick();
 
@@ -1261,7 +1619,8 @@ static void cmd_get_status(void)
                     "STATUS mode=%s amp=%u estop=%u dac_x=%ld dac_y=%ld "
                     "tel_x=%s%d.%01d tel_y=%s%d.%01d tel_seq=%u tel_status=%u "
                     "tel_age_ms=%lu pkts=%lu errs=%lu uptime=%lus "
-                    "target_x_set=%u target_x=%s%d.%01d kp_milli=%ld ki_milli=%ld\r\n",
+                    "target_x_set=%u target_x=%s%d.%01d kp_milli=%ld ki_milli=%ld kd_milli=%ld "
+                    "fc_millihz=%ld sine=%u sine_freq_millihz=%ld\r\n",
                     (g_mode == MODE_OPEN_LOOP) ? "open_loop" : "closed_loop",
                     (unsigned)amp_en, (unsigned)estop_latched,
                     (long)dac_x, (long)dac_y,
@@ -1271,7 +1630,9 @@ static void cmd_get_status(void)
                     (unsigned long)pkt_count, (unsigned long)err_count,
                     (unsigned long)(now / 1000U),
                     (unsigned)g_target_x_set, tgt_sign, tgt_whole, tgt_frac,
-                    (long)g_kp_milli, (long)g_ki_milli);
+                    (long)g_kp_milli, (long)g_ki_milli, (long)g_kd_milli,
+                    (long)g_fc_millihz,
+                    (unsigned)g_sine_active, (long)g_sine_freq_millihz);
   }
   if (len > 0)
   {
@@ -1327,6 +1688,11 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
   if (huart->Instance == USART2)
   {
+    uint32_t err = huart->ErrorCode;
+    if (err & HAL_UART_ERROR_ORE) { g_uart_ore_count++; }
+    if (err & HAL_UART_ERROR_FE)  { g_uart_fe_count++;  }
+    if (err & HAL_UART_ERROR_NE)  { g_uart_ne_count++;  }
+    if (err & HAL_UART_ERROR_PE)  { g_uart_pe_count++;  }
     /* Same re-arm-after-any-error rationale as HAL_I2C_ErrorCallback
      * above. */
     HAL_UART_Receive_IT(&huart2, &vcp_rx_byte, 1);
