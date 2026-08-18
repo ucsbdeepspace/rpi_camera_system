@@ -33,6 +33,8 @@ import cv2
 import numpy as np
 from picamera2 import Picamera2
 
+from roi_set_selection import set_roi_y_start
+
 DEFAULT_RAW_SIZE = (640, 200)
 DEFAULT_FRAME_DURATION_US = 6000  # conservative -- floor not characterized
                                     # for either ROI mode, unlike the 3400us
@@ -50,6 +52,12 @@ else:
     RAW_SIZE = DEFAULT_RAW_SIZE
 FORCE_FRAME_DURATION_US = int(sys.argv[2]) if len(sys.argv) > 2 else DEFAULT_FRAME_DURATION_US
 SKIP_N = int(sys.argv[3]) if len(sys.argv) > 3 else DEFAULT_SKIP_N
+# Real sensor rows, pre-bin -- this script always resets to y_start=0 on
+# every mode select otherwise (a fixed top-of-sensor window), so if the beam
+# currently sits further down the sensor (check with roi_set_selection.py
+# <cam_index> first) the preview will just show background noise, not
+# "nothing works" -- pass this to actually look at the right rows.
+Y_START = int(sys.argv[4]) if len(sys.argv) > 4 else 0
 
 # ── Detect available cameras ────────────────────────────────────────────────
 info = Picamera2.global_camera_info()
@@ -85,6 +93,13 @@ def make_camera(index):
     if tuple(actual_raw["size"]) != RAW_SIZE:
         print(f"  WARNING: requested {RAW_SIZE} but got {actual_raw['size']} "
               f"-- the requested ROI mode was NOT selected as expected.")
+
+    if Y_START:
+        # Must happen after configure() (which just picked the mode and
+        # reset roi_y_start to 0) and before start() -- see the
+        # "runtime-movable ROI" notes in CLAUDE.md for why the order matters.
+        applied = set_roi_y_start(index, Y_START)
+        print(f"Camera {index} y_start requested={Y_START} applied={applied}")
 
     cam.start()
 

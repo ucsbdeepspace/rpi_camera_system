@@ -3582,6 +3582,118 @@ parameter, not a runtime-settable value).
 dac_x=95 dac_y=95`), `get_status` confirms `errs=0` at the new STM32-side
 timing config. Not yet committed to git as of this entry.
 
+### Pi-side I2C1 baud change landed and verified; `camera_view_tool.py` streaming throughput root-caused and fixed — 238Hz → ~440-475Hz real, measured (2026-08-18)
+
+Direct follow-up to the "Pi-side change needed" verification steps above.
+Added `dtparam=i2c_arm_baudrate=400000` to `/boot/firmware/config.txt`
+(alongside the already-present `dtparam=i2c_arm=on`) and rebooted.
+Confirmed applied: the live devicetree `clock-frequency` property under
+`/sys/class/i2c-dev/i2c-1/device/of_node/` reads `400000`, and
+`i2cdetect -y 1` still cleanly finds the Nucleo at `0x42` (~0.018s, not a
+timeout) — bus healthy at the new speed, step 1-2 of the prior entry's
+verification plan both pass.
+
+**Real camera driver work in this same session turned out to be a false
+alarm, not related to any of this.** A separate, uncommitted mid-session
+detour investigated `camera_preview_roi.py` showing "staticy flickering"
+and failing to center on the beam right after this same reboot — root
+cause was NOT the baud change (that bus is physically separate from the
+camera CSI/I2C controllers) and NOT a driver regression: only camera 0
+enumerated that boot (camera 1's already-documented intermittent
+ribbon-seating fault, see "Hardware status" below, coincidentally on the
+same boot), and `camera_preview_roi.py` itself has no beam-centering
+logic at all — it always resets to `y_start=0`, and the beam had drifted
+to sensor row ~426 (outside that fixed top-of-sensor window) since this
+tool was last used back in July. Fixed by adding an optional `y_start`
+CLI arg to `camera_preview_roi.py` (reuses `roi_set_selection.py`'s
+`set_roi_y_start`). Also cleaned up 3 stray artifacts (a bare `h`
+appended to the end of `camera_preview_roi.py`/`camera_view_tool.py`, a
+`workedh` typo in `camera_preview.py`'s docstring) — accidental keystrokes
+that landed in Thonny's editor instead of the OpenCV window, from running
+these tools inside Thonny rather than a plain terminal.
+
+**The real question — why does `camera_view_tool.py`'s live streaming to
+the Nucleo only achieve ~238Hz when this project once measured this
+camera at nearly 1kHz — was root-caused with real, isolated timing
+measurements** (matching this project's own established methodology, not
+estimated):
+
+| stage | measured |
+|---|---|
+| `NucleoLink.send_position()` alone, new 400kHz bus | ~0.29-0.34ms/call (was ~1ms/call pre-baud-raise) |
+| `find_beam_blob()` alone, `640x200` | ~1.79-2.02ms/call |
+| `find_beam_blob()` alone, `640x100` | ~1.14ms/call |
+| raw capture alone, `640x200` | ~1.875ms/frame (533fps, matches the old validated floor) |
+| combined capture+detect+send loop, `640x200`, no recenter/display | **342Hz** |
+| combined capture+detect+send loop, `640x100`, no recenter/display | **558Hz** |
+| + auto-track recenter (blocking, ~8.6ms/call × ~20/s), `640x200` | 274Hz |
+| + display/GTK overhead (~15Hz throttled draw) | ~238Hz (the originally-reported number) |
+
+**I2C was never the bottleneck after the baud raise** — `send_position()`
+dropped to ~0.3ms/call, a small fraction of the loop. The real cost was
+`apply_y_start()` (two `v4l2-ctl` subprocess calls, ~8.6ms combined)
+running synchronously inside the same loop that feeds the Nucleo, firing
+~20×/second whenever auto-track is on (the default whenever streaming is
+on) — plus `640x200`'s per-pixel detection cost being roughly double
+`640x100`'s.
+
+**Two real fixes landed in `camera_view_tool.py`, not yet committed as of
+mid-session but committed by the end (see push note below):**
+1. `DEFAULT_STREAM_ROI` switched from `(640, 200)` to `(640, 100)` — the
+   fastest binned mode, ~558Hz pure ceiling vs ~342Hz. Real tradeoff:
+   half the vertical drift margin (100 output / 200 real pre-bin rows),
+   which is exactly why fix #2 needed to land first.
+2. `apply_y_start()`'s per-frame auto-track calls replaced with a new
+   `request_recenter()` — runs the actual subprocess work on a background
+   thread instead of blocking the capture/detect/send loop. A `cycle_height()`-
+   or startup-triggered `apply_y_start()` call stays synchronous (rare,
+   one-time events, not hot-path).
+
+**A real correctness bug was caught and fixed before landing, not
+theoretical** — the user asked directly whether the streamed coordinates
+were independent of recentering, which they weren't in the first cut.
+`last_centroid_abs_y[i] = y_starts[i] + cy * v_bin` converts a frame's
+local centroid to an absolute sensor row using `y_starts[i]` as the
+offset; that's only correct if `y_starts[i]` can't change between "frame
+captured" and "coordinate computed" for that frame. The first background-
+thread version wrote `y_starts[i]` directly from the worker thread, at
+whatever arbitrary moment the subprocess call happened to finish relative
+to the main loop's own capture timing — if that landed between a frame
+being captured under the *old* window and its coordinate being computed,
+the tool would report a spurious jump of however far the recenter moved,
+straight into the Nucleo's telemetry stream as if it were real beam
+motion. Fixed: the background worker now writes into a separate
+`_recenter_applied` dict; the main loop is the only thing that ever moves
+a value from there into `y_starts`, and only right before that camera's
+own next `capture_array()` call — restoring the same "no capture in
+flight across a `y_starts` change" guarantee the old blocking design had
+for free, while keeping the actual slow work off the hot path. See
+`request_recenter()`'s docstring in the script for the full mechanism.
+
+**Verified live after each change** (`DISPLAY=:0`, real GUI, real Nucleo,
+`--signal=INT` so the `finally` cleanup runs): 342Hz → ~440Hz after the
+two fixes → ~449-475Hz after the correctness fix (no regression; run-to-
+run variance, if anything slightly faster). 0 I2C send failures across
+every run, `tainted` stayed `4096`, no dmesg anomalies, camera/I2C
+handles clean after each run. Not stress-tested against a *large* beam
+correction specifically (the bench beam was already well-centered during
+these runs, so recenter targets were close to the already-applied
+position) — the fix is a structural guarantee, not something that needed
+a big jump to validate, but flagging that this specific caveat wasn't
+exercised.
+
+**Committed and pushed** (see git log). `beam_position_streamer.py` was
+not touched this session — it has its own, separate blocking
+`set_roi_y_start` usage pattern and wasn't part of what the user was
+running, so it may still have the same recenter-blocks-the-loop cost if
+its own auto-recentering path is ever added/used; worth revisiting if it
+becomes the streaming path of choice instead of `camera_view_tool.py`.
+
+**State left**: Pi-side camera/I2C in this file's usual clean idle state.
+User moving to the laptop next to work on the Nucleo's closed-loop PID
+code — nothing about this session's changes touches firmware or the
+Nucleo side at all, purely Pi-side camera/I2C throughput.
+
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 
 Frequency-domain complement to the step-response tests, motivated by the

@@ -68,12 +68,12 @@ Controls:
       own ~20Hz throttle, decoupled from both the raw capture rate
       (find_beam_blob is too expensive to run on every one of 500-900
       frames/sec) and the ~15Hz display throttle (tying auto-track to that
-      was the original "why is this so slow" bug). Each recenter blocks the
-      capture loop for ~7-10ms (a v4l2-ctl subprocess call), so tracking
-      does cost some fps while active -- measured ~525fps -> ~220-230fps at
-      the old 50Hz rate; 20Hz keeps that hit much smaller. See
-      ANALYSIS_INTERVAL_S if you want to trade responsiveness for fps or
-      vice versa.
+      was the original "why is this so slow" bug). Each recenter's ~7-10ms
+      v4l2-ctl subprocess call runs on a background thread (request_recenter())
+      rather than blocking the capture loop, so tracking no longer costs fps
+      while active -- it used to (measured ~525fps -> ~220-230fps at the old
+      50Hz rate, before that fix). See ANALYSIS_INTERVAL_S if you want to
+      trade recenter responsiveness for request volume or vice versa.
   q   quit
 
 Full-speed streaming to the Nucleo (ON BY DEFAULT, camera 0): normally
@@ -88,10 +88,12 @@ reason. The on-screen view of that camera's centroid still only refreshes
 at the ~15Hz DISPLAY_INTERVAL_S rate -- full-speed transmission and a
 human-readable decimated view are independent, they don't have to share a
 rate. Auto-track recentering (if 't' is also on) stays gated at the slower
-ANALYSIS_INTERVAL_S cadence regardless, since its cost is the ~7-10ms
-set_roi_y_start subprocess call, not detection -- recentering on every
-streamed frame would tank fps the same way the original
-auto-track-at-50Hz bug did (see ANALYSIS_INTERVAL_S's own comment).
+ANALYSIS_INTERVAL_S cadence regardless -- not for fps reasons anymore
+(request_recenter() runs the ~7-10ms set_roi_y_start subprocess call on a
+background thread, off the capture loop entirely, see its own docstring),
+just to avoid issuing a fresh recenter request on literally every frame
+when the beam hasn't moved enough to matter (see ANALYSIS_INTERVAL_S's own
+comment).
 
 If the Nucleo link can't be opened, or an individual send fails (e.g. a
 NACK/timeout -- the same TimeoutError smbus2 raises on a dead/unwired
@@ -100,8 +102,9 @@ detection and display are unaffected, only the send itself is best-effort.
 Pass --no-stream to skip attempting the link entirely (pure bench-viewer
 mode, the old default).
 
-Starts directly in DEFAULT_STREAM_ROI (640x200, the validated ~527fps
-binned floor) whenever streaming, instead of the old full-sensor default
+Starts directly in DEFAULT_STREAM_ROI (640x100, the fastest binned mode --
+~558Hz measured combined capture+detect+send, see CLAUDE.md) whenever
+streaming, instead of the old full-sensor default
 -- high-speed tracking/transmission shouldn't require a manual 'h' press
 first. Since there's no prior detection to center on yet at startup, the
 initial window is centered on the sensor's vertical middle (same fallback
@@ -126,7 +129,7 @@ to be loaded -- see CLAUDE.md.
 
 Usage:
   python3 camera_view_tool.py [--no-stream] [--stream-cam N] [--dry-run] [--roi WxH]
-    (default)       starts in 640x200 (binned, ~527fps) with auto-track ON,
+    (default)       starts in 640x100 (binned, ~558Hz) with auto-track ON,
                      streaming camera 0's detected centroid to the Nucleo
                      over I2C at full capture speed -- see "Full-speed
                      streaming" above. A missing/unresponsive Nucleo is a
@@ -146,6 +149,7 @@ Install:  pip install opencv-python numpy
 """
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
 
@@ -212,32 +216,42 @@ ANALYSIS_INTERVAL_S = 0.05  # beam detection + auto-track recenter run at most
                               # display throttle was the original "why is
                               # this so slow" bug -- ~333ms/correction).
                               #
-                              # This is a real throughput/responsiveness
-                              # trade-off, not a free decoupling: each
-                              # recenter blocks the single capture loop for
-                              # set_roi_y_start's measured ~7-10ms subprocess
-                              # cost. At 50Hz (0.02s) that's up to ~45% of
-                              # the loop's time when the beam is tracked
-                              # continuously -- measured live, it dropped
-                              # 640x200 from ~525fps to ~220-230fps. 20Hz
-                              # keeps the fps hit much smaller while still
-                              # recentering ~16x faster than the original
-                              # ~333ms bug -- plenty responsive for a bench
-                              # alignment/monitoring tool. Lower this if
-                              # faster tracking matters more than fps for a
-                              # given use, higher if the reverse.
+                              # Recenter itself no longer blocks the capture
+                              # loop at all (see request_recenter() -- it
+                              # runs apply_y_start's ~7-10ms of v4l2-ctl
+                              # subprocess calls on a background thread), so
+                              # this throttle now only controls how often a
+                              # fresh recenter *request* is issued, not a
+                              # direct fps cost. Before that fix, this WAS a
+                              # real throughput trade-off: at 20Hz, blocking
+                              # recentering measured live dropped 640x200
+                              # from ~525fps to ~220-230fps (and 50Hz was
+                              # far worse, up to ~45% of the loop). Lower
+                              # this if faster tracking responsiveness
+                              # matters more than request volume for a given
+                              # use, higher if the reverse -- it's no longer
+                              # a speed trade-off, just a responsiveness one.
 STREAM_STATUS_INTERVAL = 200  # print a send-rate summary every this many
                                 # streamed frames -- printing every frame at
                                 # ~339fps would flood the terminal
 
 
-DEFAULT_STREAM_ROI = (640, 200)  # validated ~527fps binned floor (CLAUDE.md)
-                                    # -- the fast mode this tool now starts in
-                                    # by default whenever streaming, so
-                                    # high-speed tracking/transmission
-                                    # doesn't require a manual 'h' press
-                                    # first. Full sensor is one 'h' press
-                                    # away if a wider view is needed.
+DEFAULT_STREAM_ROI = (640, 100)  # fastest binned mode -- measured combined
+                                    # capture+detect+send ceiling ~558Hz here
+                                    # vs ~342Hz at 640x200 (CLAUDE.md), the
+                                    # dominant remaining cost at either size
+                                    # is find_beam_blob, not capture or I2C
+                                    # send. Real streamed rate depends on
+                                    # display/recenter overhead too -- see
+                                    # request_recenter() and
+                                    # DISPLAY_INTERVAL_S. Narrower window
+                                    # (100 output / 200 real pre-bin rows,
+                                    # half of 640x200's margin) means less
+                                    # room for the beam to drift before
+                                    # losing lock -- this is exactly why
+                                    # recenter needed to stop blocking the
+                                    # loop first. Full sensor is one 'h'
+                                    # press away if a wider view is needed.
 
 
 def parse_args():
@@ -323,7 +337,7 @@ def make_camera(index, initial_size):
     return cam
 
 
-def apply_y_start(index, target):
+def apply_y_start(index, target, out=None):
     """Push index's y_start and verify it actually landed, retrying briefly.
 
     Needed because cam.start() can return before the driver has fully
@@ -335,7 +349,20 @@ def apply_y_start(index, target):
     from looping over multiple cameras/windows first) hit the read's
     CalledProcessError directly, uncaught, since only the write used to be
     retried here -- so the whole operation, read included, is retried now.
+
+    Writes the applied value into `out` (defaults to the shared y_starts
+    dict, for the synchronous startup/cycle_height() callers). The
+    background-thread recenter path passes a *different* dict instead --
+    see request_recenter()'s docstring for why letting a background thread
+    write y_starts directly is a real correctness bug, not just a style
+    choice: the main loop uses y_starts[index] to convert a just-captured
+    frame's local centroid into an absolute sensor row, and that's only
+    correct if y_starts can't change out from under it between "frame
+    captured" and "coordinate computed" -- a background thread updating it
+    at an arbitrary moment breaks exactly that guarantee.
     """
+    if out is None:
+        out = y_starts
     last_err = None
     for _ in range(10):
         try:
@@ -354,8 +381,8 @@ def apply_y_start(index, target):
                                         # once auto-track started calling
                                         # it continuously -- found live,
                                         # tanked fps from ~530 to ~6.
-            y_starts[index] = set_roi_y_start(index, target)
-            if y_starts[index] == expected:
+            out[index] = set_roi_y_start(index, target)
+            if out[index] == expected:
                 return
         except subprocess.CalledProcessError as e:
             # Surface the actual v4l2-ctl failure on final exhaustion below
@@ -366,7 +393,63 @@ def apply_y_start(index, target):
         time.sleep(0.05)
     err_tag = f"  (last error: {last_err})" if last_err else ""
     print(f"WARNING camera {index}: y_start did not settle at {target}, "
-          f"landed at {y_starts[index]}{err_tag}")
+          f"landed at {out[index]}{err_tag}")
+
+
+_recenter_lock = threading.Lock()
+_recenter_pending = {}  # index -> most recently requested target row
+_recenter_busy = set()  # indices with a worker thread currently in flight
+_recenter_applied = {}  # index -> a completed background recenter's applied
+                          # y_start, not yet adopted into y_starts -- only
+                          # the main loop moves values from here into
+                          # y_starts, and only right before that camera's
+                          # own next capture_array() call (see the main
+                          # loop), so y_starts[i] can never change while a
+                          # frame captured under the OLD offset is still
+                          # being turned into an absolute-row coordinate.
+
+
+def _recenter_worker(index):
+    while True:
+        with _recenter_lock:
+            target = _recenter_pending.pop(index, None)
+            if target is None:
+                _recenter_busy.discard(index)
+                return
+        apply_y_start(index, target, out=_recenter_applied)
+
+
+def request_recenter(index, target):
+    """Non-blocking version of apply_y_start() for the per-frame auto-track
+    path. apply_y_start's ~7-10ms of v4l2-ctl subprocess calls used to block
+    the same loop that feeds the Nucleo, stalling telemetry every time it
+    fired -- measured live, this was the difference between a ~342Hz and a
+    ~274Hz combined capture+detect+send ceiling at 20Hz (see CLAUDE.md).
+    Runs the actual work on a background thread instead (subprocess calls
+    release the GIL while waiting, so this genuinely overlaps with capture,
+    not just deferred). If a recenter is already in flight for this camera,
+    overwrites the pending target rather than queuing another call -- only
+    the latest beam position matters, not every intermediate one the beam
+    passed through while the previous call was still running.
+
+    The worker writes its result into _recenter_applied, NOT y_starts
+    directly -- the main loop is the only thing that ever moves a value
+    from there into y_starts, and it only does so right before that
+    camera's own next capture_array() call. If the background thread wrote
+    y_starts directly, it could land at an arbitrary moment relative to
+    the main loop's own frame timing: a frame captured under the OLD
+    window could get its centroid's absolute row computed using the NEW
+    y_starts if the write happened to land in between "frame captured" and
+    "coordinate computed" -- a real spurious jump of however far the
+    recenter moved, sent straight to the Nucleo as if it were real beam
+    motion. Funneling the update through one fixed point in the main
+    loop's own sequence closes that race."""
+    with _recenter_lock:
+        _recenter_pending[index] = target
+        if index in _recenter_busy:
+            return
+        _recenter_busy.add(index)
+    threading.Thread(target=_recenter_worker, args=(index,), daemon=True).start()
 
 
 def cycle_height():
@@ -553,6 +636,16 @@ print("Streaming -- 'h' cycles mode (1280x800 -> 640x200 -> 640x100 -> 1280x800)
 try:
     while True:
         for i, cam in zip(indices, cams):
+            # Adopt any completed background recenter's result BEFORE
+            # capturing -- the only place y_starts[i] is allowed to change
+            # while streaming, so it's never mutated while a frame captured
+            # under the old offset is still being converted to an absolute
+            # row (see request_recenter()'s docstring for why that race is
+            # a real bug, not just a style nitpick).
+            with _recenter_lock:
+                if i in _recenter_applied:
+                    y_starts[i] = _recenter_applied.pop(i)
+
             # Capture every iteration, unconditionally, so the fps counter
             # reflects true capture speed -- the display/analysis work below
             # is throttled instead (see module docstring).
@@ -610,18 +703,18 @@ try:
                           f"last=({stream_x:.1f},{stream_y:.1f}) valid={beam_valid}")
 
                 # Auto-track recentering stays on the slower ANALYSIS_INTERVAL_S
-                # cadence regardless -- its cost is the ~7-10ms
-                # set_roi_y_start subprocess call, not detection, so
-                # recentering on every streamed frame would tank fps the
-                # same way the original auto-track-at-50Hz bug did (see
-                # ANALYSIS_INTERVAL_S's own comment).
+                # cadence regardless -- request_recenter() runs the actual
+                # ~7-10ms set_roi_y_start subprocess call on a background
+                # thread now (see its own docstring), so this throttle just
+                # limits how often a fresh request is issued, not a direct
+                # fps cost.
                 if (auto_track and raw_sizes[i][1] != PIXEL_ARRAY_HEIGHT
                         and last_found[i] is not None
                         and now - last_analysis_time[i] >= ANALYSIS_INTERVAL_S):
                     last_analysis_time[i] = now
                     pre_bin_height = raw_sizes[i][1] * v_bin
                     target = int(round(last_centroid_abs_y[i] - pre_bin_height / 2))
-                    apply_y_start(i, target)
+                    request_recenter(i, target)
             else:
                 # Beam detection + auto-track recenter run on their own ~20Hz
                 # throttle (ANALYSIS_INTERVAL_S) -- fast enough to keep up with
@@ -648,7 +741,7 @@ try:
                         if auto_track and raw_sizes[i][1] != PIXEL_ARRAY_HEIGHT:
                             pre_bin_height = raw_sizes[i][1] * v_bin
                             target = int(round(last_centroid_abs_y[i] - pre_bin_height / 2))
-                            apply_y_start(i, target)
+                            request_recenter(i, target)
 
             if now - last_display_time[i] < DISPLAY_INTERVAL_S:
                 continue
