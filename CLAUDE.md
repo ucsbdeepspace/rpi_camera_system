@@ -3348,7 +3348,7 @@ still affects other scripts sharing the old fixed-format assumption
 `fta_sine_response_test_vcp.py`, the open-loop `fta_step_response_test_vcp.py`)
 — only the one script actually run today was fixed; sine-tracking
 against this new controller (the real 10-20Hz deliverable) hasn't been
-re-run either. Nothing committed to git yet as of this entry.
+re-run either. (Committed and pushed later the same session, see below.)
 
 ### D-term evaluated properly: a direct free-decay test confirms a real ~15.3Hz resonance, D does not help at any tested filter cutoff, and the PID rate/cross-axis questions are answered (2026-08-18, same day)
 
@@ -3469,8 +3469,118 @@ convention. **Not yet done**: the anti-windup output-limits experiment
 flagged above; a full sine-tracking sweep was deliberately NOT re-run
 with any D configuration, since none beat the P+I baseline on the much
 cheaper step-response test — no reason to spend the extra hardware time
-confirming the same negative result at 5 frequencies. Nothing committed
-to git yet as of this entry.
+confirming the same negative result at 5 frequencies. (Committed and
+pushed later the same session, commit `12548ba`.)
+
+### I2C1 bus speed investigated — real ~106kHz standard mode found; STM32 slave side raised to ~333kHz Fast Mode and tested; Pi (master) side still needs a matching change (2026-08-19)
+
+Prompted by the user asking why the Pi->Nucleo telemetry rate (~200-235Hz,
+observed repeatedly all session) is so far below this project's own
+~1kHz raw-camera-capture ceiling (`MODE_640_100_ROI`, ~854-880fps). Two
+things resolved, one thing still open (needs the Pi, not available from
+this laptop-only session):
+
+**Clarified the actual comparison, not apples-to-apples.** The ~1kHz
+numbers came from `camera_throughput_test.py` -- pure sensor capture, no
+beam detection, no I2C send. The real streaming path
+(`camera_view_tool.py`) does capture + `find_beam_blob()` + an I2C send
+every frame. This project already measured `find_beam_blob()` alone at
+640x200 binned: ~2.32ms/call, a ~430fps ceiling from detection alone
+("fps root-cause" section above) -- already well under 1kHz before I2C
+even enters the picture. Real observed throughput (~200-235Hz) is still
+roughly half of that detection-alone estimate, so detection cost doesn't
+explain the whole gap either.
+
+**Checked what's directly checkable from this session (no Pi access):
+I2C1's actual bus speed.** Decoded the STM32 slave's own
+`hi2c1.Init.Timing` register (`0x00503D58`, CubeMX-computed when the
+system clock was raised to 16MHz -- see "Firmware queue rewrite" above)
+using the STM32L4 I2C_TIMINGR formula (RM0394 26.4.9): PRESC=0,
+SCLH=61, SCLL=88 -> SCL period ~9.4us -> **~106kHz, standard mode, not
+Fast Mode** -- never previously checked or documented. At ~106kHz, one
+8-byte telemetry packet costs ~700-800us of raw bus time alone, a
+~1.3kHz ceiling by itself -- real, but not the dominant factor given the
+~430fps detection ceiling is already lower than that.
+
+**Important clarification given to the user, worth remembering**: I2C
+slaves never drive SCL. The STM32's `Timing` register only configures
+how *this MCU* samples/filters the bus to correctly decode whatever
+clock the master actually drives -- it does not by itself change the
+real bus speed. The Raspberry Pi (bus master, via `smbus2`/`/dev/i2c-1`)
+is what actually sets SCL frequency, and needs its own change too.
+Raising only the STM32 side is a real, useful, testable step (validates
+the slave doesn't break at the new sampling config) but cannot alone
+demonstrate a throughput improvement.
+
+**STM32 side raised to Fast Mode and hardware-tested.** Hand-derived a
+new `Timing` value (no CubeMX GUI access from this session) from the
+register formula rather than trusting a memorized reference table: with
+I2CCLK=16MHz, PRESC=1 (`t_PRESC=125ns`), SCLL=13 (`t_SCLL=1750ns`, above
+the Fast Mode spec minimum tLOW=1300ns), SCLH=9 (`t_SCLH=1250ns`, above
+spec minimum tHIGH=600ns) -> total SCL period ~3.0us -> **~333kHz**,
+deliberately short of the 400kHz spec ceiling for margin since this
+bus's real rise/fall times have never been scoped. SCLDEL=4/SDADEL=0 are
+conservative values matching the general shape of ST's own Fast Mode
+reference tables, not tuned to this specific board.
+`hi2c1.Init.Timing = 0x1040090D`. **Not `.ioc`-tracked** (same situation
+as every other hand-added-outside-CubeMX setting in this file -- NVIC
+priorities, DAC1 init, USART2 baud) -- flagged inline in `main.c`,
+reapply by hand if this project is ever regenerated from the `.ioc`.
+
+Rebuilt, reflashed (same post-reflash silence glitch as every other
+reflash this session, resolved by reflashing again). **Confirmed clean**:
+`errs=0`, telemetry still flowing at the same ~220Hz baseline as before
+(expected -- the Pi hasn't changed yet, so the real bus clock is still
+whatever the Pi was already driving). This validates the new slave-side
+timing config doesn't break compatibility with a slower master (a slave
+configured for faster sampling has *more* margin against a slower real
+clock, not less) -- a real, useful confirmation, even though it can't
+demonstrate a speed win by itself.
+
+**Pi-side change needed to actually get a faster bus -- not done this
+session, no access to that machine from here.** Add (or edit, if a
+lower value already exists) in `/boot/firmware/config.txt`:
+```
+dtparam=i2c_arm_baudrate=400000
+```
+(`dtparam=i2c_arm=on` is already confirmed present in that file per the
+"Header I2C bus" section above -- add the baudrate line alongside it,
+same file.) This is the standard, documented Raspberry Pi OS parameter
+name for the general-purpose I2C bus baud rate; Raspberry Pi 5's RP1
+southbridge kept the same `i2c_arm` device-tree alias/binding for
+compatibility, so this should apply the same way it does on earlier Pi
+models, but **has not been verified against this specific RP1-based
+Pi 5 from this session** -- worth confirming directly rather than
+assuming. Requires a reboot to take effect (device tree overlay
+parameter, not a runtime-settable value).
+
+**Verification steps for after the reboot**, in order:
+1. `sudo i2cdetect -y 1` should still cleanly find the Nucleo at `0x42`
+   -- confirms the bus still enumerates correctly at the new speed
+   before trusting anything higher-level.
+2. Restart whichever streaming script was running
+   (`camera_view_tool.py`'s default mode, or `beam_position_streamer.py`)
+   and watch the Nucleo's own heartbeat/telemetry-relay line for
+   `errs=` -- if the physical wiring/pull-ups aren't good enough for
+   400kHz-class signal integrity (a real risk Standard Mode is more
+   tolerant of than Fast Mode), checksum errors would show up here
+   first, not as a silent failure.
+3. Compare the achieved packet rate against this entry's ~220Hz
+   baseline (same simple raw-line-count-over-N-seconds check used
+   throughout this file, e.g. reading the VCP for a few seconds and
+   counting `seq=` lines, or watching the Nucleo's own `pkts=` delta in
+   `get_status`/heartbeat over a fixed window).
+4. If throughput improves but is still well under the ~430fps
+   detection-alone ceiling, the remaining gap is most likely Pi-side
+   compute (detection + Python/`smbus2` per-call overhead) -- worth a
+   direct, isolated timing check of `NucleoLink.send_position()` and/or
+   `find_beam_blob()` at whatever mode is actually in use, the same way
+   this project isolated `find_beam_blob()`'s cost once before (see
+   "fps root-cause" above) -- not done this session.
+
+**State left**: hardware safely idle (`mode=open_loop amp=0 estop=0
+dac_x=95 dac_y=95`), `get_status` confirms `errs=0` at the new STM32-side
+timing config. Not yet committed to git as of this entry.
 
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 

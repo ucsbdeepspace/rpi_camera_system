@@ -638,7 +638,35 @@ static void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
-  hi2c1.Init.Timing = 0x00503D58;
+  /* Raised from ~106kHz standard mode to Fast Mode, 2026-08-19. The
+   * previous value (0x00503D58, CubeMX-computed for this project's
+   * 16MHz I2CCLK when the clock was raised from 4MHz -- see "Firmware
+   * queue rewrite" in CLAUDE.md) decoded to SCLH=61/SCLL=88/PRESC=0 ->
+   * SCL period ~9.4us -> ~106kHz. Investigating why the real end-to-end
+   * Pi->Nucleo telemetry rate (~200-235Hz) is so far below this
+   * project's ~1kHz raw camera-capture ceiling found this bus running
+   * at standard-mode speed was one contributing factor (not the whole
+   * gap -- see CLAUDE.md, 2026-08-19).
+   *
+   * Hand-derived (not CubeMX-generated, no GUI access from this session)
+   * from the STM32L4 I2C_TIMINGR formula (RM0394 26.4.9): with
+   * I2CCLK=16MHz, PRESC=1 -> t_PRESC=125ns; SCLL=13 -> t_SCLL=14*125ns=
+   * 1750ns (> the Fast Mode spec minimum tLOW=1300ns); SCLH=9 ->
+   * t_SCLH=10*125ns=1250ns (> spec minimum tHIGH=600ns). Total SCL
+   * period ~3.0us -> ~333kHz -- deliberately short of the 400kHz spec
+   * ceiling for margin, rather than cutting it exactly to spec, since
+   * this bus's real rise/fall times were never characterized on a
+   * scope. SCLDEL=4/SDADEL=0 are conservative values matching the
+   * general shape of ST's own Fast Mode reference tables, not tuned to
+   * this specific board.
+   *
+   * IMPORTANT: this only configures how the SLAVE (this MCU) samples/
+   * filters the bus -- I2C slaves never drive SCL, so this alone does
+   * NOT make the bus actually run faster. The Raspberry Pi (bus MASTER)
+   * also needs its own I2C1 baud rate raised to actually get a faster
+   * bus -- see the note in CLAUDE.md for the exact Pi-side change, not
+   * done from this session (no access to that machine here). */
+  hi2c1.Init.Timing = 0x1040090D;
   hi2c1.Init.OwnAddress1 = 132;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
