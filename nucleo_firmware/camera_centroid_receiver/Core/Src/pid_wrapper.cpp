@@ -29,12 +29,12 @@ static PIDController *g_pid = nullptr;
 alignas(PIDController) static unsigned char g_pid2_storage[sizeof(PIDController)];
 static PIDController *g_pid2 = nullptr;
 
-static double g_ts_s   = 0.0021858;  /* ~1/457.5s -- this default is overwritten by
+static float g_ts_s   = 0.0021858f;  /* ~1/457.5s -- this default is overwritten by
                                        * pid_wrapper_init()'s real argument at startup; kept
                                        * roughly current (2026-08-19: ~440-475Hz measured
                                        * telemetry rate, was ~207-235Hz pre-ROI-change) only as
                                        * a defensive fallback, see pid_wrapper.h. */
-static double g_fc_hz  = 20.0;       /* derivative low-pass cutoff -- Phil's own example value
+static float g_fc_hz  = 20.0f;       /* derivative low-pass cutoff -- Phil's own example value
                                        * originally, found 2026-08-18 to be far too high relative
                                        * to this rig's own ~15.3Hz lightly-damped resonance
                                        * (confirmed via a direct free-decay ring-down test, see
@@ -43,9 +43,9 @@ static double g_fc_hz  = 20.0;       /* derivative low-pass cutoff -- Phil's own
                                        * destabilized the loop. Now live-settable via set_fc so
                                        * this can be retried at a genuinely conservative cutoff
                                        * without a reflash per attempt. */
-static double g_out_min = 0.0;
-static double g_out_max = 0.0;
-static double g_kp = 0.0, g_ki = 0.0, g_kd = 0.0;  /* last-commanded gains, so pid_wrapper_set_fc
+static float g_out_min = 0.0f;
+static float g_out_max = 0.0f;
+static float g_kp = 0.0f, g_ki = 0.0f, g_kd = 0.0f;  /* last-commanded gains, so pid_wrapper_set_fc
                                                       * can reconstruct without needing them re-sent */
 
 static void reconstruct(void)
@@ -59,8 +59,8 @@ static void reconstruct(void)
     g_pid2->setOutputLimits(g_out_min, g_out_max);
 }
 
-extern "C" void pid_wrapper_init(double kp, double ki, double kd, double ts_s, double fc_hz,
-                                   double out_min, double out_max)
+extern "C" void pid_wrapper_init(float kp, float ki, float kd, float ts_s, float fc_hz,
+                                   float out_min, float out_max)
 {
     g_ts_s   = ts_s;
     g_fc_hz  = fc_hz;
@@ -73,7 +73,7 @@ extern "C" void pid_wrapper_init(double kp, double ki, double kd, double ts_s, d
     g_pid2->setOutputLimits(g_out_min, g_out_max);
 }
 
-extern "C" void pid_wrapper_set_gains(double kp, double ki, double kd)
+extern "C" void pid_wrapper_set_gains(float kp, float ki, float kd)
 {
     /* Reconstruct rather than mutate -- PIDController has no gain
      * setters (by design, per the class as given verbatim), and
@@ -85,13 +85,13 @@ extern "C" void pid_wrapper_set_gains(double kp, double ki, double kd)
     reconstruct();
 }
 
-extern "C" void pid_wrapper_set_fc(double fc_hz)
+extern "C" void pid_wrapper_set_fc(float fc_hz)
 {
     g_fc_hz = fc_hz;
     reconstruct();
 }
 
-extern "C" void pid_wrapper_set_ts(double ts_s)
+extern "C" void pid_wrapper_set_ts(float ts_s)
 {
     /* Live-settable sample time -- added 2026-08-19 specifically so the
      * "does throttling the control rate back down recover the old
@@ -107,7 +107,7 @@ extern "C" void pid_wrapper_set_ts(double ts_s)
     reconstruct();
 }
 
-extern "C" void pid_wrapper_set_out_limits(double out_min, double out_max)
+extern "C" void pid_wrapper_set_out_limits(float out_min, float out_max)
 {
     /* setOutputLimits() alone (no reconstruct) is enough here -- unlike
      * gains/fc, PIDController's constructor doesn't derive anything from
@@ -121,7 +121,7 @@ extern "C" void pid_wrapper_set_out_limits(double out_min, double out_max)
     g_pid2->setOutputLimits(g_out_min, g_out_max);
 }
 
-extern "C" double pid_wrapper_calculate(double setpoint_px, double measurement_px, double dt_s)
+extern "C" float pid_wrapper_calculate(float setpoint_px, float measurement_px, float dt_s)
 {
     /* dt_s is the caller's real measured elapsed time since its own last
      * control step (see main.c's run_closed_loop_step) -- passed straight
@@ -132,7 +132,7 @@ extern "C" double pid_wrapper_calculate(double setpoint_px, double measurement_p
     return g_pid->calculate(setpoint_px, measurement_px, dt_s);
 }
 
-extern "C" double pid_wrapper_calculate2(double setpoint_px, double measurement_px, double dt_s)
+extern "C" float pid_wrapper_calculate2(float setpoint_px, float measurement_px, float dt_s)
 {
     /* Second axis, see g_pid2's docstring above. */
     return g_pid2->calculate(setpoint_px, measurement_px, dt_s);

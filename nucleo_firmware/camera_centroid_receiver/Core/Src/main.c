@@ -251,6 +251,44 @@ static int32_t g_notch_q_milli = 0;       /* Q*1000, only meaningful while the n
 static int32_t g_lead_fz_millihz = 0;     /* 0 = lead disabled; see cmd_set_lead/lead_filter_t */
 static int32_t g_lead_fp_millihz = 0;     /* only meaningful while the lead filter is enabled */
 
+/* Real, continuously self-calibrating sample-rate estimate for the notch
+ * and lead filters -- added 2026-08-27 after finding TWO layers of the
+ * same underlying bug: (1) cmd_set_notch originally hardcoded a 457.5Hz
+ * sample-rate assumption regardless of the real control rate (fixed
+ * earlier this file's history), then (2) even after fixing that to use
+ * g_ctrl_rate_millihz (the NOMINAL/requested throttle target), direct
+ * hardware measurement found the REAL achieved control-step rate can
+ * differ from that nominal value by a large, telemetry-rate-dependent
+ * amount (measured live: -73% at ~285Hz Pi telemetry, -12% at ~462Hz,
+ * and telemetry itself was observed to drift from 285->462->483Hz within
+ * one bench session) -- a single fixed "nominal equals real" assumption,
+ * however it's sourced, is fundamentally fragile here.
+ *
+ * Real fix: track the REAL inter-firing interval via an exponential
+ * moving average, updated from run_closed_loop_step's own already-
+ * computed dt_s (the actual measured elapsed time since the last real
+ * control-step firing -- exactly what's needed, already available, no
+ * new measurement code required), and recompute notch/lead coefficients
+ * from THIS every control step rather than any nominal/assumed rate.
+ * Self-calibrates against ground truth regardless of what the Pi's
+ * telemetry rate happens to be doing.
+ *
+ * Initialized to 1000/457.5 ms (~2.186ms) -- the same "typical full
+ * telemetry rate" fallback already used elsewhere in this file
+ * (pid_wrapper_init's ts_s default) -- as a reasonable starting guess
+ * only until the first few real control steps overwrite it with ground
+ * truth; not meant to be trusted as accurate on its own. */
+static float g_measured_ctrl_interval_ms = 1000.0f / 457.5f;
+#define RATE_EMA_ALPHA 0.05f  /* ~20-sample effective averaging window --
+                                * smooths real per-step jitter (measured
+                                * std up to ~25% of mean) while still
+                                * tracking genuine rate drift within a
+                                * few hundred ms, not tens of seconds. */
+/* get_status reports this as meas_ctrl_rate_millihz= (Hz*1000, matching
+ * every other rate field's convention) so a host script can directly
+ * confirm what the firmware is ACTUALLY using, instead of needing an
+ * external measurement like the one that found this whole bug class. */
+
 /* --- Resonance notch filter ----------------------------------------------
  * Added 2026-08-19 after every attempt to use PIDController.hpp's D term
  * failed regardless of its low-pass filter's cutoff (1-20Hz tried,
@@ -272,10 +310,17 @@ static int32_t g_lead_fp_millihz = 0;     /* only meaningful while the lead filt
  * reinforcing) the resonance, matching the observation that even Kp
  * alone had far less margin than expected (unstable by Kp=2.5).
  *
- * fs (assumed sample rate) shares the same fixed-rate caveat as
- * pid_wrapper.h's ts_s -- baked in at notch_configure() time, not
- * measured per-call. Re-verify/reconfigure if the real control rate
- * changes again (see pid_wrapper.h's docstring for the general issue). */
+ * fs (assumed sample rate) is NO LONGER fixed/baked-in (2026-08-27) --
+ * see g_measured_ctrl_interval_ms's docstring further up this file. Two
+ * real bugs were found and fixed in sequence: first a hardcoded 457.5Hz
+ * literal regardless of the real control rate, then (after fixing that to
+ * use g_ctrl_rate_millihz) a second, smaller but still real mismatch
+ * between that NOMINAL throttle target and the ACTUALLY achieved rate,
+ * confirmed by direct hardware measurement to vary with the Pi's live
+ * telemetry rate. notch_compute_coeffs is now called on every control
+ * step (run_closed_loop_step) using a continuously-updated real-rate EMA,
+ * self-calibrating against ground truth instead of trusting any single
+ * assumed value. */
 typedef struct
 {
   float b0, b1, b2, a1, a2;
@@ -285,7 +330,14 @@ typedef struct
 
 static notch_filter_t g_notch = {0};
 
-static void notch_configure(float freq_hz, float q, float sample_rate_hz)
+/* Coefficients ONLY -- deliberately does NOT touch x1/x2/y1/y2 (that's
+ * notch_reset_state's job). Split out 2026-08-27 so this can be called on
+ * EVERY control step (see g_measured_ctrl_interval_ms below) to keep the
+ * notch's sample-rate assumption tracking the real achieved rate -- if it
+ * also reset the recursive history every call, the filter would never
+ * actually accumulate state and couldn't filter anything (this would have
+ * been a severe regression, caught before it was ever wired in). */
+static void notch_compute_coeffs(float freq_hz, float q, float sample_rate_hz)
 {
   float w0 = 2.0f * 3.14159265358979323846f * freq_hz / sample_rate_hz;
   float alpha = sinf(w0) / (2.0f * q);
@@ -297,7 +349,6 @@ static void notch_configure(float freq_hz, float q, float sample_rate_hz)
   g_notch.b2 = 1.0f / a0;
   g_notch.a1 = -2.0f * cos_w0 / a0;
   g_notch.a2 = (1.0f - alpha) / a0;
-  g_notch.x1 = g_notch.x2 = g_notch.y1 = g_notch.y2 = 0.0f;
 }
 
 static float notch_apply(float x)
@@ -368,19 +419,19 @@ static void notch_reset_state(float seed_px)
  * cascade (G1*G2 = G2*G1), so notch-then-lead vs lead-then-notch would
  * give the same result; notch-then-lead was picked arbitrarily.
  *
- * Sample-rate handling -- built correctly from the start, unlike the
- * notch's equivalent bug (cmd_set_notch used to hardcode 457.5Hz
- * regardless of the real ctrl_rate, silently wrong whenever throttled --
- * see CLAUDE.md's "Notch filter retested honestly" entry for how that
- * confounded an earlier comparison; FIXED 2026-08-27, see cmd_set_notch
- * above). lead_configure takes the sample rate as an explicit argument,
- * and cmd_set_lead passes g_ctrl_rate_millihz/1000
- * -- the REAL current rate, not a hardcoded constant. Still has the same
- * residual limitation the notch has: if set_ctrl_rate changes AFTER
- * set_lead, the coefficients go stale until set_lead is reissued -- not
- * fixed here (would need coefficients recomputed every call, more
- * complexity than a first firmware pass needs), just not made WORSE by
- * hardcoding on top of it. */
+ * Sample-rate handling -- avoided the notch's FIRST bug from the start
+ * (cmd_set_notch used to hardcode 457.5Hz regardless of the real
+ * ctrl_rate, silently wrong whenever throttled -- see CLAUDE.md's "Notch
+ * filter retested honestly" entry; fixed 2026-08-27, see cmd_set_notch
+ * above), but was equally exposed to the SECOND, subtler bug: even the
+ * real g_ctrl_rate_millihz is only the NOMINAL/requested throttle
+ * target, not the actually-achieved control-step rate, which direct
+ * hardware measurement found can differ by a large, telemetry-rate-
+ * dependent amount. Fixed the same day, same mechanism as the notch:
+ * lead_compute_coeffs is now called every control step (run_closed_loop_step)
+ * from a continuously-updated real-rate EMA (g_measured_ctrl_interval_ms,
+ * see its own docstring), not any single assumed value -- no more
+ * "goes stale if ctrl_rate changes later" limitation. */
 typedef struct
 {
   float b0, b1, a1;
@@ -390,7 +441,10 @@ typedef struct
 
 static lead_filter_t g_lead = {0};
 
-static void lead_configure(float fz_hz, float fp_hz, float sample_rate_hz)
+/* Coefficients ONLY -- see notch_compute_coeffs's docstring for why this
+ * must not touch x1/y1 (that's lead_reset_state's job) now that this runs
+ * on every control step. */
+static void lead_compute_coeffs(float fz_hz, float fp_hz, float sample_rate_hz)
 {
   float T = 1.0f / sample_rate_hz;
   float Kz = 1.0f / (3.14159265358979323846f * fz_hz * T);
@@ -399,7 +453,6 @@ static void lead_configure(float fz_hz, float fp_hz, float sample_rate_hz)
   g_lead.b0 = (1.0f + Kz) / (1.0f + Kp_);
   g_lead.b1 = (1.0f - Kz) / (1.0f + Kp_);
   g_lead.a1 = (1.0f - Kp_) / (1.0f + Kp_);
-  g_lead.x1 = g_lead.y1 = 0.0f;
 }
 
 static float lead_apply(float x)
@@ -676,8 +729,8 @@ int main(void)
    * (DIAG_CONTROL_INTERVAL_MS, used to falsify sample rate as the cause
    * of the Kp=1.75/Ki=200 instability) has been removed and
    * run_closed_loop_step fires on every confident packet again. */
-  pid_wrapper_init(0.0, 0.0, 0.0, 1.0 / 457.5, (double)g_fc_millihz / 1000.0,
-                    -(double)(DAC_MAX_COUNT - DAC_MIN_COUNT), (double)(DAC_MAX_COUNT - DAC_MIN_COUNT));
+  pid_wrapper_init(0.0f, 0.0f, 0.0f, 1.0f / 457.5f, (float)g_fc_millihz / 1000.0f,
+                    -(float)(DAC_MAX_COUNT - DAC_MIN_COUNT), (float)(DAC_MAX_COUNT - DAC_MIN_COUNT));
 
   /* USER CODE END 2 */
 
@@ -1323,10 +1376,10 @@ static void apply_dac(fta_axis_t axis, int32_t value)
  * still does the final hardware clamp exactly as before. */
 static void run_closed_loop_step(int16_t tel_x_scaled, uint32_t now)
 {
-  double  target_px;
-  double  measured_px;
-  double  correction;
-  double  dt_s;
+  float   target_px;
+  float   measured_px;
+  float   correction;
+  float   dt_s;
   int32_t output;
   float   filtered_x_px;
 
@@ -1339,13 +1392,41 @@ static void run_closed_loop_step(int16_t tel_x_scaled, uint32_t now)
    * "never fired since mode engagement" (reset there, see cmd_set_mode)
    * -- dt_s stays <=0 in that case so pid_wrapper_calculate falls back to
    * ts_ instead of computing a bogus multi-second "dt" from tick 0. */
-  dt_s = -1.0;
+  dt_s = -1.0f;
   if (g_last_ctrl_step_tick != 0U && now > g_last_ctrl_step_tick)
   {
-    dt_s = (double)(now - g_last_ctrl_step_tick) / 1000.0;
+    dt_s = (float)(now - g_last_ctrl_step_tick) / 1000.0f;
   }
 
-  target_px = (double)g_target_x_scaled / (double)POSITION_SCALE;
+  /* Self-calibrating sample-rate tracking for the notch/lead filters --
+   * see g_measured_ctrl_interval_ms's own docstring for the full story.
+   * Reuses dt_s (already the real measured interval since the last
+   * firing) rather than a second measurement; skipped when dt_s isn't
+   * valid (first firing since engagement) so a stale/bogus interval never
+   * corrupts the EMA -- the persisted value from a PRIOR engagement (or
+   * the boot-time fallback, first engagement ever) carries forward
+   * instead, which is still a far better estimate than any nominal
+   * throttle target. Coefficients are recomputed every firing (cheap: a
+   * couple of trig calls + divides, negligible next to a ~5-7ms control
+   * period) so both filters track real rate drift continuously, not just
+   * at the moment set_notch/set_lead happened to be called. */
+  if (dt_s > 0.0f)
+  {
+    float interval_ms = dt_s * 1000.0f;
+    g_measured_ctrl_interval_ms += RATE_EMA_ALPHA * (interval_ms - g_measured_ctrl_interval_ms);
+  }
+  if (g_notch.enabled)
+  {
+    notch_compute_coeffs((float)g_notch_freq_millihz / 1000.0f, (float)g_notch_q_milli / 1000.0f,
+                          1000.0f / g_measured_ctrl_interval_ms);
+  }
+  if (g_lead.enabled)
+  {
+    lead_compute_coeffs((float)g_lead_fz_millihz / 1000.0f, (float)g_lead_fp_millihz / 1000.0f,
+                         1000.0f / g_measured_ctrl_interval_ms);
+  }
+
+  target_px = (float)g_target_x_scaled / (float)POSITION_SCALE;
 
   /* Notch-filter the measurement BEFORE it reaches the PID controller
    * (see the notch_filter_t comment above for why here, not just inside
@@ -1356,7 +1437,7 @@ static void run_closed_loop_step(int16_t tel_x_scaled, uint32_t now)
    * for an LTI cascade -- see lead_filter_t's comment). No-op unless
    * explicitly enabled via set_lead. */
   filtered_x_px = lead_apply(filtered_x_px);
-  measured_px = (double)filtered_x_px;
+  measured_px = filtered_x_px;
 
   correction = pid_wrapper_calculate(target_px, measured_px, dt_s);
   output = g_closed_loop_base_dac_y + (int32_t)correction;
@@ -1382,20 +1463,20 @@ static void run_closed_loop_step(int16_t tel_x_scaled, uint32_t now)
  * physical response. */
 static void run_closed_loop_step_axis2(int16_t tel_y_scaled, uint32_t now)
 {
-  double  target_py;
-  double  measured_py;
-  double  correction;
-  double  dt_s;
+  float   target_py;
+  float   measured_py;
+  float   correction;
+  float   dt_s;
   int32_t output;
 
-  dt_s = -1.0;
+  dt_s = -1.0f;
   if (g_last_ctrl_step_tick != 0U && now > g_last_ctrl_step_tick)
   {
-    dt_s = (double)(now - g_last_ctrl_step_tick) / 1000.0;
+    dt_s = (float)(now - g_last_ctrl_step_tick) / 1000.0f;
   }
 
-  target_py = (double)g_target_y_scaled / (double)POSITION_SCALE;
-  measured_py = (double)tel_y_scaled / (double)POSITION_SCALE;
+  target_py = (float)g_target_y_scaled / (float)POSITION_SCALE;
+  measured_py = (float)tel_y_scaled / (float)POSITION_SCALE;
 
   correction = pid_wrapper_calculate2(target_py, measured_py, dt_s);
   output = g_closed_loop_base_dac_x - (int32_t)correction;  /* negated -- see sign note above */
@@ -2050,7 +2131,7 @@ static void cmd_set_kp(const char *arg)
    * integral/derivative history, same as this file's previous hand-
    * rolled version did explicitly on a Ki change -- now implicit in
    * every gain change, Kp included, which is at least as safe. */
-  pid_wrapper_set_gains((double)g_kp_milli / 1000.0, (double)g_ki_milli / 1000.0, (double)g_kd_milli / 1000.0);
+  pid_wrapper_set_gains((float)g_kp_milli / 1000.0f, (float)g_ki_milli / 1000.0f, (float)g_kd_milli / 1000.0f);
 
   len = snprintf(resp, sizeof(resp), "OK kp_milli=%ld\r\n", val);
   if (len > 0)
@@ -2080,7 +2161,7 @@ static void cmd_set_ki(const char *arg)
   }
 
   g_ki_milli = (int32_t)val;
-  pid_wrapper_set_gains((double)g_kp_milli / 1000.0, (double)g_ki_milli / 1000.0, (double)g_kd_milli / 1000.0);
+  pid_wrapper_set_gains((float)g_kp_milli / 1000.0f, (float)g_ki_milli / 1000.0f, (float)g_kd_milli / 1000.0f);
 
   len = snprintf(resp, sizeof(resp), "OK ki_milli=%ld\r\n", val);
   if (len > 0)
@@ -2110,7 +2191,7 @@ static void cmd_set_kd(const char *arg)
   }
 
   g_kd_milli = (int32_t)val;
-  pid_wrapper_set_gains((double)g_kp_milli / 1000.0, (double)g_ki_milli / 1000.0, (double)g_kd_milli / 1000.0);
+  pid_wrapper_set_gains((float)g_kp_milli / 1000.0f, (float)g_ki_milli / 1000.0f, (float)g_kd_milli / 1000.0f);
 
   len = snprintf(resp, sizeof(resp), "OK kd_milli=%ld\r\n", val);
   if (len > 0)
@@ -2153,7 +2234,7 @@ static void cmd_set_fc(const char *arg)
   }
 
   g_fc_millihz = (int32_t)val;
-  pid_wrapper_set_fc((double)g_fc_millihz / 1000.0);
+  pid_wrapper_set_fc((float)g_fc_millihz / 1000.0f);
 
   len = snprintf(resp, sizeof(resp), "OK fc_millihz=%ld\r\n", val);
   if (len > 0)
@@ -2197,7 +2278,7 @@ static void cmd_set_out_limit(const char *arg)
   }
 
   g_out_limit_counts = (int32_t)val;
-  pid_wrapper_set_out_limits(-(double)g_out_limit_counts, (double)g_out_limit_counts);
+  pid_wrapper_set_out_limits(-(float)g_out_limit_counts, (float)g_out_limit_counts);
 
   len = snprintf(resp, sizeof(resp), "OK out_limit=%ld\r\n", val);
   if (len > 0)
@@ -2253,7 +2334,7 @@ static void cmd_set_ctrl_rate(const char *arg)
   {
     g_control_interval_ms = 0U;
     g_ctrl_rate_millihz = 457500;
-    pid_wrapper_set_ts(1.0 / 457.5);
+    pid_wrapper_set_ts(1.0f / 457.5f);
   }
   else
   {
@@ -2263,7 +2344,7 @@ static void cmd_set_ctrl_rate(const char *arg)
       g_control_interval_ms = 1U;  /* 1ms is the floor -- HAL_GetTick() resolution */
     }
     g_ctrl_rate_millihz = (int32_t)rate_millihz;
-    pid_wrapper_set_ts(1000.0 / (double)rate_millihz);
+    pid_wrapper_set_ts(1000.0f / (float)rate_millihz);
   }
   g_last_ctrl_step_tick = 0U;
 
@@ -2419,11 +2500,19 @@ static void cmd_set_axis2(const char *arg)
  * while throttled (including the "retested honestly" CLAUDE.md entry,
  * which sanity-checked at throttled-200Hz) measured this wrong filter,
  * not the intended one -- re-verify before trusting those numbers again.
- * Same fix pattern as lead_configure/cmd_set_lead below, which always
- * used g_ctrl_rate_millihz correctly and was never affected. Still has
- * the residual limitation lead_configure documents: if set_ctrl_rate
- * changes AFTER set_notch, coefficients go stale until set_notch is
- * reissued. */
+ * Same fix pattern as lead_compute_coeffs/cmd_set_lead below, which
+ * always used g_ctrl_rate_millihz correctly and was never affected by
+ * this specific bug.
+ *
+ * SECOND fix, same day: g_ctrl_rate_millihz turned out to be its own
+ * problem -- it's the NOMINAL/requested throttle target, not the real
+ * achieved rate, and direct hardware measurement found those can differ
+ * by a large, telemetry-rate-dependent amount. Both this command and
+ * cmd_set_lead now seed coefficients from g_measured_ctrl_interval_ms (a
+ * continuously-updated real-rate EMA) instead, and run_closed_loop_step
+ * keeps recomputing them every control step from then on -- no more
+ * "goes stale if set_ctrl_rate changes later" limitation; see that
+ * global's own docstring for the full story. */
 static void cmd_set_notch(const char *arg)
 {
   long  freq_millihz, q_milli;
@@ -2462,8 +2551,16 @@ static void cmd_set_notch(const char *arg)
 
   g_notch_freq_millihz = (int32_t)freq_millihz;
   g_notch_q_milli = (int32_t)q_milli;
-  notch_configure((float)g_notch_freq_millihz / 1000.0f, (float)g_notch_q_milli / 1000.0f,
-                  (float)g_ctrl_rate_millihz / 1000.0f);
+  /* Initial coefficients from whatever the measured-rate EMA holds right
+   * now (real ground truth, not the nominal g_ctrl_rate_millihz target --
+   * see g_measured_ctrl_interval_ms's own docstring for why that nominal
+   * value isn't trustworthy). run_closed_loop_step recomputes this every
+   * control step from then on, so this call just avoids a brief window
+   * with stale/zero coefficients between this command and the next real
+   * control-step firing. Deliberately does NOT reset x1/x2/y1/y2 -- see
+   * notch_compute_coeffs's docstring. */
+  notch_compute_coeffs((float)g_notch_freq_millihz / 1000.0f, (float)g_notch_q_milli / 1000.0f,
+                        1000.0f / g_measured_ctrl_interval_ms);
   g_notch.enabled = 1;
 
   len = snprintf(resp, sizeof(resp), "OK notch_freq_millihz=%ld q_milli=%ld\r\n", freq_millihz, q_milli);
@@ -2531,8 +2628,10 @@ static void cmd_set_lead(const char *arg)
 
   g_lead_fz_millihz = (int32_t)fz_millihz;
   g_lead_fp_millihz = (int32_t)fp_millihz;
-  lead_configure((float)g_lead_fz_millihz / 1000.0f, (float)g_lead_fp_millihz / 1000.0f,
-                 (float)g_ctrl_rate_millihz / 1000.0f);
+  /* Same reasoning as cmd_set_notch above -- initial coefficients from the
+   * measured-rate EMA, run_closed_loop_step keeps them current from here. */
+  lead_compute_coeffs((float)g_lead_fz_millihz / 1000.0f, (float)g_lead_fp_millihz / 1000.0f,
+                       1000.0f / g_measured_ctrl_interval_ms);
   g_lead.enabled = 1;
 
   len = snprintf(resp, sizeof(resp), "OK lead_fz_millihz=%ld fp_millihz=%ld\r\n", fz_millihz, fp_millihz);
@@ -2629,6 +2728,7 @@ static void cmd_get_status(void)
                     "pulse_tick=%lu smoothing=%u axis2=%u "
                     "notch=%u notch_freq_millihz=%ld notch_q_milli=%ld "
                     "lead=%u lead_fz_millihz=%ld lead_fp_millihz=%ld "
+                    "meas_ctrl_rate_millihz=%ld "
                     "open_sine=%u open_sine_freq_millihz=%ld "
                     "sine=%u sine_freq_millihz=%ld\r\n",
                     (g_mode == MODE_OPEN_LOOP) ? "open_loop" : "closed_loop",
@@ -2647,6 +2747,7 @@ static void cmd_get_status(void)
                     (unsigned)g_axis2_enabled,
                     (unsigned)g_notch.enabled, (long)g_notch_freq_millihz, (long)g_notch_q_milli,
                     (unsigned)g_lead.enabled, (long)g_lead_fz_millihz, (long)g_lead_fp_millihz,
+                    (long)(1000000.0f / g_measured_ctrl_interval_ms),
                     (unsigned)g_open_sine_active, (long)g_open_sine_freq_millihz,
                     (unsigned)g_sine_active, (long)g_sine_freq_millihz);
   }

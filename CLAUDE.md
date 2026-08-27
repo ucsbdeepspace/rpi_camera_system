@@ -5314,6 +5314,272 @@ compile-verified, only reviewed by eye (change mirrors the already-proven
    old "Ki=400 chosen as working point" or the "mixed result, never
    raised the Ki ceiling" conclusion as settled without a rerun.
 
+### Notch fix built, flashed, and rerun — the REAL 38.5Hz notch has a LOWER Ki ceiling than either no notch or the buggy 16.8Hz one; does not explain the lead-compensator divergence (2026-08-27, same day)
+
+Executed the "Next steps" list from the entry above. Built clean (0
+errors/0 warnings, `arm-none-eabi-gcc`/`make` via the project's usual
+bypass-CubeIDE toolchain), flashed via `STM32_Programmer_CLI`
+(SN `066FFF515152827187153930`, matches this file's on-record board),
+`get_status` confirmed alive and idle immediately after — no post-reflash
+silence this time.
+
+**Reran the notch-alone Ki sweep** (`scratch_notch_comparison.py`,
+Kp=1.75, throttled 200Hz, -25px step, same explicit-mode-verification
+harness used throughout this thread) at Ki=200/300/350/400/550/800, plus
+a bisection at 300/350 to pin the ceiling more precisely than the
+original 200/400/550/800 checkpoints:
+
+| Ki | verdict | overshoot |
+|---|---|---|
+| 200 | CLEAN | 9.9% |
+| 300 | CLEAN | 21.2% |
+| 350 | CLEAN | 13.9% |
+| 400 | RINGING | 31.1% |
+| 550 | RINGING | 80.5% |
+| 800 | DIVERGED | — |
+
+**Real ceiling with the CORRECT 38.5Hz notch: clean through ~350, rings
+by 400.** Plotted against the two other conditions already on record
+(`fta_notch_ki_sweep_plot.py`, new committed script,
+`results/fta_notch_ki_ceiling_comparison.png`):
+
+| condition | ceiling (last clean Ki) |
+|---|---|
+| no notch (unaffected by the bug) | ~500-550 |
+| buggy notch (~16.8Hz, mis-clocked) | ~400 |
+| **real notch (38.5Hz, this fix)** | **~350** |
+
+**Surprising result, stated plainly: the correctly-configured notch has
+the WORST Ki ceiling of the three, not the best.** Worse than no notch
+at all, and worse than the accidentally-mis-notched 16.8Hz version. Not
+yet root-caused further — plausible candidates, none confirmed: the
+notch's own phase contribution (a band-stop filter adds real phase
+distortion near its center frequency, not just gain attenuation) could
+be eating into the loop's phase margin right at the frequencies that
+matter for the Ki boundary; or Q=3 is simply too narrow/aggressive for
+this plant now that it's centered correctly. Not investigated this
+session — flagged as a real open question, not a settled explanation.
+
+**Answers the question this whole rerun was for: no, this does NOT
+explain the lead-compensator divergence found earlier.** Every lead+notch
+scratch trial that day ran at Ki=200 — clean under both the buggy notch
+AND the confirmed-real one (9.9% overshoot here). Since the notch was
+already stable alone at the exact Ki used in every lead+notch test, the
+chaos seen when the lead compensator was added cannot be attributed to
+"the notch wasn't real." That investigation remains genuinely open,
+unrelated to this bug.
+
+**Visual confirmation**: `results/fta_notch_sweep_panel.png` (6-panel
+small multiples of the real-notch sweep, color-coded clean/ringing/
+diverged) and `results/fta_notch_ki_ceiling_comparison.png` (overshoot
+vs. Ki, all three conditions overlaid, symlog y-axis). Worth noting from
+the panel: even the "CLEAN" traces (Ki=200/300/350) show a visible
+continuous high-frequency buzz riding on the whole signal, both before
+and after the step — more pronounced than earlier "clean" traces
+elsewhere in this project. Didn't affect the CLEAN/RINGING/DIVERGED
+classification (based on peak excursion and settling, not noise floor),
+but worth keeping in mind if revisiting this data.
+
+**State left**: hardware safely idle (`mode=open_loop amp=0 estop=0
+dac_x=95 dac_y=95`, confirmed after every trial). Firmware fix is
+committed (`5b23da3`) and now also build/flash-verified on real hardware
+for the first time. `fta_notch_ki_sweep_plot.py` is a new, real,
+committed tool (not scratch) — reusable if this sweep needs repeating
+(e.g. at a different Q, or once the ceiling-regression mechanism above
+is investigated). Raw sweep data:
+`results/scratch_notch_cmp_notchfix_ki{200,300,350,400,550,800}_*.npz`.
+
+**Not yet done**: root-causing why the correctly-centered notch has a
+worse Ki ceiling than no notch at all (the real open question this entry
+surfaces); the lead-compensator investigation itself, still unresolved
+and now confirmed unrelated to this bug; Bode/ring-down characterization
+of the OTHER axis (dac_x -> cy) — flagged as worth doing given the
+locked-optics calibration already found the two axes have different gain
+magnitude AND sign (dac_y->cx: +0.126 px/count, dac_x->cy: -0.104
+px/count), so there's no reason to assume they share a resonance either,
+and there's now an active flexure redesign (FEA-vs-bench slides,
+`docs/session_results_2026-08-18_pid_tuning.pptx`) that would benefit
+from knowing if the two axes need different treatment.
+
+### Notch/lead sample rate made fully self-calibrating (measured, not assumed); real ~35% control-step throughput ceiling found and root-caused to double-precision PID math + axis2; fixed via float conversion + -O2 build; a real measurement-methodology bug caught along the way (2026-08-27, same day)
+
+Direct continuation of the entry above. The "real notch has a WORSE Ki
+ceiling than no notch" finding prompted a closer look at whether
+`g_ctrl_rate_millihz` (the value the fixed notch now uses) is itself
+trustworthy — it's the NOMINAL/requested throttle target, not the real
+achieved control-step rate.
+
+**Confirmed it isn't, by direct hardware measurement.** Built a host-side
+rate-measurement technique (`dac_y=` value-change detection against
+firmware `tick=` timestamps, restricted to the active step-response
+transient window — same fix `scratch_ctrl_jitter_check.py` needed earlier
+this session for the identical reason: near-settled periods let many
+real firings round to the same integer `dac_y`, inflating apparent
+gaps). Result: at ~285Hz Pi telemetry, throttled-200Hz's real achieved
+rate was **~107-143Hz**, not 200Hz (-46% to -73% off nominal). At ~462Hz
+telemetry, the gap shrank to ~12% (176Hz real vs 200Hz nominal) — the
+mismatch is real and telemetry-rate-dependent, confirmed to swing
+within a single session (telemetry itself observed at 285→462→483→
+488→516Hz at different points today, all on the same rig).
+
+**Real fix: firmware self-calibration, not another manual measurement.**
+Added `g_measured_ctrl_interval_ms` (main.c) — an EMA of the REAL
+inter-firing interval, updated every control step from `dt_s` (already
+computed for the dt-aware PID, no new measurement needed) and initialized
+to the same `1/457.5s` fallback used elsewhere. `notch_configure`/
+`lead_configure` were split into `notch_compute_coeffs`/`lead_compute_coeffs`
+(coefficients only) + the existing `notch_reset_state`/`lead_reset_state`
+(x1/x2/y1/y2 history only) — necessary because the ORIGINAL combined
+functions reset the filter's recursive history as a side effect, and
+recomputing coefficients every control step (needed for continuous
+self-calibration) would have zeroed that history every ~2-5ms, breaking
+the filters entirely (caught before it was ever wired in, not a live
+bug). `run_closed_loop_step` now recomputes both filters' coefficients
+from the live EMA every firing when enabled. `get_status` gained
+`meas_ctrl_rate_millihz=` for direct visibility — confirmed live: firmware's
+own self-reported rate (177.84Hz) matched an independent host-side
+measurement (176.0Hz) taken under similar conditions, real agreement.
+
+**User pushback, correctly targeted: "if the Pi sends 490Hz, why does the
+Nucleo only process 177Hz?"** — this surfaced a genuinely separate,
+bigger problem. Distinguished the two possible causes directly:
+non-confident-detection filtering (ruled out — 100% of received relay
+lines were confident) vs. the firmware's single-slot "latest packet"
+receive buffer coalescing multiple I2C arrivals into one when the main
+loop can't cycle back around fast enough (not yet confirmed at that
+point). A clean, SIMULTANEOUS measurement (raw `pkts=` growth vs.
+`meas_ctrl_rate`, same window, unthrottled) found: **555 raw I2C
+packets/s arriving, zero checksum errors, only ~353-364Hz (~64-66%)
+actually driving a control step** — a real, structural ~35% loss, not a
+throttle artifact (ctrl_rate=0 for this test).
+
+**Isolated the cause with one cheap, no-rebuild test: `set_axis2 0`.**
+Same simultaneous measurement, axis2 disabled: 432.2 raw pkts/s, 407.6-
+413.3Hz achieved — **~94-96% throughput**, up from ~64-66%. Disabling the
+second axis (which runs the identical PID math a second time per packet)
+nearly eliminated the gap on its own — strong, direct, quantified
+evidence the bottleneck was axis2's *duplicate* cost, not I2C, not
+telemetry, not some other structural limit.
+
+**Root cause: `PIDController.hpp` uses `double` throughout, and this
+MCU's FPU (fpv4-sp-d16) is single-precision hardware only** — every
+double op was software-emulated, a known, deliberately-accepted tradeoff
+from when Phil's class was first adopted (flagged at the time as
+"negligible... against this loop's real timing budget," an assessment
+that didn't anticipate axis2 running the same expensive math twice per
+packet). **Fixed with the user's explicit go-ahead — a second, deliberate
+deviation from "use Phil's class completely unmodified"** (the first was
+the earlier dt-awareness change): converted `PIDController.hpp`,
+`pid_wrapper.h`/`.cpp`, and every `main.c` call site from `double` to
+`float` throughout. Precision risk judged low for this application
+(pixel-scale errors, anti-windup clamped, bumpless-reset every
+engagement) — same P/I/D terms, same back-calculation anti-windup, same
+EMA-filtered derivative, only the storage/arithmetic type changed.
+Built clean (0 warnings), `.text` shrank 49200→46048 bytes (~3.2KB),
+consistent with real double-emulation code being removed, not just a
+source-level change with no effect.
+
+**Rebuilt project also found and fixed at -O0 (no optimization) this
+entire session** — a debug-friendly setting CubeIDE generates by
+default, never revisited. Edited both `Debug/Core/Src/subdir.mk` and
+`Debug/Drivers/STM32L4xx_HAL_Driver/Src/subdir.mk` (`-O0`→`-O2`, the only
+two files with the flag) directly — **not persisted in `.cproject`**, so
+this reverts to `-O0` if the project is ever regenerated from inside
+CubeIDE's GUI, same class of gotcha as every other hand-added setting in
+this file; reapply by hand if that happens. Deleted only the `.o`/`.d`
+build outputs (not `subdir.mk`/`makefile`/`objects.mk`) to force a real
+recompile — the earlier `rm -rf Debug/Core Debug/Drivers` mistake from
+2026-08-13 (deletes CubeIDE's generated rule files, not just outputs)
+deliberately NOT repeated. `.text` shrank further, 46048→31468 bytes
+(~32% smaller) — real optimization, not a no-op.
+
+**Net throughput result, axis2 ON, unthrottled, same measurement
+technique throughout** (raw telemetry rate varied between each test,
+Pi-side, outside firmware control — the fraction/ratio is the fair
+comparison, not the absolute Hz):
+
+| build | raw pkts/s | achieved rate | fraction |
+|---|---|---|---|
+| double (original) | 554.8 | 353-364Hz | ~64-66% |
+| float, -O0 | 341.2 | 317.4-323.7Hz | ~93-95% |
+| float, -O2 | ~460 (see correction below) | 413-482Hz | ~90-105%* |
+
+*the -O2 row's fraction briefly looked impossible (raw pkts/s computed as
+516.5, HIGHER than the achieved rate would allow given the Pi's own
+~480Hz report) — see the measurement-bug correction immediately below;
+the corrected raw rate (459.9/s) restores a sane, sub-100% fraction.
+
+**A second real measurement bug, caught by direct user pushback ("516
+can't be right, the Pi says 480").** The "clean" simultaneous-measurement
+technique used firmware `uptime=` (whole SECONDS only) as the elapsed-
+time denominator for a ~4s window — a `"4s"` reading can correspond to
+anywhere from 4.0 to 4.99s of true elapsed time (integer truncation), and
+dividing a real packet count by an artificially-small denominator
+inflates the computed rate by up to ~25%. Confirmed directly: precise
+Python wall-clock timing (`time.monotonic()`, taken exactly when each
+confirmed status read lands, not a nominal sleep duration) gave 4.484s
+real elapsed for the same window firmware `uptime` reported as exactly
+4s — corrected raw rate **459.9 pkts/s**, consistent with the Pi's own
+~480Hz report, not the impossible 515-516/s reported twice before this
+was caught. **Lesson, worth remembering for any future rate measurement
+on this rig**: never use the firmware's whole-second `uptime` field as a
+timing denominator for a short window — always use host-side
+`time.monotonic()` captured at the exact moment of each confirmed read.
+
+**Also observed, real and not yet explained**: within one clean 4.5s
+measurement window (float+-O2 build), `meas_ctrl_rate_millihz` swung
+from 481.8Hz down to 413.3Hz — a genuine, fairly large real-time
+fluctuation, not measurement noise (this was after the uptime-denominator
+bug was already fixed). Could be real telemetry-rate variation on the
+Pi side within that window, or something else — not investigated
+further this session.
+
+**A real, unresolved side effect of the float conversion**: rerunning the
+long-established Kp=1.75/Ki=200 baseline (throttled 200Hz, no notch/lead,
+axis2 on — historically ALWAYS clean, 4-10% overshoot in every earlier
+test this session) came back **RINGING, 33.8% overshoot**. Directly
+measured the real control-step rate under this exact config immediately
+after: 173.1Hz — essentially unchanged from the pre-float measurement
+(177.8Hz) under the same throttled+axis2-on conditions, so the new
+ringing is NOT explained by a rate change (ruled out by direct
+measurement, not assumed). Two live hypotheses, genuinely undecided:
+(1) a real numerical/precision difference from the float conversion
+itself (plausible but a large jump — 4-10%→33.8% — for values in this
+range, where float's ~7 decimal digits should be far more than enough);
+(2) something about the physical rig changed independent of any
+firmware work today — this project has already documented at least one
+UNEXPLAINED session-to-session behavior shift before (the original
+Kp=1.75/Ki=200 full-rate instability that "stopped reproducing, for
+reasons unconnected to any software change," 2026-08-19), and the most
+recent commit before this session added flexure FEA-vs-bench redesign
+slides, meaning the physical rig may be under active hardware
+investigation in parallel. Recommended next step, not yet done: try a
+comfortably lower Ki (e.g. 100) to see if it's still clean — would help
+distinguish "needs modest re-tuning given today's changes" from "the
+plant itself changed."
+
+**State left**: hardware safely idle (`mode=open_loop amp=0 estop=0
+dac_x=95 dac_y=95`, confirmed via `get_status` after every test, `errs=0`
+throughout). Firmware changes (self-calibrating notch/lead, float PID,
+-O2 build) are all built, flashed, and hardware-verified working — but
+**uncommitted** as of this entry. `ctrl_rate_millihz` left at the
+established default (200000, throttled) after every test that changed
+it. `scratch_verify_notch_rate.py` (repo root, not committed — ad hoc
+diagnostic, same convention as this session's other scratch_* scripts)
+has the transient-window-restricted rate measurement technique, in case
+it's needed again — though prefer `get_status`'s own `meas_ctrl_rate_millihz`
+field going forward over any host-side re-measurement, now that the
+firmware self-reports it directly.
+
+**Not yet done**: the Ki=200 ringing regression (immediate next step:
+lower-Ki check, described above); root-causing the real-time
+`meas_ctrl_rate` fluctuation observed in one window; re-running the
+notch Ki sweep from the entry above now that both the float PID and -O2
+are in place (that sweep predates both — its exact numbers should be
+treated as representative of the double/-O0 build, not necessarily
+still accurate); the lead-compensator investigation, still open and
+unrelated to any of today's fixes; Bode/ring-down on the other axis,
+flagged in the entry above, still not started.
 
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 

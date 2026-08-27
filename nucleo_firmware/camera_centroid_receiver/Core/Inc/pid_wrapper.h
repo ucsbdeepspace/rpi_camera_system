@@ -38,23 +38,37 @@
  * still live-settable via pid_wrapper_set_ts) is now only the
  * construction-time FALLBACK for a dt<=0 call (e.g. the first call after
  * (re)construction) -- main.c's run_closed_loop_step measures real dt via
- * HAL_GetTick() and passes it to every pid_wrapper_calculate() call. */
+ * HAL_GetTick() and passes it to every pid_wrapper_calculate() call.
+ *
+ * 2026-08-27: switched from double to float throughout (this interface,
+ * PIDController.hpp, and every main.c call site) -- second, explicit,
+ * user-approved deviation from Phil's original class. This MCU's FPU
+ * (fpv4-sp-d16) is single-precision hardware only, so double math here
+ * was software-emulated; with the second axis (axis2) also running this
+ * same math per packet, direct hardware measurement found this cost a
+ * real ~35% of the achievable control-step rate (555 raw I2C packets/s
+ * arriving, only ~355Hz actually driving a control step) -- disabling
+ * axis2 alone (removing one of the two double-math calls per packet)
+ * closed most of that gap, isolating the cost to this math specifically.
+ * See PIDController.hpp's own docstring for the precision-risk assessment
+ * (low, for this pixel-scale, anti-windup-clamped, periodically-reset
+ * application). */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-void   pid_wrapper_init(double kp, double ki, double kd, double ts_s, double fc_hz,
-                         double out_min, double out_max);
-void   pid_wrapper_set_gains(double kp, double ki, double kd);
-void   pid_wrapper_set_fc(double fc_hz);  /* derivative low-pass cutoff, live-settable -- see
+void  pid_wrapper_init(float kp, float ki, float kd, float ts_s, float fc_hz,
+                        float out_min, float out_max);
+void  pid_wrapper_set_gains(float kp, float ki, float kd);
+void  pid_wrapper_set_fc(float fc_hz);  /* derivative low-pass cutoff, live-settable -- see
                                             * the g_fc_hz comment in pid_wrapper.cpp for why this
                                             * was added (20Hz default found too high relative to
                                             * this rig's ~15.3Hz resonance) */
-void   pid_wrapper_set_ts(double ts_s);  /* live-settable sample time, see pid_wrapper.cpp --
+void  pid_wrapper_set_ts(float ts_s);  /* live-settable sample time, see pid_wrapper.cpp --
                                             * added 2026-08-19 to test control-rate-throttling
                                             * hypotheses without a reflash per attempt */
-void   pid_wrapper_set_out_limits(double out_min, double out_max);  /* live-settable output
+void  pid_wrapper_set_out_limits(float out_min, float out_max);  /* live-settable output
                                             * saturation range passed straight to
                                             * PIDController::setOutputLimits() -- added 2026-08-19
                                             * to test whether tightening this (originally set to
@@ -63,16 +77,16 @@ void   pid_wrapper_set_out_limits(double out_min, double out_max);  /* live-sett
                                             * some of the settling-time/overshoot regression found
                                             * after adopting this class vs. the old hand-rolled
                                             * controller's proactive integral clamp -- see CLAUDE.md */
-double pid_wrapper_calculate(double setpoint_px, double measurement_px, double dt_s);
+float pid_wrapper_calculate(float setpoint_px, float measurement_px, float dt_s);
                                             /* dt_s: real elapsed seconds since the caller's own
                                             * last control step (<=0 to fall back to ts_) -- see
                                             * this header's own docstring above, 2026-08-19 */
-double pid_wrapper_calculate2(double setpoint_px, double measurement_px, double dt_s);
+float pid_wrapper_calculate2(float setpoint_px, float measurement_px, float dt_s);
                                             /* second axis (dac_x <- cy), identical Kp/Ki/Kd/ts_s/
                                             * fc_hz/limits to the first (reconstructed together by
                                             * every gain/fc/ts/limit setter) but its own independent
                                             * integral/derivative history -- added 2026-08-19 */
-void   pid_wrapper_reset(void);  /* resets BOTH axes' integral/derivative history together */
+void  pid_wrapper_reset(void);  /* resets BOTH axes' integral/derivative history together */
 
 #ifdef __cplusplus
 }
