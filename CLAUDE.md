@@ -5250,6 +5250,71 @@ measured phase/gain data to actually design a compensator (e.g. proper
 loop-shaping) rather than continued trial-and-error gain search, if
 tuning is still pursued alongside/before any hardware change.
 
+
+### Found and fixed: the notch filter's sample-rate bug was still live in firmware — every throttled notch test (including both "retested" entries above) measured the wrong filter (2026-08-27)
+
+Found while chasing why the fresh lead-compensator scratch tests
+(`scratch_lead_*_ki200`, `results/`) were unstable even layered on top of
+the supposedly-working notch+Ki=200 baseline. Went back to the actual
+firmware source rather than trusting the comments describing it, and
+`cmd_set_notch` (main.c) was still calling `notch_configure(freq, q,
+457.5f)` — a hardcoded literal, not `g_ctrl_rate_millihz`. Every one of
+the five scratch runs (and, on inspection, the sanity-check line in the
+"Notch filter retested honestly" entry above, which explicitly says
+"throttled-200Hz") ran with `ctrl_rate=200Hz`, not the assumed 457.5Hz.
+
+**What that actually does, computed from the real RBJ biquad math**: a
+digital notch designed for 38.5Hz assuming a 457.5Hz sample rate, but
+then clocked at a different real rate `fs`, lands at `38.5 * (fs/457.5)`
+Hz instead. At throttled 200Hz that's **16.82Hz** — not 38.5Hz. Frequency
+response of that exact (mis-clocked) filter: **-0.10dB at the real
+38.5Hz resonance** (essentially no effect on the thing it was built to
+suppress) and **-37.98dB at 16.8Hz**, a deep, narrow hole carved dead
+center in the 10-20Hz band this project actually needs clean. -4.6dB
+bleeds into 15Hz too.
+
+**Consequence**: every "notch@38.5Hz" result taken while throttled —
+both the "Notch filter retested honestly" entry above (Ki pushed to 400,
+real substantial improvement claimed) and the "Notch vs. no-notch
+re-tested properly ... mixed result" entry — was measuring this wrong,
+~16.8Hz filter, not the intended 38.5Hz one. Neither conclusion can be
+trusted as evidence about the actual 38.5Hz notch until reproduced with
+the fix below. (Full-rate/unthrottled notch tests, if any were run, are
+unaffected — 457.5Hz was correct there by coincidence.)
+
+**Fix applied** (`nucleo_firmware/camera_centroid_receiver/Core/Src/main.c`,
+`cmd_set_notch`, ~line 2449): now calls
+`notch_configure(freq, q, (float)g_ctrl_rate_millihz / 1000.0f)` —
+the real current rate, exactly the same pattern `cmd_set_lead` /
+`lead_configure` already used correctly (lead was never affected by this
+bug). Also corrected the two doc comments (above `cmd_set_notch`, and in
+the lead-compensator block) that described the hardcoded-457.5Hz
+behavior as current/intentional — they now document the bug and the fix
+instead.
+
+**State left**: firmware change is written but **uncommitted, not yet
+built, not yet flashed** — no `arm-none-eabi-gcc`/STM32CubeIDE toolchain
+available in the environment this fix was made from, so it hasn't been
+compile-verified, only reviewed by eye (change mirrors the already-proven
+`cmd_set_lead` pattern exactly; brace count unchanged).
+
+**Next steps, in order**:
+1. Open in STM32CubeIDE, build, flash to the Nucleo.
+2. Rerun the notch-alone Ki sweep (same protocol as "Ki pushed with the
+   notch active" above: Kp=1.75, throttled 200Hz, Ki stepped 200/400/550/
+   800) — see whether the ceiling/character changes now that the notch
+   actually targets 38.5Hz instead of 16.8Hz.
+3. Rerun `scratch_lead_notch_sanity_ki200` / `scratch_lead_notch_fix_ki200`
+   (lead+notch combo, Kp=1.75/Ki=200/notch@38.5Hz/lead fz=6/fp=20,
+   throttled 200Hz) — see whether the lead-compensator instability found
+   in every one of today's scratch runs persists once the notch stops
+   eating a hole in the 10-20Hz band.
+4. Treat every throttled-mode notch number logged before 2026-08-27 as
+   unverified until reproduced with this fix in place — don't cite the
+   old "Ki=400 chosen as working point" or the "mixed result, never
+   raised the Ki ceiling" conclusion as settled without a rerun.
+
+
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 
 Frequency-domain complement to the step-response tests, motivated by the

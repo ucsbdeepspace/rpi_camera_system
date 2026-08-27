@@ -368,12 +368,13 @@ static void notch_reset_state(float seed_px)
  * cascade (G1*G2 = G2*G1), so notch-then-lead vs lead-then-notch would
  * give the same result; notch-then-lead was picked arbitrarily.
  *
- * Sample-rate handling -- explicitly NOT repeating the notch's known bug
- * (notch_configure is hardcoded to 457.5Hz regardless of the real
- * ctrl_rate, silently wrong whenever throttled -- see CLAUDE.md's
- * "Notch filter retested honestly" entry for how that confounded an
- * earlier comparison). lead_configure instead takes the sample rate as
- * an explicit argument, and cmd_set_lead passes g_ctrl_rate_millihz/1000
+ * Sample-rate handling -- built correctly from the start, unlike the
+ * notch's equivalent bug (cmd_set_notch used to hardcode 457.5Hz
+ * regardless of the real ctrl_rate, silently wrong whenever throttled --
+ * see CLAUDE.md's "Notch filter retested honestly" entry for how that
+ * confounded an earlier comparison; FIXED 2026-08-27, see cmd_set_notch
+ * above). lead_configure takes the sample rate as an explicit argument,
+ * and cmd_set_lead passes g_ctrl_rate_millihz/1000
  * -- the REAL current rate, not a hardcoded constant. Still has the same
  * residual limitation the notch has: if set_ctrl_rate changes AFTER
  * set_lead, the coefficients go stale until set_lead is reissued -- not
@@ -2404,10 +2405,25 @@ static void cmd_set_axis2(const char *arg)
  * notch filter (see notch_filter_t above). Q_MILLI is Q*1000 (e.g. 3000
  * = Q of 3.0); higher Q = narrower, more precise rejection but less
  * forgiving of frequency-estimate error, lower Q = wider/more robust but
- * eats into more of the surrounding spectrum. Assumes a fixed sample
- * rate (see notch_configure's own docstring) -- same 457.5Hz this
- * firmware's ts_s already assumes, kept consistent rather than
- * independently configurable for now. */
+ * eats into more of the surrounding spectrum.
+ *
+ * FIXED 2026-08-27 (bug found while chasing unrelated lead-compensator
+ * instability): this call used to pass a hardcoded 457.5f sample rate
+ * to notch_configure() regardless of the REAL current g_ctrl_rate_millihz.
+ * Whenever throttled (e.g. the 200Hz rate used in every scratch_lead_*
+ * test), the notch's coefficients were computed for the wrong fs, so a
+ * "set_notch 38500 3000" call did not notch 38.5Hz at all -- it notched
+ * 38.5 * (actual_fs/457.5) instead (e.g. ~16.8Hz at 200Hz throttle: dead
+ * center of the 10-20Hz band this project actually needs, doing ~0dB at
+ * the real resonance and ~-38dB at 16.8Hz). Any prior notch result taken
+ * while throttled (including the "retested honestly" CLAUDE.md entry,
+ * which sanity-checked at throttled-200Hz) measured this wrong filter,
+ * not the intended one -- re-verify before trusting those numbers again.
+ * Same fix pattern as lead_configure/cmd_set_lead below, which always
+ * used g_ctrl_rate_millihz correctly and was never affected. Still has
+ * the residual limitation lead_configure documents: if set_ctrl_rate
+ * changes AFTER set_notch, coefficients go stale until set_notch is
+ * reissued. */
 static void cmd_set_notch(const char *arg)
 {
   long  freq_millihz, q_milli;
@@ -2446,7 +2462,8 @@ static void cmd_set_notch(const char *arg)
 
   g_notch_freq_millihz = (int32_t)freq_millihz;
   g_notch_q_milli = (int32_t)q_milli;
-  notch_configure((float)g_notch_freq_millihz / 1000.0f, (float)g_notch_q_milli / 1000.0f, 457.5f);
+  notch_configure((float)g_notch_freq_millihz / 1000.0f, (float)g_notch_q_milli / 1000.0f,
+                  (float)g_ctrl_rate_millihz / 1000.0f);
   g_notch.enabled = 1;
 
   len = snprintf(resp, sizeof(resp), "OK notch_freq_millihz=%ld q_milli=%ld\r\n", freq_millihz, q_milli);
