@@ -3580,7 +3580,84 @@ parameter, not a runtime-settable value).
 
 **State left**: hardware safely idle (`mode=open_loop amp=0 estop=0
 dac_x=95 dac_y=95`), `get_status` confirms `errs=0` at the new STM32-side
-timing config. Not yet committed to git as of this entry.
+timing config. Committed same session (`dbfd825`), pushed.
+
+### Pi-side ROI + other changes raised real telemetry to ~440-475Hz; updated the PID's fixed ts_ to match; found the OLD Kp/Ki gains are now genuinely unstable at the new rate, found a new conservative stable point (2026-08-19, same day)
+
+User made changes on the Pi (ROI + other changes, exact details not made
+from this laptop-only session) that raised real end-to-end telemetry
+throughput from ~200-235Hz to a measured **~465Hz** (confirmed directly:
+1396 lines in 3s from this session, right in the reported 440-475Hz
+range).
+
+**Updated the PID's fixed `ts_` to match.** `pid_wrapper_init()`'s
+`ts_s` argument (see the PID-integration entry above for why this is
+fixed rather than measured per-call) was still `1/210` from before this
+change -- now stale, since the class assumes each `calculate()` call
+represents a fixed real time slice. Updated to `1/457.5` (midpoint of
+the reported 440-475Hz range) in `main.c`, `pid_wrapper.cpp`'s defensive
+default, and both files' comments. Rebuilt, reflashed (same
+post-reflash silence glitch as every other reflash this session, same
+fix).
+
+**Real, important finding: Kp=1.75/Ki=200 (the gains validated clean at
+~210-235Hz all session) are now genuinely UNSTABLE at ~465Hz** -- not a
+corrupted-command artifact (checked: a `get_status` reply came back
+visibly spliced with a telemetry line mid-transmission, real evidence
+the VCP TX side is under more contention at the higher telemetry rate,
+but the readable portion confirmed the gains/target landed correctly;
+the control loop reads I2C data directly in memory, never via the VCP
+text stream, so TX corruption can't have affected the actual closed-loop
+math). The real step-response trace shows genuine, physically bounded
+(DAC-clamped, safe) but clearly *growing* oscillation after the step --
+not noise, not a plotting artifact.
+
+**Root cause, isolated via a quick systematic search rather than
+assumed**: tested pure P (`Ki=0`, `Kp=1.75` alone) first -- clean,
+damped, stable (settles ~344ms to the expected small P-only steady-state
+offset, `results/fta_closed_loop_step_response_465hz_kp1750_ki0.png`).
+**Kp alone is fine at the new rate; the instability is specifically from
+the integral term.** Likely mechanism: this plant has a fixed real
+transport delay (~41ms pipeline lag, established earlier in this
+project) that doesn't shrink just because the control loop now updates
+~2.2x more often -- so at 465Hz, many more integral-accumulating
+corrections now land *within* that same fixed delay window before the
+plant's response to earlier corrections is even reflected back,
+effectively raising loop gain relative to what the plant can physically
+keep up with, even with `ts_` correctly rescaled so the integral math
+itself is numerically consistent with real elapsed time. A standard,
+expected consequence of raising sample rate without re-tuning integral
+gain down to match, not a bug in the `ts_` fix.
+
+**Ki search at fixed Kp=1.75** (`results/fta_closed_loop_465hz_ki_search.png`,
+`scratch_465hz_ki_search.py`):
+
+| Ki | character |
+|---|---|
+| 0 | stable, clean, but only reaches a small fraction of a 25px step (expected P-only limitation) |
+| 10 | **stable** -- smooth approach, 4.1% overshoot, settles in 2844ms, no growth anywhere across a 6s window |
+| 20 | marginal -- converges cleanly for ~1.7s, then a slow-building oscillation starts growing in the last ~1.3s of the recording |
+| 50 | unstable -- clearly growing oscillation |
+| 200 (old baseline) | unstable -- growing oscillation, largest amplitude tested |
+
+**Chosen for now: Kp=1.75, Ki=10** -- confirmed stable across a full 6s
+window, though slow (2.5s rise, 2.8s settling) compared to the old
+141-297ms range this project achieved at the slower rate. This is a
+conservative, safe starting point, not a final tuned answer -- there's
+real room between Ki=10 (safely stable) and Ki=20 (marginal) that a
+finer search could recover, and Kp itself hasn't been re-explored at
+this new rate at all (matching the earlier finding that Kp, not just Ki,
+has its own real instability boundary -- that boundary was only ever
+characterized at the old, slower rate and may have shifted too).
+
+**Not yet done**: fine Ki search between 10-20; Kp re-exploration at the
+new rate; Kd (still 0, untouched this entry) revisiting now that the
+resonance/rate relationship is better understood; a full sine-tracking
+sweep at the new rate/gains (the actual 10-20Hz deliverable); the exact
+Pi-side ROI/other changes that produced the rate increase were not
+recorded from this laptop-only session -- worth a brief note from
+whoever made them, for the record. **State left**: hardware safely idle.
+Not yet committed to git as of this entry.
 
 ### Pi-side I2C1 baud change landed and verified; `camera_view_tool.py` streaming throughput root-caused and fixed — 238Hz → ~440-475Hz real, measured (2026-08-18)
 
@@ -3693,6 +3770,1485 @@ becomes the streaming path of choice instead of `camera_view_tool.py`.
 User moving to the laptop next to work on the Nucleo's closed-loop PID
 code — nothing about this session's changes touches firmware or the
 Nucleo side at all, purely Pi-side camera/I2C throughput.
+
+### Chasing "why is the loop unstable at the new ~465Hz rate" — rate itself ruled out by direct diagnostic; a real ring-down remeasurement effort found the ORIGINAL 15.3Hz resonance number was itself broken (host timestamp bucketing), and the true resonance is ~38.5Hz, not 15.3 or 22 (2026-08-19, same day)
+
+Direct continuation of the entry above: after pulling the Pi-side
+440-475Hz throughput fix, updated `pid_wrapper_init`'s `ts_s` to
+`1/457.5` (from `1/210`) to match, rebuilt/reflashed. Reran the
+established `Kp=1.75/Ki=200` step-response baseline — **genuinely
+unstable, growing oscillation, not settling** (`results/fta_closed_loop_step_response_vcp_20260818T191117Z.png`).
+Verified this wasn't a corrupted-command artifact first (a `get_status`
+reply came back visibly spliced with a telemetry line under the higher
+load, but the readable portion confirmed gains/target landed correctly,
+and the control loop reads I2C data directly in memory, never via VCP,
+so TX corruption can't have touched the actual control math).
+
+**Ki search at the new rate** (`Kp=1.75` fixed): Ki=200/50 clearly
+unstable, Ki=20 marginal (clean for ~1.7s then slowly builds
+oscillation), **Ki=10 genuinely stable** (4.1% overshoot, 2844ms
+settling, no growth across a 6s window) — see
+`results/fta_closed_loop_465hz_ki_search.png`. Initial (WRONG, see below)
+theory: a sample-rate effect, since the plant's fixed ~41ms pipeline
+delay doesn't shrink just because the loop updates more often.
+
+**User pushed back, correctly**: pure delay-based control theory says a
+fixed dead-time's effect on stability margin depends on absolute delay,
+not sampling density, as long as well below Nyquist (true at both 210Hz
+and 465Hz relative to a ~15-40Hz plant). **Direct diagnostic run to
+settle it**: added a TEMPORARY firmware throttle
+(`DIAG_CONTROL_INTERVAL_MS`, gates how often `run_closed_loop_step`
+actually fires back to ~200Hz while telemetry TX stays at the full
+~465Hz) and reran the exact same `Kp=1.75/Ki=200` baseline. **Still
+deeply unstable (1179.6% overshoot), same growing-oscillation
+signature** (`results/fta_closed_loop_step_response_465hz_telemetry_200hz_control_kp1750_ki200.png`)
+— this cleanly falsifies sample rate as the cause. Checked static local
+plant gain next (small `dac_y` steps around 2048, open-loop): **0.094-0.095
+px/count, essentially unchanged** from the ~0.09 px/count baseline this
+control loop was originally tuned against — rules out a simple DC
+calibration shift too.
+
+**Re-ran the same free-decay ring-down test from the previous PID entry
+(user's own idea) to check whether the actuator's resonance itself
+moved.** First re-measurement: 22.09Hz, ζ=0.082 (vs. the previously-
+documented 15.35Hz, ζ=0.105) — reported as "the resonance moved,
+explaining the instability." **User pushed back again, correctly**:
+insufficient resolution was the likely explanation, not a real physical
+shift. Investigated directly rather than assuming either way:
+
+- Re-examined the OLD ring-down capture's own raw `t[]` array: **69-86%
+  of consecutive host-side timestamps were EXACTLY identical** — Windows
+  batches this project's `_reader_thread`'s `readline()` calls into
+  ~15-16ms bursts (thread-scheduling granularity), not the ~2-3ms real
+  telemetry spacing. For a 15-65ms-period oscillation, that's only
+  ~1-4 real timestamp buckets per cycle — nowhere near enough to trust a
+  frequency fit, regardless of the underlying ~210-465Hz telemetry rate
+  itself being fine.
+- Tried the obvious fix (`winmm.timeBeginPeriod(1)`, already used
+  elsewhere in this project for `time.sleep()` inflation) — **did not
+  help** (still 85% zero-dt after applying it). That fixes Sleep()
+  granularity, not general thread-scheduling preemption granularity —
+  a real, useful negative result, not just an oversight.
+- **Real fix: stopped trusting host arrival timestamps entirely.** Added
+  a `tick=` field (raw `HAL_GetTick()`, ms) to the telemetry relay line
+  (`line[]` grown 120→140 bytes) — the firmware's own free-running
+  1ms SysTick counter, immune to host OS scheduling. Rebuilt, reflashed
+  (same post-reflash silence glitch as every other reflash this session,
+  same fix). Updated `fta_ringdown_test.py` to timestamp every sample
+  from this field instead of `time.monotonic()`.
+
+**With real per-sample timing, the picture changed completely** — and
+took two more wrong turns before landing somewhere trustworthy:
+1. A "biggest single-sample drop" heuristic for finding the amp-off
+   moment picked an early point still inside the forced-drive transient
+   (the amp is actually driven for ~500-800ms in practice, not the
+   nominal `--pulse-ms=80ms` — paced command transmission dominates,
+   same finding as the negative-lag t0 bug from the on-board-sine-
+   generator entry above) — fed `curve_fit` a mixed forced+free window,
+   converged on a slow envelope (1.5Hz, ζ=0.677) that was visibly wrong
+   against the raw data once plotted.
+2. Switched to anchoring on the unambiguous global-minimum trough (real
+   free decay, nothing can drive the system past it once the amp is
+   truly off) minus a 60ms margin. Better-anchored window, FFT-seeded
+   initial guess — `curve_fit` converged to 8.56Hz/ζ=0.368 with a fit
+   curve that visually tracked individual oscillation cycles closely,
+   looked trustworthy at the time.
+3. **User pushed back a third time, correctly**: three different
+   `curve_fit` answers on three attempts, even after fixing real bugs
+   each time, isn't something to trust blindly — asked for a model-free
+   peak-to-peak spacing measurement instead, starting a little after the
+   amp turns off.
+
+**Model-free peak/trough spacing analysis — the trustworthy result.**
+Skipped the messier initial 2-3 cycles (still visibly settling from the
+forced-drive release, larger and more irregular in the raw data) and
+measured spacing between consecutive peaks AND troughs independently in
+the clean decaying tail (`t≈1.3-1.7s`): **16 peaks + 17 troughs, 31
+independent spacing measurements, mean 26.0ms → 38.51Hz** — peaks and
+troughs agree closely when computed separately (both ~40Hz via median).
+Marked directly on a plot for verification, not just reported as a
+number: `results/fta_ringdown_peak_spacing_analysis.png`
+(`scratch_ringdown_peak_analysis.py`, ad hoc, not committed-quality).
+
+**Net conclusion: the true resonance is ~38.5Hz, not the previously-
+documented 15.3Hz (which was itself measured with the same broken
+host-timestamp methodology and should now be considered unverified, not
+a real "before" baseline) and not the 22Hz/8.56Hz intermediate numbers
+from this entry's own earlier, flawed attempts.** Whether ~38.5Hz
+represents a real change from before the Pi-side ROI/other changes, or
+whether the ORIGINAL 15.3Hz was simply always wrong, cannot be
+determined — the original data is unsalvageable (no `tick=` field
+existed yet when it was captured). Given 38.5Hz is well outside the
+project's 10-20Hz disturbance-rejection target band (unlike 15.3 or
+22Hz, both of which sat inside or near it), **this may substantially
+change the practical implications of the whole resonance-vs-D-term
+thread** — a resonance safely above the target band is a much less
+acute constraint than one sitting inside it. Not yet reconciled with
+the Ki-instability finding above (Ki=200 stable before, unstable now,
+at Kp=1.75) — that finding stands on its own (independently confirmed,
+rate-independent per the throttle diagnostic) but its connection to
+"the resonance" is now an open question again given how much the
+resonance number itself has moved through this entry.
+
+**Not yet done**: reconciling the ~38.5Hz resonance finding with the
+Ki-instability finding; the messier initial 2-3 cycles' own frequency
+content (looked visually different/faster than the clean 38.5Hz tail —
+possibly a second mode, possibly still-settling noise, not analyzed);
+a fresh Ki/Kp search informed by the corrected resonance number; the D-
+term question (deferred pending the above). `fta_ringdown_test.py`'s
+`curve_fit`-based analysis is now known-unreliable for initial-window
+selection even with correct per-sample timing (converged wrong twice)
+and should probably be replaced with the peak-spacing approach as the
+primary method, not just an ad hoc side script, if this test gets used
+again. **State left**: hardware safely idle
+(`mode=open_loop amp=0 estop=0 dac_x=95 dac_y=95`). Nothing from this
+entry committed to git yet.
+
+### Fresh gain search at the corrected ~465Hz rate — Ki pushed to 19 cleanly, but Kp has almost no headroom above 1.75 (unstable by 2.5), contradicting the "38.5Hz gives us margin" hope (2026-08-19, same day)
+
+Direct follow-up once the true resonance (~38.5Hz, see entry above) was
+established. User asked two framing questions before tuning: does
+anti-windup need fixing first (**no** -- it only engages once output
+saturates, and small-signal step tests never get near the ±3905
+correction limit, so it doesn't participate in the linear small-signal
+stability question actually driving the current instability; real for
+large-disturbance recovery, but not gating this search); should D be
+retried during this pass (**after**, not during -- get a solid P+I
+baseline first with a resonance-informed low filter cutoff, layer D on
+top once that's settled, not concurrently).
+
+**Real bug hit immediately**: `fta_closed_loop_step_response_vcp.py`'s
+`TELEMETRY_RE` still didn't have the `tick=` field added in the entry
+above -- exact same "add a wire-format field, forget the OTHER script
+using the same regex" mistake this project has now made three separate
+times this session (`tgt=`, `dac_y=`, now `tick=`). Two back-to-back
+runs both failed with "0 usable telemetry samples" before this was
+caught and fixed. **Worth fixing properly at some point**: every VCP
+telemetry consumer script re-declares its own copy of `TELEMETRY_RE`
+independently rather than sharing one definition -- a shared parsing
+module would close off this whole class of bug permanently instead of
+catching it fresh reactively each time a field gets added.
+
+**Ki search (Kp=1.75 fixed), bisecting between the previous session's
+Ki=10 (stable) and Ki=20 (marginal)**:
+
+| Ki | overshoot | settling |
+|---|---|---|
+| 10 | -- | 2844ms |
+| 15 | 1.6% | 2265ms |
+| 18 | 1.6% | 1953ms |
+| 19 | 1.2% | 1797ms |
+
+Clean, monotonic improvement, no instability anywhere in this range —
+**Ki=19 is the best confirmed-clean result**, though still far slower
+than the old controller's 141-297ms best.
+
+**Kp increase attempted next, expecting the 38.5Hz finding to have
+opened up real headroom — it did not.** `Kp=3.5/Ki=15`: 693.3%
+overshoot, and tellingly the reported PRE-STEP baseline itself was
+already unsettled (284.4px instead of the expected clean ~253-255px) --
+unstable just holding a fixed setpoint, not only during the step.
+Backed off to `Kp=2.5/Ki=10`: **also unstable** (422.2% overshoot, same
+unsettled-baseline signature, baseline=281.2px). **The real Kp
+instability boundary at this rate sits somewhere between 1.75 and 2.5 --
+a much narrower margin than the 38.5Hz resonance measurement seemed to
+promise.** Telemetry rate also visibly dropped during both unstable Kp
+runs (~320-359/s vs. the normal ~445-450/s) -- plausibly detection
+confidence degrading at the oscillation's extremes, not investigated
+further.
+
+**Practical conclusion**: Ki remains the effective, safe lever at this
+rate (matching the ORIGINAL pre-2026-08-19 finding that Ki, not Kp, was
+the real speed lever -- re-confirmed, not overturned, by this session's
+work). Kp should stay at 1.75 for now. **Current best working
+configuration: Kp=1.75, Ki=19** (1.2% overshoot, 1797ms settling).
+Neither this nor the Ki=10-18 intermediate points have been re-verified
+with a longer post-window than 5-6s or cross-checked against a sine
+sweep yet -- step response only so far.
+
+**Not yet done**: narrower Kp bisection (1.75-2.5) to find its precise
+boundary, if worth the hardware time given Ki is already the more
+productive lever; the D-term retry (deferred per the sequencing decided
+at the start of this entry, not yet attempted); reconciling why Kp has
+so little margin despite the resonance sitting comfortably above the
+target band (the closed-loop bandwidth Kp alone drives may be reaching
+up toward 38.5Hz even though the *target* disturbance band is only
+10-20Hz -- plausible, not confirmed); a proper shared-regex fix for the
+`TELEMETRY_RE`-duplication bug class. **State left**: hardware safely
+idle (`mode=open_loop amp=0 estop=0 dac_x=95 dac_y=95`). Nothing from
+this entry committed to git yet.
+
+### D-term retried with a resonance-informed (10Hz) cutoff on top of the working Ki=19 baseline — still fails at every tested Kd, now a decisive, well-tested conclusion (2026-08-19, same day)
+
+User asked directly: since D adds phase lead and could in principle buy
+back stability margin for higher Kp/Ki (a fair, correct point), and
+given the D-term failure earlier was plausibly explained by a careless
+20Hz cutoff chosen against a WRONG 15.3Hz resonance reading, retry D now
+with a cutoff properly informed by the real 38.5Hz measurement.
+
+**`Kp=1.75/Ki=19/Kd=0.005/fc=10Hz`**: 3434.0% overshoot, drifted the
+WRONG direction entirely (delta=+8.68px against a commanded -25px step)
+— badly unstable, same growing-oscillation signature as every earlier D
+failure. **`Kp=1.75/Ki=19/Kd=0.001/fc=10Hz`** (smallest representable
+nonzero Kd in this firmware's milli-unit convention): still badly
+unstable, 1391.5% overshoot.
+
+**This is now a decisive result, not an unlucky parameter choice.**
+Across this session, D has been tested at cutoffs spanning 1-20Hz and
+`Kd` spanning 0.001-0.05, combined with both `Ki=19` (this session's
+best clean P+I result) and the original `Ki=200` — **every single
+combination made things worse than P+I alone; none improved on it.**
+The earlier hope that a properly-chosen cutoff (informed by the
+corrected 38.5Hz resonance, comfortably above the 10-20Hz target band
+this time) would let D work has not panned out.
+
+**Most likely explanation, consistent with the class's design**:
+`PIDController.hpp`'s derivative filter is a single-pole EMA low-pass —
+a fundamentally blunt instrument that trades "reject the resonance"
+directly against "pass useful signal" along a single knob (cutoff
+frequency), with no way to do both at once when the resonance is close
+enough to the frequencies where useful error-rate information also
+lives. A cutoff low enough to meaningfully attenuate 38.5Hz also
+attenuates most of what would make D useful in the 10-20Hz target band;
+a cutoff high enough to preserve useful signal doesn't reject the
+resonance at all. This is a structural limitation of the *filter
+design*, not evidence the underlying idea (derivative action) can't
+ever work here.
+
+**Answering the user's real question ("can this get the old speed back")
+honestly: not with this D implementation.** The old 141-297ms result was
+achieved under conditions (rate, and very possibly a different true
+resonance situation) that no longer hold, and every attempt to recover
+it — through Ki alone, through Kp, and now through D — has hit a real
+wall well short of that target. `Kp=1.75, Ki=19` (1797ms settling)
+remains the best confirmed-clean result this session has found. Genuine
+remaining options, neither attempted: (1) a real notch filter targeting
+38.5Hz specifically (rejects just that frequency, doesn't blanket-
+attenuate everything above the cutoff the way a low-pass does) — new
+firmware DSP work, not a parameter change; (2) physical/hardware changes
+to the actuator mount (stiffen/damp to push the resonance further out or
+reduce its Q) — outside firmware's reach entirely. Kept `Kd=0` (back to
+the working P+I baseline) as the final state.
+
+**State left**: hardware safely idle (`mode=open_loop amp=0 estop=0
+dac_x=95 dac_y=95`). Nothing from this entry committed to git yet.
+
+### Notch filter built and tested — first result looked like parity with P+I, but the WHOLE post-rate-change search (including that result) turns out to have been run under a leftover ~200Hz diagnostic throttle; at the true ~465Hz rate Ki=19 is badly unstable, and the notch does not move the Ki/Kp boundary (2026-08-19, same day)
+
+Implemented the notch filter flagged as the next real option in the entry
+above: a proper 2nd-order biquad notch (RBJ "Audio EQ Cookbook" formulas,
+`notch_configure`/`notch_apply`/`notch_reset_state` in `main.c`), applied
+to the measurement before it reaches the PID, with new `set_notch
+FREQ_MILLIHZ Q_MILLI` / `notch_off` VCP commands and `notch=`/
+`notch_freq_millihz=`/`notch_q_milli=` added to `get_status`. Tested at
+38.5Hz/Q=3 on top of the Kp=1.75/Ki=19 baseline: 1.2% overshoot, 1781ms
+settling — indistinguishable from the no-notch Ki=19 result (1.2%/1797ms).
+
+**That comparison turned out to be meaningless — a real, important
+correction.** Reread the firmware and realized `DIAG_CONTROL_INTERVAL_MS`
+(the ~200Hz control-rate throttle added earlier in the day purely to
+falsify sample rate as the cause of the original Ki=200 instability) and
+the matching `ts_s = 1/200` were never reverted. This means the ENTIRE
+post-rate-change tuning campaign from earlier today — the Ki=15/18/19
+bisection, the Kp=2.5/3.5 instability check, both D-term retests, and
+the first notch test above — were all run with the control loop
+artificially capped at ~200Hz, not the true ~440-475Hz the Pi has
+actually been streaming at since the ROI change. Telemetry TX itself was
+always full-rate; only `run_closed_loop_step`'s call frequency was
+throttled. `notch_configure()`'s hardcoded `457.5f` sample-rate
+assumption was therefore ALSO wrong the entire time, silently
+mismatched against the true ~200Hz the loop was actually running at.
+
+**Fixed properly, not patched around**: removed `DIAG_CONTROL_INTERVAL_MS`
+and its call-site gate entirely (`run_closed_loop_step` fires on every
+confident packet again, matching the pre-diagnostic design), removed the
+now-unused `g_last_ctrl_step_tick`, and restored `pid_wrapper_init`'s
+`ts_s` to `1/457.5`. Rebuilt (clean, `text=43212`, slightly smaller with
+the throttle code gone), reflashed — clean on the first try, no
+post-reflash silence glitch this time.
+
+**Retested Kp=1.75/Ki=19/notch=38.5Hz at the TRUE full rate: badly
+unstable — chaotic oscillation between ~150-650px even during the
+pre-step baseline hold**, nothing like a step response
+(`results/fta_closed_loop_step_response_fullrate_kp1750_ki19_notch385_q3.png`).
+This is a real, decisive correction: Ki=19 was never actually validated
+against the rate this project has been running at since the ROI change —
+every number reported for it earlier today (1.2%/1797ms, the "new best
+result") was only ever true under the artificial ~200Hz cap.
+
+**Real bug found and fixed in the host test script while chasing this**:
+after a command times out (~2s with no reply — normal, already-documented
+VCP flakiness under load), ~2s of telemetry backlog accumulates unread.
+The NEXT command's own reply-matching window was being spent draining
+that stale backlog instead of watching for a fresh reply — confirmed
+directly (isolated repro: `clear_estop` and `set_mode open_loop` both
+timeout, then `get_status` fails all 5 of its own retries, ~11.6s total,
+even though `get_status` called on its own with a clean buffered
+succeeds in <1s every time). Fixed by adding `ser.reset_input_buffer()`
+to the start of `send_command()` in `fta_closed_loop_step_response_vcp.py`,
+right before each paced write — clears stale backlog before it can
+cascade into starving the next command's own reply. Confirmed fixed via
+isolated repro before trusting it for the real test runs below.
+
+**Fresh Ki search at the TRUE ~465Hz rate, Kp=1.75, notch=38.5Hz/Q=3
+active throughout:**
+
+| Ki | character |
+|---|---|
+| 15 | **clean** — bounded convergence, no growth, ~2-3px steady noise band (`results/fta_closed_loop_step_response_fullrate_kp1750_ki15_notch385_q3.png`) |
+| 19 | unstable — chaotic, unbounded oscillation even at rest |
+| 20 | marginal — bounded but a visible low-frequency "beating" envelope, not growing but not clean either (`..._ki20_notch385_q3.png`) |
+| 30 | worse — same beating pattern but now visibly GROWING in amplitude across the recorded window (`..._ki30_notch385_q3.png`) |
+
+Also retried `Kp=2.5/Ki=15` (notch on) to check whether the notch buys
+Kp headroom the way it was hoped to when first proposed: **still badly
+unstable** (575% overshoot, chaotic, telemetry rate itself dropped to
+~289/s from the usual ~435-450/s — matching the same "detection
+struggles during violent oscillation" signature seen for unstable Kp
+values earlier today).
+
+**Conclusion: the notch filter does not move the Ki or Kp stability
+boundary in any measurable way.** The clean/marginal/unstable
+transition found here with the notch active (clean at 15, marginal at
+20, worse at 30) lands in essentially the same place as the boundary
+already on record from EARLIER today's true-full-rate search *without*
+any notch (`Ki=10` clean, `Ki=20` marginal, `Ki=50`/`200` unstable, all
+pre-throttle) — if anything Ki=15 clean/Ki=20 marginal is a slightly
+tighter band than the no-notch Ki=10/Ki=20 result, not a looser one,
+though the difference is small enough it could just be the low-Ki edge
+being under-sampled in one search vs. the other rather than a real
+notch-makes-it-worse effect. Either way, there is no evidence here that
+filtering out the 38.5Hz resonance from the feedback path buys back any
+of the speed lost since the ROI-change rate increase. **Best honest
+working point at the true full rate, with or without the notch: Kp=1.75,
+Ki=15** — clean, but far short of the pre-ROI-change 141ms/1.1% result,
+and no faster than what was already achievable without the notch.
+
+**Plotting changed to always show notch status, not just when active**
+(direct response to wanting this visible at a glance, not buried in a
+CLI flag): `fta_closed_loop_step_response_vcp.py` now queries
+`get_status` for the REAL `notch=`/`notch_freq_millihz=`/`notch_q_milli=`
+fields right before engaging closed_loop, rather than trusting whether
+`--notch-freq-milli` was passed on the command line — the firmware's
+notch state persists in RAM across runs, so a run that passes neither
+`--notch-freq-milli` nor the new `--notch-off` flag could silently still
+be running with a notch a PREVIOUS run left enabled. This ground-truth
+value drives a high-contrast badge on the plot itself (top-left, amber
+"NOTCH ON: 38.5Hz Q=3.0" when active, muted "notch: off" when not) and
+is baked into the figure title, plus saved into the npz as
+`notch_active`/`notch_freq_hz`/`notch_q` — a saved plot can no longer be
+mistaken for the wrong condition.
+
+**On the user's question "is the change with the ROI turning binning on
+where it was off before?"**: no — both `640x200` and `640x100` are
+binned modes (`MODE_640_200_ROI`/`MODE_640_100_ROI`, see the ROI-mode
+sections elsewhere in this file); binning was never off. The real
+throughput fix (see "Pi-side I2C1 baud change landed and verified"
+above) was three separate things: (1) `DEFAULT_STREAM_ROI` switched from
+the already-binned `640x200` to the smaller, faster, ALSO-already-binned
+`640x100`; (2) `apply_y_start()`'s blocking auto-track subprocess calls
+moved off the hot capture/detect/send loop onto a background thread
+(`request_recenter()`); (3) the I2C bus itself raised from 100kHz to
+400kHz (a separate, earlier fix). None of the three is a binned/unbinned
+switch.
+
+**On the still-open "should I send out for a stiffer flexure?" question**:
+this result sharpens the case for yes, more than it did before the notch
+test. The notch was the cheap, no-hardware option, specifically chosen
+because it should in principle reject only the resonance without the
+D-term low-pass's blanket-attenuation tradeoff — and it measurably did
+not help. That doesn't prove a stiffer flexure WOULD help (the
+underlying instability mechanism at higher Ki/Kp still isn't fully
+explained — see the "not yet done" list below), but it does mean
+the one concrete firmware-only lever left on the table has now been
+tried and found wanting, narrowing the realistic remaining options to
+(a) accept ~Ki=15's ~1.5-2s settling as the working point, or (b) a
+physical change to the actuator mount. Not a firm recommendation to
+order hardware yet — worth first understanding WHY the notch didn't
+help (a notch only rejects a narrow band right at 38.5Hz; if the real
+instability mechanism is closed-loop bandwidth/phase-margin erosion
+building up well below 38.5Hz, rather than resonance energy specifically
+at 38.5Hz feeding back, a notch would never have been expected to help
+regardless of hardware, and stiffening the flexure — which mainly just
+relocates the resonance — might not help either).
+
+**State left**: hardware safely idle (`mode=open_loop amp=0 estop=0
+dac_x=95 dac_y=95`). Firmware throttle-removal, `ts_s` fix, and the
+notch filter itself are all uncommitted. `fta_closed_loop_step_response_vcp.py`'s
+`send_command` backlog fix and ground-truth notch-status plotting are
+also uncommitted. **Not yet done**: WHY the instability boundary sits
+where it does (~Ki=15-20 at Kp=1.75, ~Kp=2.5 regardless of Ki) is still
+not explained by anything more specific than "phase margin," not
+confirmed against the 38.5Hz resonance or any other specific mechanism;
+Kp has not been sub-2.5 fine-bisected at the true rate (jumped straight
+from the working 1.75 to 2.5); no sine-tracking validation at true rate
+with any of today's gain points; the D-term has not been retried at the
+true (un-throttled) rate at all — every D-term result on record is also
+now suspect for the same throttle reason and should be treated as
+unvalidated at the real rate, not just the notch/Ki results.
+
+### Output-limit tightening tried (the flagged-but-never-tried anti-windup experiment) — decisively does NOT help, and makes a marginal case actively worse; confirms the instability is a real gain/phase-margin problem, not a windup problem (2026-08-19, same day)
+
+Direct follow-up to the "same-axis effect, most likely from a real
+anti-windup mechanism difference" theory in the "D-term evaluated
+properly" entry above (Phil's `PIDController.hpp` only claws back
+integral reactively once the *combined* p+i+d output saturates; the old
+hand-rolled controller clamped proactively every step). That theory was
+never tested — `pid_wrapper_init`'s output limits were left at the full
+`±3905` DAC-count span (the whole clamped DAC range), so for a 25px step
+needing only ~250-300 counts of correction, the class's back-calculation
+anti-windup never engages at all, regardless of how badly Ki=200 behaves.
+
+**Made it live-testable without touching `PIDController.hpp` itself** —
+respects the standing "use Phil's class completely, no mixing in
+hand-rolled logic" constraint, since `setOutputLimits()` is a real,
+unmodified part of the class's own API. Added `pid_wrapper_set_out_limits()`
+(`pid_wrapper.cpp`/`.h`, mutates the live instance via `setOutputLimits()`
+without reconstructing — deliberately does NOT clear the integral, meant
+for A/B comparison mid-run) and a new `set_out_limit N` VCP command
+(symmetric ±N DAC counts, `g_out_limit_counts` global, defaults to the
+same `±3905`), plus `out_limit=` added to `get_status`. Rebuilt (clean,
+`text=43688`), reflashed cleanly. `fta_closed_loop_step_response_vcp.py`
+got a matching `--out-limit` arg, ground-truth `out_limit` read back via
+`get_status` (same pattern as the notch ground-truth fix), and a plot
+annotation that appears only when the limit is tightened from the
+default.
+
+**Tested tightening to ±500 counts (well above the ~278-count steady-state
+need for a 25px step, but tight enough that windup-driven overshoot
+past that should get clawed back) at two gain points:**
+- **Kp=1.75/Ki=200** (the original pre-ROI-change gains this whole
+  thread is trying to recover): still badly unstable, chaotic
+  oscillation even at rest before the step — no different in character
+  from the untightened result
+  (`results/fta_closed_loop_step_response_fullrate_kp1750_ki200_outlimit500.png`).
+- **Kp=1.75/Ki=20** (previously the borderline "marginal, bounded
+  beating" case *without* the tightened limit): with the limit tightened
+  to ±500, this became **fully chaotic — WORSE than without the limit**,
+  diverging even during the pre-step baseline hold
+  (`results/fta_closed_loop_step_response_fullrate_kp1750_ki20_outlimit500.png`).
+
+**Conclusion: tightening the output limit is not the fix, and can
+actively make a marginal case worse.** This is a real, useful negative
+result, not just "didn't help": it confirms the instability found at
+these gains and this rate is a genuine linear stability-margin problem
+(loop gain vs. the plant's real phase lag at the control bandwidth these
+gains push toward), not a saturation/anti-windup problem — the system
+goes unstable well before ever coming close to needing anti-windup
+protection in the first place. The Ki=20 regression under a *tighter*
+limit is consistent with a classic nonlinear failure mode (saturation +
+integral action + delay can themselves create or worsen a limit cycle),
+not a coincidence.
+
+**Practical implication for the user's question about reintroducing the
+old hand-rolled proactive integral clamp**: not expected to help either,
+for the same reason — that technique is also fundamentally an
+anti-windup mechanism (bounding the integral state itself rather than
+reactively undoing a saturated step), and this result shows anti-windup
+design of any kind is not what's gating stability here. Recommended
+NOT pursuing that path (also avoids reopening the "use Phil's class
+completely, don't mix in hand-rolled logic" decision for a change
+unlikely to fix the actual problem). The genuinely still-open question
+is why the linear stability margin collapsed between the pre-ROI-change
+rate and the current ~465Hz rate — not yet tied to a specific mechanism
+(the 38.5Hz resonance was checked via the notch filter and ruled out as
+the explanation in the entry above).
+
+**Output limit reset back to the default `±3905`** before leaving
+hardware idle (confirmed via `get_status`) — the tightened value was
+purely diagnostic, not adopted. **Current honest best working
+configuration remains unchanged: Kp=1.75, Ki=15**, notch off (no
+measurable benefit), output limit at its default (tightening it doesn't
+help, so no reason to deviate from default). `set_out_limit`/
+`--out-limit` are kept as a permanent live-tunable feature (cheap to
+keep, useful if this needs revisiting) even though this particular test
+came back negative.
+
+**State left**: hardware safely idle (`mode=open_loop amp=0 estop=0
+dac_x=95 dac_y=95`). Firmware (`pid_wrapper.cpp`/`.h`, `main.c`'s
+`set_out_limit` command + `get_status` field) and
+`fta_closed_loop_step_response_vcp.py`'s `--out-limit` support are both
+uncommitted. **Not yet done**: sine-tracking validation at Kp=1.75/Ki=15
+(the true-rate honest best point) — the natural next step now that a
+real stable operating point exists, and the actual test of whether this
+settles the "does the loop reject the real 10-20Hz disturbance" question
+rather than just a step-response proxy; a Kp sub-2.5 fine bisection at
+the true rate; the D-term retried at the true (un-throttled) rate
+(everything on record for D predates the throttle fix and is unvalidated
+at the real rate); the still-open "why did the stability margin collapse
+at the higher rate" question.
+
+### Sine-tracking validation at Ki=15 reveals a much bigger problem: T≈0.10-0.16 at 5-20Hz means ~85-90% of a real disturbance passes through unrejected — a second host-timestamp-bucketing bug found and fixed along the way; then a properly-built, live-tunable control-rate throttle unexpectedly recovers the OLD fast/clean Ki=200 behavior, though sine validation shows it's still not enough (2026-08-19, same day)
+
+**Ran the first real sine-tracking test against today's honest best point
+(Kp=1.75/Ki=15, no notch) using the on-board sine generator.** Found
+`fta_closed_loop_onboard_sine_test.py`'s own `send_command`/
+`send_command_timed` never got the backlog-reset fix from the entry
+above (separate function, own copy) — `start_sine` failed outright until
+ported over. Also found the abort path never called `stop_sine`, so a
+command that actually landed firmware-side (confirmed via `get_status`
+showing `sine=1`) but lost its confirmation reply left the sine
+generator latched on after a false-alarm abort — fixed by verifying
+`start_sine` against `get_status` ground truth (added `sine`/
+`sine_freq_millihz` to `STATUS_FIELD_RE`) instead of trusting the reply
+alone, matching this session's established notch/out_limit pattern.
+
+**Real result, amplitude=25px (150um pk-pk):** gain 0.098-0.163 across
+1-10Hz — **much lower than hoped**. User's reaction, correctly: "we
+can't have such low gain, we need to use this to put the fiber at exact
+positions, not generate waves." This reframed what the number means:
+for a unity-feedback loop, T (tracking gain) and S (disturbance
+sensitivity) satisfy S=1-T — a low T at a frequency IS poor rejection at
+that frequency, not a separate/different concern. T≈0.10-0.16 means
+S≈0.84-0.90: **if a real 5-10Hz beacon wobble hit the rig right now,
+84-90% of it would still show up as position error, essentially
+uncorrected.** This is the sine test finally proving, by direct
+measurement, what the whole day's stability-vs-speed fight implied: the
+"safe" Ki=15 is stable but has nowhere near enough closed-loop bandwidth
+for the actual mission.
+
+**Second host-timestamp-bucketing bug found, same class as the ring-down
+test's original bug, in TWO more scripts.** User asked, correctly
+suspicious of the low sample rate: "are we having the same time binning
+issue... at 400hz i'd expect a 10hz sine wave to look smoother." Checked
+directly: `fta_closed_loop_onboard_sine_test.py`'s `_reader_thread` used
+`time.monotonic()`, never the `tick=` field it was already parsing —
+77.7% of consecutive samples landed on the exact same host timestamp in
+one recorded run. Fixed the same way as `fta_ringdown_test.py` before it:
+timestamp from `tick=` (added a `t0` no longer needed, cleaned up the
+now-unused parameter). Refit the numbers with corrected timestamps: gain
+barely changed (0.129/0.105 vs 0.125/0.128 at 5/10Hz) — confirms the low
+gain is real, not a timestamp artifact (the least-squares sine fit over
+hundreds of points is fairly robust to this kind of jitter, unlike the
+ring-down test's single-cycle peak-spacing measurement, which the same
+bug corrupted badly).
+
+**Checked `fta_closed_loop_step_response_vcp.py` too — same bug, worse
+implications.** It also parses `tick=` but timestamps off
+`time.monotonic()`. Unlike the sine script, this one's `t_step` (when the
+step was commanded) is measured on the HOST clock with no firmware-
+reported echo to anchor against, so switching straight to tick-based `t`
+would leave `t_step` on a different, unsynchronized clock. Fixed
+properly: record both a host arrival timestamp and `tick_ms` per sample,
+then fit an affine mapping (`np.polyfit`, least-squares over thousands of
+samples so per-sample OS jitter averages out) from host time to firmware
+tick, and map `t_step` through that fit. Rerunning the Kp=1.75/Ki=15
+baseline with the fix: rise time 1484ms→**2586ms**, overshoot 10.5%→
+**1.5%**, settling now resolves at **2984ms** (previously never converged
+in the recorded window) — a real, substantial correction, not noise.
+Visually, the corrected plot shows a single clean damped approach over
+~3s; the old bucketed version's compressed time axis had made it look
+faster and noisier than it really is. **This means every precise rise/
+settling-time number reported earlier today (Ki=15/19/20/30, the
+Kp=2.5/3.5 checks, both out_limit tests) should be treated as
+directionally correct but not trustworthy to the millisecond** — the
+stable-vs-unstable classifications themselves are unaffected (those come
+from raw amplitude, not timing), only the precise ms figures.
+
+**Checked whether the "wobble in the undriven axis" the user noticed
+during testing meant cross-axis coupling needs its own controlled axis.**
+Compared `y` (undriven) statistics directly: clean Ki=15 run — std=0.47px,
+range=2.3px (noise floor); every unstable run tested (Ki=19/200/20 with
+various notch/out_limit settings) — std=8.5-12.5px, range=47-80px. The
+wobble tracks X-axis instability, not independent cross-coupling — real
+evidence against needing a second controlled axis right now, though worth
+rechecking once X is genuinely stable through a real disturbance test
+(not yet done at a fully validated operating point).
+
+**Answered a Pi-side question**: switching back to `640x200` and still
+seeing ~448Hz confirms the ROI mode itself (binning, coordinate scaling)
+never changed — the throughput win came from the I2C baud raise
+(100kHz→400kHz) and moving auto-track recentering off the hot capture
+loop onto a background thread, both mode-independent; `640x100` was a
+separate, additional lever, not a prerequisite.
+
+**User's hypothesis, tested properly: does throttling the control rate
+back to ~200Hz (this time with a genuinely clean, atomically-paired
+rate+`ts_s` mechanism, not the earlier one-off `DIAG_CONTROL_INTERVAL_MS`)
+recover the OLD Kp=1.75/Ki=200 behavior?** Built `set_ctrl_rate MILLIHZ`
+(`pid_wrapper_set_ts()` + `g_control_interval_ms`, both firmware/
+`pid_wrapper.cpp`/`.h`) — ONE command sets both the throttle gate and the
+PID's `ts_s` together, specifically to prevent the two ever silently
+drifting apart the way the removed `DIAG_CONTROL_INTERVAL_MS` diagnostic
+did earlier the same day. `MILLIHZ=0` disables the throttle (full
+telemetry-driven rate, default); a positive value throttles to that rate.
+Added matching `--ctrl-rate-milli` to `fta_closed_loop_step_response_vcp.py`,
+ground-truth `ctrl_rate_millihz`/`ctrl_interval_ms` via `get_status`
+(same pattern as notch/out_limit), and a high-contrast red "THROTTLED"
+plot badge (top-right, notch's badge owns top-left) shown only when
+active, plus a title suffix — a throttled run can't be mistaken for a
+full-rate one at a glance.
+
+**Result: Kp=1.75/Ki=200 throttled to 200Hz is genuinely clean and fast
+again** — 168ms/2.0%/193ms then, on an immediate repeat, 163ms/1.9%/201ms
+(`results/fta_closed_loop_step_response_throttle200_kp1750_ki200*.png`)
+— essentially matching the historical pre-ROI-change numbers
+(141-297ms range), and confirmed reproducible, not a fluke. **This
+directly contradicts the earlier same-day finding** ("Chasing 'why is the
+loop unstable'" entry) that the same nominal config (Kp=1.75/Ki=200,
+throttled ~200Hz control rate via `DIAG_CONTROL_INTERVAL_MS`, `ts_s`
+matched) was catastrophically unstable (1179.6% overshoot). Compared the
+old failing run's own saved npz directly: identical `base_dac_y`/
+`step_px`/`kp_milli`/`ki_milli`, and the raw `x` trace genuinely swings
+from 2.9 to 535.0px — a real amplitude blowup, not a timestamp artifact
+(overshoot is computed from amplitude alone, unaffected by either
+timestamp bug). **Could not identify a concrete mechanism explaining the
+discrepancy** — the old throttle gate and the new `set_ctrl_rate` gate
+are functionally equivalent on inspection, and `ts_s` appears to have
+been correctly matched in both cases from what's still readable in
+comments/history. Flagging honestly as an unresolved mystery rather than
+claiming a mechanism: something about the old one-off diagnostic
+implementation (or conditions at the time) differed from today's more
+careful, live-tunable version, but what exactly isn't established.
+
+**Sine-tracking validation at the recovered config (Kp=1.75/Ki=200,
+throttled 200Hz), 2.5px/15um pk-pk, informed by the earlier T=S-1
+lesson**:
+
+| freq | gain (T) | implied \|S\| |
+|---|---|---|
+| 5 Hz | 0.342 | 0.658 |
+| 10 Hz | 0.223 | 0.777 |
+| 15 Hz | 0.205 | 0.795 |
+| 20 Hz | 0.235 | 0.765 (lag past the ±90° wraparound boundary, lower confidence) |
+
+Clean, stable, amplitude-limited traces throughout (`results/fta_closed_loop_onboard_sine_throttle200_ki200_*Hz_15umpp.png`)
+— no instability at any tested frequency. **A real, meaningful
+improvement over Ki=15** (T was 0.10-0.16 there) — roughly 2-3x better
+gain across the band — but **still far short of good rejection**: S
+staying at 0.66-0.80 across 5-20Hz means 66-80% of a real disturbance in
+that band would still show up as position error. **This is the clearest
+evidence yet that fast STEP-response settling and good DISTURBANCE
+REJECTION at 10-20Hz are not the same property** — the historically
+"best" pre-ROI-change configuration was always somewhat limited here; it
+just settles a single big jump quickly, which is a different thing from
+continuously cancelling an oscillating input. Consistent with the much
+earlier open-loop finding (see "Pushed sine tracking to 5/10/15/20Hz" and
+the fine-sweep/resonance sections further below) that the actuator/plant
+itself has real rolloff in this band, not fully fixable by PID tuning
+alone regardless of which specific instability this session has been
+chasing.
+
+**Practical recommendation**: adopt Kp=1.75/Ki=200 + `set_ctrl_rate
+200000` as the new best working point — strictly better than Ki=15 on
+every measured axis (settling ~15x faster, tracking gain ~2-3x higher at
+5-20Hz), reproducibly stable. But be explicit that this does NOT fully
+solve the "hold exact position against a real 10-20Hz disturbance"
+mission on its own — real residual error will remain. Worth exploring:
+whether an intermediate throttle rate (e.g. 300-400Hz, between the
+unstable full ~465Hz and the conservative 200Hz) does better than either
+end; and revisiting the D-term / Kp headroom now that a working, live-
+tunable rate control exists to explore around.
+
+**State left**: hardware safely idle (`mode=open_loop amp=0 estop=0
+dac_x=95 dac_y=95`). Firmware (`pid_wrapper.cpp`/`.h`'s `pid_wrapper_set_ts`,
+`main.c`'s `set_ctrl_rate` command + `get_status` fields, `TX_MSG_MAX_LEN`/
+`line[]` grown to 400 for the extra fields) and both Python scripts'
+timestamp fixes / `--ctrl-rate-milli` support are uncommitted. **Not yet
+done**: understanding why the old throttle attempt failed when the new
+one doesn't; an intermediate-rate sweep (300/400Hz) to see if there's a
+better point than 200Hz; Kp headroom re-exploration now that Ki=200 is
+recoverable; D-term retried at a genuinely working configuration; a
+longer-duration/repeated sine validation for statistical confidence (n=1
+per frequency so far).
+
+### Real closed-loop delay measured directly: ~11.5ms, not the previously-assumed ~41ms — changes the phase-margin picture significantly (2026-08-19, same day)
+
+User asked, after the "is PID even sufficient given S+T=1" discussion:
+does the mission need unity gain (yes, essentially — S=1-T, so poor
+rejection IS what a low T at a frequency means), and what's actually
+capping achievable bandwidth. Reasoned that the empirical pattern all
+day (Ki/Kp capped regardless of anti-windup/notch tuning) is the
+signature of loop delay eating phase margin, and flagged that the only
+delay number on record (~41ms, from the "RESOLVED (2026-08-06)" sine-lag
+section) was measured over a fundamentally different, slower path — the
+VCP-relay test methodology (camera → I2C → Nucleo print → USB VCP →
+Python read) — not today's real control path, which reads I2C telemetry
+directly in memory with no VCP round trip at all. Needed a real,
+directly-measured number for the actual path before reasoning further.
+
+**Built a measurement designed to avoid every host-timing trap hit this
+session** (the on-board sine generator's original negative-lag bug, two
+separate host-timestamp-bucketing bugs) by keeping BOTH ends of the
+measurement on the firmware's own clock, zero host timestamps involved.
+New firmware command `pulse_step DELTA` (`main.c`): applies a DAC step to
+`dac_y` and latches `g_pulse_step_tick = HAL_GetTick()` in the same
+atomic action, open-loop and amp-enabled only (same guard pattern as
+`set_x`/`set_y`). Added `pulse_tick=` to `get_status` so the exact
+applied tick survives even if the command's own confirmation reply gets
+lost under load (routine, same as every other VCP reply this session) —
+a retried `get_status` recovers it from firmware memory instead.
+
+Built `fta_loop_delay_test.py`: one pulse per trial (matching this
+project's "don't read VCP replies while the reader thread owns
+`ser.readline()`" discipline — the pulse itself is fire-and-forget during
+recording, `pulse_tick` is only read back via `get_status` AFTER the
+reader thread stops), pre/post windows timestamped entirely via the
+firmware's `tick=` telemetry field, baseline computed from the pre-pulse
+window, onset detected as the first post-pulse sample exceeding
+`max(1px, 3×pre-pulse noise std)`.
+
+**Result: 11.5ms mean delay, very tight (std=1.7ms, range 10-15ms across
+6/6 usable trials, alternating step direction)** — `results/fta_loop_delay_20260818T220222Z.png`.
+Visually confirmed clean: flat pre-pulse baseline, sharp unambiguous
+onset in every trial, no ambiguity in picking the threshold crossing.
+Bonus: each trial's post-step trace visibly rings down at a period
+consistent with the ~38.5Hz resonance already characterized via the
+dedicated ring-down test — a nice independent corroboration of that
+number from a completely different measurement.
+
+**This is much smaller than the ~41ms figure this project had been using
+in reasoning about phase margin, and changes the picture meaningfully.**
+Recomputing: an 11.5ms pure delay alone doesn't consume 90° of phase
+until ~22Hz (vs. ~6Hz using the old, wrong 41ms figure) — real headroom
+remains from a pure-latency standpoint well into the project's actual
+10-20Hz target band. **This means the earlier reasoning ("PID can't work
+because of loop delay, needs a Smith predictor or hardware fix") was
+likely overstated for THIS real control path** — the ~41ms number was
+correct for the old VCP-relay test methodology, just not representative
+of the real closed-loop path that was actually being reasoned about.
+
+**Practical implication**: given delay itself has real headroom to
+~20Hz+, the more likely dominant constraint on today's stability ceiling
+is the plant's own resonance dynamics (~38.5Hz, ζ≈0.105, lightly damped —
+directly visible in this test's own ringdown) rather than raw sensor/
+transmission latency. This reopens two options with more confidence than
+before: (1) the notch filter approach (tried today, found not to move
+the Ki/Kp boundary) may be worth retrying now that the throttled-200Hz
+recovery is understood and the delay budget is known to be generous —
+the earlier notch test's null result might have been confounded by the
+same throttle/rate confusion this session worked through afterward, not
+a real dead end; (2) hardware stiffening/damping of the flexure, which
+directly targets the resonance, looks more clearly relevant now that
+resonance (not delay) is the more likely dominant constraint. A Smith
+predictor is less obviously necessary given how modest the real delay
+turned out to be — worth deprioritizing relative to the resonance-focused
+options above.
+
+**State left**: hardware safely idle (`mode=open_loop amp=0 estop=0
+dac_x=95 dac_y=95`, confirmed via the script's own cleanup + final
+`get_status`). Firmware (`pulse_step` command, `g_pulse_step_tick`,
+`pulse_tick=` status field) and `fta_loop_delay_test.py` (new file) are
+uncommitted. **Not yet done**: repeating at other operating points (only
+dac_y≈2048 tested); distinguishing how much of the 11.5ms is
+camera/detection/transmission vs. the actuator's own electrical/
+mechanical onset (this measurement gives the total, not the breakdown);
+retrying the notch filter now that the throttle confusion is resolved;
+using this real delay number to properly evaluate a Smith-predictor-style
+compensator if the resonance-focused options don't fully close the gap.
+
+### Control-step timing regularity measured directly; a boxcar smoothing pre-filter implemented and tested — reveals the ORIGINAL Kp=1.75/Ki=200 instability has stopped reproducing at all for unexplained reasons, and once a genuinely-still-unstable config was found to test against, smoothing added NOTHING beyond what throttling alone already provides (2026-08-19, same day)
+
+Direct follow-up to "why did throttling help" — still unanswered after the
+delay measurement above. User's sharpened question: is it raw rate, or
+specifically how REGULAR the control-update timing is; and would a
+rolling/boxcar average (a real anti-aliasing pre-filter) do better than
+the existing throttle's naive skip-based decimation (which just keeps
+whichever single sample crosses the interval gate and discards the rest,
+doing nothing to reduce noise)?
+
+**Part 1 — measured real control-step timing regularity, not just rate.**
+Used telemetry's own `dac_y=` field as a firing-detector (`apply_dac` is
+only ever called from `run_closed_loop_step` in closed-loop mode, so
+`dac_y` changes value only on a real control-step firing) to reconstruct
+actual control-step intervals from firmware-tick-timestamped data —
+`scratch_ctrl_jitter_check.py`. First attempt was contaminated by
+DAC-value quantization during near-settled periods (many consecutive
+samples share the same rounded integer `dac_y` even though the underlying
+state is still moving, inflating apparent "gaps") — fixed by restricting
+analysis to each condition's own active fast-changing transient window,
+found empirically rather than assumed.
+
+**Result: full rate CV (std/mean of firing intervals) ≈ 71% (median 4ms,
+mean 5.7ms, real tail to 20+ms) vs. throttled-200Hz CV ≈ 44% (median
+7ms, mean 8.3ms, shorter tail)** — `results/fta_ctrl_jitter_check_final.png`.
+Genuinely more regular under throttling, not just slower — supports the
+consistency hypothesis, though n=21 for the throttled case is a small
+sample and 44% CV is still real jitter, not a clean metronome.
+
+**Part 2 — implemented a real boxcar pre-filter to test noise/aliasing
+directly, decoupled from rate.** New firmware state: `g_smooth_sum`/
+`g_smooth_count` accumulate every confident telemetry sample regardless
+of whether a control step fires that cycle; `g_smoothing_enabled`
+(`set_smoothing 0|1` VCP command, `smoothing=` in `get_status`) toggles
+whether `run_closed_loop_step` gets the accumulator's mean (reset after
+each firing) or just the latest raw sample, same as today. Deliberately
+independent of `set_ctrl_rate` — full-rate+smoothing, throttled+smoothing,
+and throttled-without-smoothing (already had) can all be tested and
+compared to separate "does averaging help" from "does throttling help."
+Also reset on `set_mode closed_loop` engagement (bumpless-transfer-style,
+same reasoning as `pid_wrapper_reset()`). Build clean, flashed clean.
+
+**First test looked like a huge, clean win — but wasn't.** Kp=1.75/
+Ki=200, full rate (no throttle at all), smoothing ON: 161ms rise, 3.5%
+overshoot, 247ms settling — clean and stable, matching the throttled-only
+result almost exactly, at the FULL update rate. Looked like decisive
+confirmation of the noise-reduction theory.
+
+**Caught before trusting it: re-ran the identical full-rate/NO-smoothing
+baseline that was catastrophically unstable earlier the same day
+(1180% overshoot) — it no longer reproduces at all.** Freshly re-run,
+smoothing explicitly OFF, otherwise identical config: 211ms rise, 2.3%
+overshoot, 233ms settling — clean, stable, visually confirmed
+(`results/fta_closed_loop_step_response_fullrate_nosmoothing_recheck_kp1750_ki200.png`).
+**This means the "smoothing fixed it" claim was confounded, not real** —
+Kp=1.75/Ki=200 has apparently become stable at full rate for reasons
+entirely unrelated to smoothing, the same unexplained-mystery pattern as
+the throttle-recovery entry above. Mathematically this also makes sense
+in hindsight: at full rate, `run_closed_loop_step` fires on essentially
+every confident packet, so the boxcar accumulator almost always contains
+exactly 1 sample when it fires — averaging 1 sample is a pure no-op,
+so smoothing genuinely could not have been responsible for a behavior
+change at full rate.
+
+**Found a genuinely-still-unstable config to test against properly**:
+Kp=2.50/Ki=15 at full rate reproduces real, growing-oscillation
+instability right now (239.1% overshoot, `results/fta_closed_loop_step_response_fullrate_recheck_kp2500_ki15.png`)
+— confirms the system hasn't become universally stable at every gain,
+just at the specific Ki=200/Kp=1.75 point tested most today. Retested
+this SAME config with smoothing ON: **still unstable** (194.7% overshoot,
+visually near-identical growing oscillation,
+`results/fta_closed_loop_step_response_fullrate_smoothing_kp2500_ki15.png`)
+— smoothing does not rescue a genuinely unstable full-rate case, matching
+the "near no-op at full rate" expectation above, not contradicting it.
+
+**Then tested where smoothing could actually matter — on top of
+throttling, where the accumulator genuinely holds multiple samples.**
+Same Kp=2.50/Ki=15: throttled-200Hz/no-smoothing is stable but slow
+(2223ms rise, 1.9% overshoot, 2482ms settling); throttled-200Hz WITH
+smoothing is **essentially identical** (2236ms rise, 1.7% overshoot,
+2513ms settling) — visually indistinguishable traces
+(`results/fta_smoothing_vs_throttle_comparison.png`, 4-panel: both
+full-rate traces unstable/near-identical, both throttled traces
+stable/near-identical). **Decisive: boxcar smoothing adds no measurable
+benefit beyond what throttling alone already provides**, at least for
+this configuration and the ~5ms window size the current throttle
+interval implies.
+
+**Net conclusion, correcting the earlier (wrong) excitement**: the real
+stabilizing lever found today is RATE REDUCTION (throttling) itself, not
+noise/aliasing filtering — the boxcar hypothesis, while a reasonable and
+worth-testing idea, does not hold up under a properly-controlled test.
+This still leaves "why does reduced rate help" as the open, unresolved
+question from the entry above (the measured 71%-vs-44% CV difference is
+real but, combined with this result, looks more like a correlate of
+throttling than an independent causal lever on its own). **A second,
+equally important finding**: the original Kp=1.75/Ki=200 full-rate
+instability that motivated this entire day's investigation no longer
+reproduces at all, for reasons unconnected to any software change made
+today (thermal drift, mechanical settling, or some other physical/
+environmental factor, none of which can be diagnosed from this
+laptop-only session). This casts a real shadow over confidence in
+ANY of today's "fixes" — if the underlying system's behavior can shift
+this much without any code change, today's validated-stable
+configurations aren't guaranteed to stay validated.
+
+**State left**: hardware safely idle (`mode=open_loop amp=0 estop=0
+dac_x=95 dac_y=95`, confirmed via `get_status` after every test).
+Firmware (`g_smooth_sum`/`g_smooth_count`/`g_smoothing_enabled`,
+`set_smoothing` command, `smoothing=` status field) and both Python
+scripts' `--smoothing`/`--ctrl-rate-milli` support are uncommitted.
+`scratch_ctrl_jitter_check.py` is ad hoc, not committed-quality.
+**Not yet done**: understanding what changed to make the original
+Ki=200 full-rate case stable (the single most important open question
+now, arguably more important than the smoothing/throttle question this
+entry set out to answer); testing a LARGER boxcar window (independent
+of the 5ms throttle interval) in case the current ~5ms window is simply
+too short to show a benefit; repeating the currently-unstable
+Kp=2.5/Ki=15 config over time to see whether IT also spontaneously
+stabilizes, which would be strong evidence for a real physical/
+environmental drift rather than a one-off fluke.
+
+### Notch filter retested honestly (correct rate/ts_s pairing this time) — real, substantial sine-tracking improvement across 5-20Hz; Kp still hard-capped even with the notch; a real safety gap found and fixed in the sine test script (2026-08-19, same day)
+
+Direct continuation toward the actual T=1 goal, per the plan: real closed-loop
+delay is only ~11.5ms (measured earlier today), leaving more phase-margin
+headroom than assumed, which points at the ~38.5Hz resonance (not raw
+latency) as the more likely dominant constraint — so retry the notch, this
+time with a fair comparison (today's earlier notch test was confounded by
+the throttle/`ts_s` mismatch bug, since fixed).
+
+**Sanity-checked first**: Kp=1.75/Ki=200/notch@38.5Hz/throttled-200Hz — 133ms
+rise, 2.7% overshoot, 189ms settling, matching (slightly beating) the
+already-known-good no-notch baseline. Notch doesn't hurt the known-good
+point.
+
+**Ki pushed with the notch active** (Kp=1.75 fixed, throttled 200Hz):
+
+| Ki | rise | overshoot | settling | character |
+|---|---|---|---|---|
+| 200 (baseline) | 133ms | 2.7% | 189ms | clean |
+| 400 | 35ms | 9.1% | 134ms | clean-ish, faster |
+| 550 | 10ms | 33.2% | 275ms | real ringing, persistent low-level buzz |
+| 800 | 6ms | 62.4% | 342ms | bounded but sustained ringing throughout the window — too aggressive |
+
+**Chose Ki=400 as the working point** — meaningfully faster than the
+Ki=200 baseline with acceptable (not excessive) overshoot, well short of
+the real ringing that starts around Ki=550.
+
+**Kp still hard-capped even with the notch active**: Kp=3.5/Ki=200/notch
+→ 1255% overshoot, never settles — confirms (again) that Kp headroom is
+not what the notch buys; Ki remains the only usable lever, same
+conclusion as every earlier gain search this project has done.
+
+**Real, substantial sine-tracking improvement — the actual test that
+matters.** Kp=1.75/Ki=400/notch@38.5Hz/throttled-200Hz, 2.5px/15um pk-pk
+(same protocol as every other sine check today):
+
+| freq | gain (T), Ki=200 no notch | gain (T), Ki=400 + notch | implied \|S\| |
+|---|---|---|---|
+| 5 Hz | 0.342 | **0.713** | 0.287 |
+| 10 Hz | 0.223 | **0.509** | 0.491 |
+| 15 Hz | 0.205 | **0.293** | 0.707 |
+| 20 Hz | 0.235 | **0.314** | 0.686 (lag past ±90°, lower confidence per the usual single-tone wraparound caveat) |
+
+Roughly 1.5-2.3x better tracking gain across the whole band, biggest win
+at 5-10Hz. Visually confirmed clean, stable, real sine-following (not
+chaotic) at every tested frequency
+(`results/fta_sine_notch_ki400_{5,10,15,20}Hz_15umpp.png`). **Genuine
+progress toward the T=1 goal, not there yet** — S still 0.29-0.71 across
+the band, best at 5Hz and degrading toward 15-20Hz, so a real 10-20Hz
+beacon wobble would still be meaningfully (though now much less
+severely) under-corrected.
+
+**Real safety gap found and fixed, live, mid-session.** `fta_closed_loop_onboard_sine_test.py`'s
+`main()` had NO exception handling around the hardware-interacting
+section at all — when the `get_status` verification after `start_sine`
+raised (the same VCP-reply-loss pattern hit repeatedly all session, not
+rare), the script crashed without ever reaching its cleanup code, leaving
+the sine generator running with the amp energized. Happened twice in a
+row live this session, both requiring manual intervention
+(`stop_sine`/`set_mode open_loop`/`set_y 95`/`amp_disable` sent by hand)
+before it was caught and fixed. **Fixed properly**: extracted the
+hardware-interacting body into `_run_sine_test()`, wrapped in `main()`'s
+`try/finally` with a new `emergency_cleanup()` (each shutdown command in
+its own `try/except` so one failing doesn't block the rest — must never
+itself raise, since it runs from a `finally`). Also made the
+`start_sine`-verification `get_status` call more resilient in its own
+right: catches a `RuntimeError` from `get_status` and proceeds anyway
+(with a clear `WARNING:` printed) rather than aborting, since a lost
+reply here doesn't mean the command didn't land — matches the same
+"ground truth over trusting a reply, but don't over-index on any single
+verification attempt" lesson already applied elsewhere this session.
+**A real bug was introduced and caught during this refactor**: the
+extracted `_run_sine_test()` initially referenced `duration` without it
+being passed in (an outer-scope variable computed in `main()`) — caught
+by re-reading the diff before trusting it, fixed by threading `duration`
+through as an explicit parameter. Verified live afterward: the fixed
+script hit the exact same `get_status`-after-`start_sine` failure on the
+very next run, printed the new warning, and completed normally instead
+of crashing — the fix works, confirmed under the real failure condition,
+not just in theory.
+
+**State left**: hardware safely idle (`mode=open_loop amp=0 estop=0
+dac_x=95 dac_y=95`, confirmed via `get_status` after every test).
+Firmware config left at Kp=1.75/Ki=400/notch=38.5Hz,Q=3/throttled-200Hz.
+`fta_closed_loop_onboard_sine_test.py`'s exception-safety fix is
+uncommitted. **Not yet done**: pushing Ki further with a finer
+bisection between 400 (clean-ish) and 550 (real ringing) to see if
+there's a faster point that's still acceptably clean; checking whether
+the notch's Q (currently 3.0, untried at other values) trades off
+against this differently; a longer-duration/repeated sine validation
+(n=1 per frequency); whether the persistent "Kp=1.75/Ki=200 spontaneously
+stable" mystery from the entries above also affects THIS result's
+durability over time, not yet checked.
+
+### PIDController.hpp made dt-aware (real per-call elapsed time, not a fixed ts_) — a well-motivated, correctly-implemented fix that does NOT solve the Kp limitation, giving a decisive, convergent negative result across three independent hypotheses (2026-08-19, same day)
+
+User's sharp diagnostic question, prompted by the jitter-consistency
+measurement two entries above: `PIDController.hpp`'s `calculate()` takes
+no `dt` argument at all -- `ts_` is fixed at construction, so every call
+does `integral_ += error * ts_` regardless of how much real time actually
+elapsed. Since this loop fires on irregular telemetry arrival (not a
+fixed timer), and real inter-call jitter was just measured directly
+(~71% CV full-rate, ~44% throttled), this is a real, structural
+mismatch, not a hypothetical concern -- the previous hand-rolled
+controller (pre-2026-08-18) measured genuine per-call `dt` via
+`HAL_GetTick()`, a property knowingly given up when adopting Phil's class
+verbatim.
+
+**Decision: modify `PIDController.hpp` minimally rather than switch to a
+different library.** Reasoned through with the user: most simple
+embedded PID libraries assume a fixed-timer caller (the normal case) and
+would have the identical problem; switching libraries would also discard
+everything learned today about this specific algorithm's behavior
+(the anti-windup mechanism, the filter design) and require re-deriving
+tuning from scratch. A small, additive change -- same P/I/D terms, same
+back-calculation anti-windup, same EMA-filtered derivative, only the
+timing math changed -- was judged to honor the spirit of "use his
+design" better than either leaving a known-wrong assumption in place or
+replacing the algorithm outright. This is a real, explicit reversal of
+the earlier "use his code completely unmodified" instruction, done with
+the user's go-ahead in this specific case, not unilaterally.
+
+**Implementation**: `calculate()` gained an optional `dt` parameter
+(default -1.0, falling back to the constructor's `ts_` for the first
+call after construction/reset); the derivative filter's smoothing
+coefficient is now recomputed per call from the real `dt` too (`fc_` is
+stored instead of a precomputed fixed `alpha_`). `pid_wrapper_calculate()`
+gained a matching `dt_s` parameter, threaded from `main.c`'s
+`run_closed_loop_step()`, which now measures real elapsed time from
+`g_last_ctrl_step_tick` (the same variable the throttle gate already
+used) before the caller updates it for the new firing. `g_last_ctrl_step_tick`
+is now also reset to 0 on `set_mode closed_loop` engagement (0 is the
+documented "never fired since engagement" sentinel, preventing a bogus
+multi-second "dt" on the first step after re-engaging). Build clean, zero
+warnings, flashed clean (no post-reflash silence glitch this time).
+
+**Sanity check first**: Kp=1.75/Ki=200/notch/throttled-200Hz — 93ms rise,
+2.7% overshoot, 133ms settling, matching (slightly beating) the pre-dt-
+aware baseline. No regression.
+
+**Real test 1 — does dt-awareness alone stabilize Ki=200 at full rate
+(unthrottled)?** Yes -- 84ms/5.6%/194ms, clean. **But this doesn't prove
+anything on its own**: Ki=200/full-rate was already known to have
+mysteriously become stable on its own hours earlier (the still-
+unexplained mystery from the entries above), so a clean result here is
+consistent with either "dt-awareness fixed it" or "it was already fixed
+by whatever the mystery factor is" -- can't distinguish between them
+using this config.
+
+**Real test 2 — the decisive one: retested the currently-still-unstable
+Kp=2.5/Ki=15 at full rate, dt-aware, notch active.** Still badly unstable
+-- 717.1% overshoot, never settles
+(`results/fta_dtaware_fullrate_kp2500_ki15.png`). **dt-awareness does
+NOT rescue a genuinely unstable config, same negative-result pattern as
+the notch (which also failed on this exact axis: Kp=3.5/Ki=200/notch was
+1255% overshoot) and smoothing (which also failed on this exact
+Kp=2.5/Ki=15 config in the two entries above).** Three independently-
+motivated, mechanistically-different fixes -- resonance notch,
+timing-jitter correction, noise-reduction pre-filter -- have now all
+failed to move the Kp stability boundary. Only throttling (real control-
+rate reduction) has ever moved it.
+
+**Real test 3 — does dt-awareness at least match throttled cleanliness
+on the Ki axis?** Kp=1.75/Ki=400/notch/dt-aware, full rate (unthrottled):
+27ms rise, 19.5% overshoot, 283ms settling -- stable but visibly more
+marginal than the equivalent throttled result (9.1% overshoot, 134ms
+settling, from the entry above). A persistent low-level buzz is visible
+throughout the recorded window
+(`results/fta_dtaware_fullrate_kp1750_ki400.png`), not present in the
+throttled version. **Throttling still provides a real, independent
+benefit even after dt-awareness removes the timing-precision confound.**
+
+**Net conclusion, now well-supported by convergent evidence across three
+different fixes**: the Kp/bandwidth limitation this whole day has been
+chasing is very likely NOT primarily a timing-precision, jitter, resonance-
+aliasing, or noise problem -- all three of those hypotheses were tested
+directly and properly, and none moved the needle. The pattern instead
+looks like a genuine rate-vs-phase-margin effect: running the control
+loop faster (even with everything else done correctly) pushes the
+closed-loop crossover frequency up, closer to where the real plant's
+combined phase budget (delay + resonance + whatever else hasn't been
+individually characterized) runs out. This reframes the remaining
+options: further software-only fixes in this family (notch tuning,
+timing correction, filtering) have now been reasonably exhausted without
+solving the core constraint; the most likely-to-matter remaining levers
+are either accepting throttled operation as a genuine design choice
+(not a workaround for a bug, but the actual right operating point given
+today's evidence), or a hardware change to the actuator/flexure that
+raises the plant's own phase margin at any control rate.
+
+**State left**: hardware safely idle (`mode=open_loop amp=0 estop=0
+dac_x=95 dac_y=95`, confirmed via `get_status` after every test).
+Firmware (`PIDController.hpp`'s dt-aware `calculate()`, `pid_wrapper.cpp`/
+`.h`'s `dt_s` threading, `main.c`'s `run_closed_loop_step`/
+`cmd_set_mode` changes) is uncommitted, left flashed and running.
+Current best validated operating point remains Kp=1.75/Ki=400/notch=
+38.5Hz,Q=3/**throttled-200Hz** (not full rate) -- dt-awareness is a real,
+correct fix worth keeping (it removes a genuine source of numerical
+error regardless of whether it solves the headline problem), but doesn't
+change the practical recommendation. **Not yet done**: characterizing
+the plant's phase budget more directly (e.g. a proper frequency-response
+sweep of the open-loop plant, not just the closed-loop sine tests done
+so far) to confirm the "rate pushes crossover into the phase-margin wall"
+theory rather than leaving it as an inference; whether an intermediate
+throttle rate (300-400Hz) with dt-awareness+notch both active does
+better than the plain 200Hz/no-dt-awareness point already found.
+
+### Second control axis added for completeness (dac_x <- cy, identical Kp/Ki to the primary axis) — basic non-divergence smoke test only, real validation deferred (2026-08-19, same day, ~30min available)
+
+User's explicit framing: not expected to fix the bandwidth/Kp problem,
+just makes the system "more complete" -- two independent PID controllers
+with identical parameters, one per axis, given ~30 minutes available.
+
+**Real correctness hazard identified before writing any code**: the
+locked-optics calibration (2026-08-12 entry above) found `dac_y`'s effect
+on `cx` is +0.126 px/count but `dac_x`'s effect on `cy` is **-0.104
+px/count** -- opposite sign. Feeding the second axis literally identical-
+sign gains into an identical control law would drive it the WRONG
+direction (positive feedback, immediate divergence) -- "identical
+parameters" has to mean identical Kp/Ki *magnitude*, with the correction
+sign-flipped to match the real (opposite-sign) plant.
+
+**Implementation** (`pid_wrapper.cpp`/`.h`, `main.c`): `pid_wrapper`
+generalized to own a second `PIDController` instance (`g_pid2`),
+reconstructed in lockstep with the first by every existing gain/fc/ts/
+limit setter -- no new tuning commands needed, "identical" falls out for
+free. New `pid_wrapper_calculate2()`. `main.c` gained
+`run_closed_loop_step_axis2()` (deliberately simpler than the primary
+axis's `run_closed_loop_step` -- no notch, no boxcar smoothing, no sine
+generator, just the dt-aware PID + the sign-flipped correction), called
+right after the primary axis on the same telemetry packet with the same
+measured `dt`. Target for the second axis is auto-captured (bumpless,
+"hold cy where it already is") on `set_mode closed_loop` engagement --
+no separate `set_target_y` command, kept deliberately minimal.
+`cmd_set_axis`'s closed-loop guard extended from "block `set_y`" to
+"block `set_x` and `set_y`", since `dac_x` is now actively controlled
+too. Build clean, zero warnings, flashed clean.
+
+**Verified**: basic non-divergence smoke test only, at the known-safe
+Kp=1.75/Ki=200/throttled-200Hz/no-notch config -- `dac_x` moved from its
+idle value (95) to a bounded 295 and held there (not pinned at either
+DAC clamp), while the primary axis converged normally (cx -> target as
+expected). A backwards sign would very likely have driven `dac_x` to a
+rail almost immediately at this Ki -- it didn't, which is real, if not
+exhaustive, evidence the sign correction is right. **Not validated**:
+no step-response or sine-tracking test of the second axis specifically
+(time ran out) -- the smoke test only observed it holding steady near
+its auto-captured target under near-zero cy error, not actively
+correcting a real, deliberate cy disturbance. Real validation (a genuine
+cy step/disturbance, watching `dac_x` correct it) is the natural next
+step before trusting this axis for anything beyond "doesn't immediately
+blow up."
+
+**State left**: hardware safely idle (`mode=open_loop amp=0 estop=0
+dac_x=95 dac_y=95`, confirmed via `get_status`). All changes
+(`pid_wrapper.cpp`/`.h`, `main.c`) uncommitted. **Not yet done**: a real
+disturbance-rejection test of axis 2 (deliberately displace cy, confirm
+dac_x corrects it in reasonable time, not just holds steady); whether
+axis 2 needs its own notch/smoothing given it's a different physical
+pathway (untested whether it has its own resonance behavior); `get_status`
+doesn't yet report `target_y` for visibility (skipped for time -- `dac_x`/
+`tel_y` are visible and were sufficient for this smoke test).
+
+### Was axis 2 actually needed? A direct A/B test, same Y-step, controller on vs. off — real, if modest, value found (2026-08-19, same day)
+
+Direct follow-up: added `g_axis2_enabled`/`set_axis2 0|1` (`main.c`) so
+the second axis can be disabled (dac_x held at its bumpless-transfer
+base instead of correcting) without touching the primary axis at all --
+lets the exact same Y-axis step test be run twice, axis2 on vs. off,
+isolating its effect. `fta_closed_loop_step_response_vcp.py` gained
+`--axis2`, ground-truth `axis2` status (same get_status pattern as
+notch/smoothing), and the plot was restructured to a 2-panel figure (cx
+on top as before, cy below) plus a std/range annotation and an ON/OFF
+badge -- so a single saved PNG now shows both axes' behavior together,
+not just the driven one. Build clean, flashed clean.
+
+**Same Kp=1.75/Ki=200/throttled-200Hz Y-step, axis2 ON vs. OFF**
+(`results/fta_axis2_on_kp1750_ki200.png` /
+`..._off_kp1750_ki200.png`, combined comparison in
+`results/fta_axis2_needed_comparison.png`): primary axis (cx) behaved
+identically either way (~82-90ms rise, ~2% overshoot, ~144-165ms
+settling -- axis2 has no effect on the driven axis, as expected). cy:
+**both conditions show the same-sized instantaneous dip right at the
+step** (real, physical cross-coupling excited by the Y-axis moving --
+too fast for any controller to catch, present regardless of axis2) --
+**but they diverge afterward**: with axis2 OFF, cy never recovers and
+instead drifts slowly upward for the rest of the ~4s window, ending
+noticeably above where it started (std=0.43px, range=2.00px, still
+trending at the end); with axis2 ON, cy recovers back to within noise of
+its original value in ~300-400ms and stays there tightly for the rest of
+the recording (std=0.20px, range=1.60px).
+
+**Answer: yes, axis 2 is doing something real, though modest in this
+test.** It can't (and isn't expected to) suppress the instantaneous
+coupling transient itself -- that's faster than any feedback loop can
+react to. What it does do is prevent the slow post-transient drift/creep
+that shows up when nothing is correcting cy, keeping it anchored near
+setpoint instead of wandering. Roughly 2x tighter std, and critically a
+qualitatively different long-term behavior (recovers vs. drifts away),
+not just a small numeric improvement. Whether this matters in practice
+depends on how large real disturbances are and how long the system runs
+between corrections -- this test only used a single ~25px Y-step as the
+disturbance source, not a sustained/repeated one.
+
+**State left**: hardware safely idle (`mode=open_loop amp=0 estop=0
+dac_x=95 dac_y=95`, `axis2` left enabled -- the sensible default,
+confirmed via `get_status`). All changes uncommitted. **Not yet done**:
+a longer or sustained-disturbance test (this was one step, not a real
+operating scenario); testing axis2 on/off during a SINE test (continuous
+disturbance) rather than just a step, which is closer to the project's
+actual 10-20Hz beacon-wobble target than a one-off step comparison.
+
+### Axis-2 A/B test repeated with a continuous sine disturbance instead of a one-off step — same conclusion, more decisive (2026-08-19, same day)
+
+Direct follow-up per the user's request: the step-based A/B test above
+was one disturbance event, not representative of a real operating
+scenario. Added `--axis2`/ground-truth `axis2` status/a third (`cy`)
+plot panel to `fta_closed_loop_onboard_sine_test.py` (mirroring the
+step-response script's earlier additions) -- the sine generator now
+continuously drives `dac_y` (hence `cx`) while `cy` is watched for the
+full recording, axis2 on vs. off.
+
+**Same Kp=1.75/Ki=200/throttled-200Hz, 10Hz/2.5px sine, axis2 ON vs.
+OFF** (`results/fta_axis2_sine_on_10Hz.png` / `..._off_10Hz.png`,
+combined in `results/fta_axis2_sine_comparison.png`, each trace zeroed
+to its own start so the shapes are directly comparable despite the two
+runs' bumpless-transfer baselines landing ~8px apart): primary axis (cx)
+tracking gain matched closely either way (0.314 ON vs 0.299 OFF) --
+confirms axis2 has no effect on the driven axis, as expected. `cy`:
+**axis2 OFF drifted 0.43px over the 3s window (real, one-directional,
+not just noise -- std=0.16px, range=0.70px); axis2 ON stayed within
+0.03px of its start the whole time (std=0.09px, range=0.50px)** -- both
+the drift magnitude AND the noise floor are roughly half with axis2 on.
+
+**Conclusion, now on firmer footing than the single-step test**: axis 2
+provides a real, measurable benefit under a continuous disturbance, not
+just a one-off transient -- it doesn't eliminate `cy` movement entirely
+(both conditions show similar-amplitude fast fluctuation, consistent
+with real per-cycle coupling from the 10Hz drive that's too fast to
+fully correct), but it reliably prevents the slow systematic drift that
+appears when nothing is correcting `cy`. This matches and reinforces the
+step-test finding rather than contradicting it -- same "prevents drift,
+doesn't suppress the instantaneous coupling" pattern shows up under a
+sustained disturbance too, which is the more representative test for
+this project's actual mission.
+
+**State left**: hardware safely idle (`mode=open_loop amp=0 estop=0
+dac_x=95 dac_y=95`, `axis2` left enabled, confirmed via `get_status`).
+All changes uncommitted. **Not yet done**: repeating at other
+frequencies (only 10Hz tested); a longer-duration run (3s used here) to
+see whether the OFF-condition drift continues growing or saturates;
+whether the drift is a real physical effect (mechanical creep/hysteresis
+excited by the sustained Y-axis motion) or something else, not
+investigated further.
+
+### Notch vs. no-notch re-tested properly — each pushed to its OWN max stable Ki, not compared against a fixed low-Ki baseline; a real, mixed result (2026-08-19, same day)
+
+Direct follow-up to the "was Ki=400 a new ceiling the notch unlocked, or
+just a Ki push that would've worked anyway?" question raised earlier —
+never actually answered on record. Built `scratch_notch_comparison.py`
+(repo root, reuses `fta_closed_loop_step_response_vcp.py`'s helpers) to
+bisect each config's real ceiling properly.
+
+**Real bug found and fixed before trusting any data**: the first two
+bisection trials (Ki=300, no notch) came back with the actuator barely
+moving at all post-step (std ~0.09px the whole window) despite a
+commanded -25px target, and `set_mode closed_loop` got a `None` reply
+both times. `fta_closed_loop_step_response_vcp.py` (and
+`fta_closed_loop_onboard_sine_test.py`) trust that reply without ever
+reading back the raw `mode=` field to confirm the switch actually took —
+a real, previously-undiscovered gap, not just the already-known lost-
+reply flakiness (which usually means the command landed even if the
+reply didn't). Fixed by adding `ensure_mode()` to the scratch harness:
+resend + read back raw `mode=` via `get_status`, retrying up to 4x before
+treating a trial as failed. Re-ran Ki=300 with the fix: clean, real data
+(5.2% overshoot) — confirms the earlier "882% overshoot" reading was
+pure garbage from a closed-loop engagement that silently never happened,
+not evidence of instability.
+
+**No-notch Ki bisection** (Kp=1.75, throttled 200Hz): 300/350/400/500
+all clean (5-21% overshoot), 550 ringing (29.5%), 600 ringing (42.7%) —
+**real ceiling ~500**, well above the Ki=200 baseline used everywhere
+else this session.
+
+**With-notch (38.5Hz, Q=3) Ki bisection, same harness**: 400 clean
+(19.9%), 450 AND 500 both ringing (31.3%/29.5%) — **real ceiling ~400**,
+*lower* than no-notch's. This directly answers the open question: **the
+notch never raised the Ki ceiling** — the earlier "notch let me push Ki
+up" framing was a confound from comparing against a fixed low-Ki
+baseline, not a real causal effect. Matches (independently reproduces,
+with a properly mode-verified harness this time) the original
+2026-08-19 "notch doesn't move the Ki/Kp boundary" finding.
+
+**Sine-tracking comparison at each config's own real max (Ki=500
+no-notch vs. Ki=400+notch), 2.5px/15um pk-pk, 5/10/15/20Hz:**
+
+| freq | T, no-notch/Ki=500 | T, notch/Ki=400 |
+|---|---|---|
+| 5 Hz | 0.903 | 0.918 |
+| 10 Hz | 0.778 | 0.924 |
+| 15 Hz | 0.740 | 0.446 |
+| 20 Hz | 0.881 | 0.560 |
+
+**Notch wins at 5-10Hz, loses badly at 15-20Hz** — worse than no notch
+at all, not just less-improved. Most likely cause: the notch's stopband
+skirt (Q=3 @ 38.5Hz) still attenuates real 15-20Hz signal, with no extra
+Ki headroom to offset it since the ceiling never actually moved. **This
+reverses the conclusion of the slide built earlier today** ("Notch
+filter (38.5Hz): real 10-20Hz tracking-gain improvement"), which only
+ever compared notch+higher-Ki against a fixed LOW-Ki no-notch baseline —
+slide and its closing-slide summary bullet corrected to match (see
+`docs/session_results_2026-08-18_pid_tuning.pptx`, now 18 slides,
+combined T-vs-frequency + 15Hz-raw-trace comparison figure at
+`results/scratch_notch_maxspeed_comparison.png`).
+
+**Second real bug found and fixed, in `fta_closed_loop_onboard_sine_test.py`
+itself, while re-running the sine comparison**: its `get_status()`
+required ALL STATUS fields to match, including `sine_freq_millihz` — the
+LAST field on the STATUS line, and (confirmed live, reproduced 3x
+identically) exactly the field a dropped trailing byte under load
+truncates (`"sine_freq_millihz=" landing directly butted against the
+next telemetry line, e.g. "...millihz=seq= 10 status=1..."`), so the
+whole connectivity check failed every retry, deterministically, not
+randomly. **First fix attempt overcorrected**: defaulting a missing
+`sine_freq_millihz` to 0 unblocked the connectivity check but broke the
+*separate* post-`start_sine` confirmation check, which specifically
+needs to tell "genuinely 0" apart from "corrupted, keep retrying" — the
+fabricated 0 made every sine test report `start_sine not confirmed`
+(sine_freq_millihz=0, expected 5000) even when it had genuinely landed
+at the right frequency, 3 times in a row. **Real fix**: `get_status()`
+now takes an explicit `required` field set — the plain connectivity
+check (which doesn't care about sine fields) passes a reduced core set,
+the sine-confirmation check keeps the original strict requirement (all
+fields, real retries on corruption, no silent default). Both scripts'
+working trees carry these fixes, uncommitted.
+
+**State left**: hardware safely idle (`mode=open_loop amp=0 estop=0
+dac_x=95 dac_y=95`). Raw sine data: `results/scratch_sine_nonotch_ki500_{5,10,15,20}Hz.npz`,
+`results/scratch_sine_notch_ki400_{5,10,15,20}Hz.npz`. Not yet committed:
+`scratch_notch_comparison.py`, `scratch_build_notch_comparison_plot.py`,
+both sine-test-script fixes.
+
+### Open-loop plant Bode plot — real, cross-validated resonance measurement; strong evidence the 38.5Hz mechanical resonance, not delay or controller tuning, is the actual ceiling on 10-20Hz rejection (2026-08-19, same day)
+
+Prompted by the user asking for a direction given being "pretty stuck"
+after exhausting the controller-tuning space (Kp's hard ceiling never
+moves; Ki's ceiling doesn't move with rate fixes, jitter fixes/dt-aware
+PID, boxcar smoothing, or the notch; D actively hurts everywhere tried).
+Recommended getting a real open-loop plant frequency response instead of
+another closed-loop trial, since the real loop delay was already known
+to be small (~11.5ms, `fta_loop_delay_test.py`, 2026-08-18) — the
+missing piece was never measuring the *plant itself* (actuator + optics
++ flexure) independent of any controller, only ever characterizing
+closed-loop behavior or a single ring-down point.
+
+**Built a firmware-level open-loop sine generator** (`main.c`):
+`start_open_sine FREQ_MILLIHZ AMPLITUDE_COUNTS CENTER_COUNTS` /
+`stop_open_sine`, direct analog of the existing closed-loop
+`start_sine`/`update_sine_target` but writing straight to `apply_dac()`
+(bypassing the PID entirely) — only armed in `MODE_OPEN_LOOP` (rejects
+otherwise, and `set_mode closed_loop` force-clears it defensively, same
+belt-and-suspenders pattern as every other mode-gated feature in this
+file). Deliberately reuses the EXISTING `dac_y=`/`tick=` telemetry relay
+fields as ground truth for both the commanded waveform and its real
+timebase — no new telemetry field needed, since `apply_dac()` already
+updates `g_last_dac_y` regardless of who calls it. `get_status` gained
+`open_sine=`/`open_sine_freq_millihz=` (added BEFORE the existing
+`sine=`/`sine_freq_millihz=` fields, deliberately, given the fresh
+first-hand experience above with trailing-field truncation under load).
+`TX_MSG_MAX_LEN`/`line[]` grown 400->460 for the two new fields (a real
+`-Wformat-truncation=` warning from GCC's own worst-case bound, not just
+convention-following headroom this time — fixed by growing the buffer,
+not silencing the warning).
+
+Rebuilt via the project's established bypass-CubeIDE toolchain
+(`arm-none-eabi-gcc`/`make` from the STM32CubeIDE-bundled 13.3.rel1
+tools, NOT `rm -rf`'d first — an incremental `make all` on the
+already-CubeIDE-populated `Debug/`), 0 errors/0 warnings on the second
+pass. Flashed via `STM32_Programmer_CLI` (SN `066FFF515152827187153930`,
+matches this file's on-record board) — download verified, **no
+post-reflash silence this time** (unlike nearly every other reflash this
+session), `get_status` responded immediately with the new fields present
+and zeroed.
+
+**Built `fta_open_loop_bode_test.py`** (new, repo root): same
+paced-write/ground-truth-verification/`emergency_cleanup`-in-`finally`
+discipline as every other VCP script this session. Fits BOTH the
+measured `cx` and the reported `dac_y` against the same `sin(wt)/cos(wt)`
+basis (identical trick to `fit_tracking()` in the closed-loop onboard
+sine script) — gain comes out in real physical units (px measured per
+DAC count commanded, not a % of commanded amplitude), and the lag/phase
+diff is immune to any host t0 error. Supports `--sweep "f1,f2,..."` to
+run a whole frequency list in one connection/one amp-enable window.
+
+**Swept 16 points, 1-50Hz, amplitude=300 DAC counts, base dac_y=2048**
+(the established clean small-signal operating point) in one run, ~2-8s
+per point (`duration = max(2.0, 8.0/freq)`), hardware confirmed idle
+before and after:
+
+| freq (Hz) | gain (px/count) | phase (deg, unwrapped) |
+|---|---|---|
+| 1 | 0.0919 | 7.1 |
+| 2 | 0.0900 | 10.4 |
+| 3 | 0.0891 | 14.0 |
+| 5 | 0.0891 | 21.6 |
+| 7 | 0.0893 | 28.7 |
+| 10 | 0.0909 | 40.4 |
+| 13 | 0.0951 | 52.0 |
+| 15 | 0.0992 | 58.3 |
+| 18 | 0.1062 | 70.1 |
+| 20 | 0.1159 | 79.1 |
+| 25 | 0.1353 | 106.8 |
+| 30 | 0.1845 | 130.0 |
+| 35 | 0.2838 | 159.0 |
+| 38.5 | 0.6777 | 218.2 |
+| 42 | 0.4234 | 291.9 |
+| 50 | 0.1143 | 349.6 |
+
+(Phase is the raw per-point fit unwrapped via `np.unwrap` across the
+sorted-by-frequency sequence — the same fundamental single-frequency
+wraparound ambiguity this project has hit before, resolved here by the
+data's own smooth monotonic progression rather than left aliased; see
+`results/fta_open_loop_bode_summary.png`.)
+
+**A real, clean, textbook result — the first genuine open-loop frequency
+response this project has ever measured across a wide band:**
+- Gain is flat, ~0.089-0.095 px/count, from 1-13Hz — benign low-frequency
+  plant behavior, consistent with the DC-ish gain (~0.09-0.13 px/count)
+  already established via the minor-loop hysteresis check and the final
+  locked-optics calibration.
+- Phase grows smoothly through the 10-20Hz target band: **40° at 10Hz,
+  79° at 20Hz** — real margin remains in the plant alone at these
+  frequencies, well short of 180°.
+- Gain climbs sharply and phase rotates fast starting ~20-25Hz, peaking
+  in a sharp resonance at **38.5Hz, gain 0.68 px/count (~7.6x the DC
+  gain)** — matching the ring-down test's 38.5Hz finding EXACTLY, from a
+  completely independent method (forced swept-sine vs. free decay). Two
+  unrelated measurement techniques landing on the same number is strong
+  corroboration this resonance is real, not an artifact of either
+  method.
+- 5Hz's measured lag (12.0ms) closely matches the directly-measured pure
+  loop delay (~11.5ms, `fta_loop_delay_test.py`) — a third independent
+  cross-check landing in the right ballpark.
+
+**Fit quality visually confirmed, not just trusted from the printed
+numbers**: `save_point_plot()` (rewritten mid-session after the first
+version's full-duration-only view became an unreadable wall of
+overlapping cycles above ~15Hz — the 38.5Hz point crams 84+ cycles into
+one panel) now shows a 2x2 grid per frequency (full-duration context +
+a zoomed first-~6-cycle view, for both the measured `cx` and commanded
+`dac_y`, raw scatter plus the actual fitted sine overlaid) — saved to
+`results/fta_open_loop_bode_<freq>Hz_<timestamp>.png`, one per swept
+frequency, regenerated from the saved `.npz` raw data (fit coefficients
+now persisted too) without touching hardware again. Spot-checked 1Hz,
+20Hz, and 38.5Hz (the resonance peak, where fit trustworthiness matters
+most) — all show the fitted sine tracking the raw telemetry closely, in
+both the compressed full-duration view and the individually-resolvable
+zoomed view.
+
+**Why this matters for the "tune more vs. fundamental change" question**:
+closing the loop with more Ki pushes the gain-crossover frequency
+higher. Even though 10-20Hz itself has real margin, any crossover
+pushed toward ~20-25Hz+ runs straight into the resonance's rapid phase
+rotation (~140 degrees in under two octaves) and eats the margin —
+directly explaining why Ki has hit a hard, narrow ceiling all session
+regardless of rate fixes, jitter fixes, or the notch. It also explains
+the notch's mixed result above: gain/phase are already climbing well
+before 38.5Hz, so a notch centered exactly there doesn't cover the
+rising skirt that actually intrudes into where the crossover needs to
+sit. This is a real, physical, narrow-band mechanical resonance, not
+delay and not a filter-design choice — the strongest evidence yet for
+the "fundamental (likely hardware) change" side of the question, e.g.
+stiffening/damping the flexure to push the resonance higher or reduce
+its Q, rather than continued controller tuning.
+
+**State left**: hardware safely idle (`mode=open_loop amp=0 estop=0
+dac_x=95 dac_y=95`, confirmed via `get_status` after the sweep and after
+the plot-regeneration pass, which touched no hardware at all). Firmware
+(`start_open_sine`/`stop_open_sine`, `TX_MSG_MAX_LEN`/`line[]` grown to
+460) and `fta_open_loop_bode_test.py` are both new/uncommitted. **Not yet
+done**: repeating at a different base `dac_y` operating point or a
+different excitation amplitude (only 2048/300-counts tested, and 300
+counts is well into the region where the resonance peak alone produces
+~200px+ swings — worth checking whether the resonance's gain/Q are
+amplitude-dependent, given this project's earlier finding of real
+small-amplitude nonlinearity in the *closed-loop* sine tests); the y-axis
+(dac_x<->cy) pathway not characterized this way at all; using this real
+measured phase/gain data to actually design a compensator (e.g. proper
+loop-shaping) rather than continued trial-and-error gain search, if
+tuning is still pursued alongside/before any hardware change.
 
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 

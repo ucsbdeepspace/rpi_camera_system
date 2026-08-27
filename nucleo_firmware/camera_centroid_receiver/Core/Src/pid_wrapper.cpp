@@ -20,7 +20,20 @@
 alignas(PIDController) static unsigned char g_pid_storage[sizeof(PIDController)];
 static PIDController *g_pid = nullptr;
 
-static double g_ts_s   = 0.0047619;  /* ~1/210s, see pid_wrapper.h */
+/* Second axis (dac_x <- cy error), added 2026-08-19 for completeness --
+ * identical Kp/Ki/Kd/ts_s/fc_hz/output-limits to the primary axis (g_pid,
+ * dac_y <- cx), reconstructed together in lockstep by the same
+ * reconstruct() below. Kept genuinely separate instances (not a shared
+ * one called twice) since each axis needs its own independent integral/
+ * derivative history -- cx and cy are two different error signals. */
+alignas(PIDController) static unsigned char g_pid2_storage[sizeof(PIDController)];
+static PIDController *g_pid2 = nullptr;
+
+static double g_ts_s   = 0.0021858;  /* ~1/457.5s -- this default is overwritten by
+                                       * pid_wrapper_init()'s real argument at startup; kept
+                                       * roughly current (2026-08-19: ~440-475Hz measured
+                                       * telemetry rate, was ~207-235Hz pre-ROI-change) only as
+                                       * a defensive fallback, see pid_wrapper.h. */
 static double g_fc_hz  = 20.0;       /* derivative low-pass cutoff -- Phil's own example value
                                        * originally, found 2026-08-18 to be far too high relative
                                        * to this rig's own ~15.3Hz lightly-damped resonance
@@ -40,6 +53,10 @@ static void reconstruct(void)
     g_pid->~PIDController();
     g_pid = new (g_pid_storage) PIDController(g_kp, g_ki, g_kd, g_ts_s, g_fc_hz);
     g_pid->setOutputLimits(g_out_min, g_out_max);
+
+    g_pid2->~PIDController();
+    g_pid2 = new (g_pid2_storage) PIDController(g_kp, g_ki, g_kd, g_ts_s, g_fc_hz);
+    g_pid2->setOutputLimits(g_out_min, g_out_max);
 }
 
 extern "C" void pid_wrapper_init(double kp, double ki, double kd, double ts_s, double fc_hz,
@@ -52,6 +69,8 @@ extern "C" void pid_wrapper_init(double kp, double ki, double kd, double ts_s, d
     g_kp = kp; g_ki = ki; g_kd = kd;
     g_pid = new (g_pid_storage) PIDController(kp, ki, kd, g_ts_s, g_fc_hz);
     g_pid->setOutputLimits(g_out_min, g_out_max);
+    g_pid2 = new (g_pid2_storage) PIDController(kp, ki, kd, g_ts_s, g_fc_hz);
+    g_pid2->setOutputLimits(g_out_min, g_out_max);
 }
 
 extern "C" void pid_wrapper_set_gains(double kp, double ki, double kd)
@@ -72,12 +91,55 @@ extern "C" void pid_wrapper_set_fc(double fc_hz)
     reconstruct();
 }
 
-extern "C" double pid_wrapper_calculate(double setpoint_px, double measurement_px)
+extern "C" void pid_wrapper_set_ts(double ts_s)
 {
-    return g_pid->calculate(setpoint_px, measurement_px);
+    /* Live-settable sample time -- added 2026-08-19 specifically so the
+     * "does throttling the control rate back down recover the old
+     * pre-ROI-change stability" question can be tested without a reflash
+     * per attempt, AND so the throttle interval and ts_s can be set
+     * together by one call site (main.c's cmd_set_ctrl_rate) instead of
+     * two separately-maintained values that can silently drift apart --
+     * exactly the mismatch that happened earlier this same day with the
+     * since-removed DIAG_CONTROL_INTERVAL_MS throttle. Reconstructs
+     * (clears integral), matching set_gains/_set_fc's existing
+     * convention for any change that alters the class's own dynamics. */
+    g_ts_s = ts_s;
+    reconstruct();
+}
+
+extern "C" void pid_wrapper_set_out_limits(double out_min, double out_max)
+{
+    /* setOutputLimits() alone (no reconstruct) is enough here -- unlike
+     * gains/fc, PIDController's constructor doesn't derive anything from
+     * min/max at construction time, so mutating the live instance is
+     * safe and, unlike pid_wrapper_set_gains/_set_fc, deliberately does
+     * NOT clear the integral -- this is meant to be tweaked mid-run
+     * while comparing behavior, not treated as a fresh start. */
+    g_out_min = out_min;
+    g_out_max = out_max;
+    g_pid->setOutputLimits(g_out_min, g_out_max);
+    g_pid2->setOutputLimits(g_out_min, g_out_max);
+}
+
+extern "C" double pid_wrapper_calculate(double setpoint_px, double measurement_px, double dt_s)
+{
+    /* dt_s is the caller's real measured elapsed time since its own last
+     * control step (see main.c's run_closed_loop_step) -- passed straight
+     * through to PIDController::calculate()'s now dt-aware integral/
+     * derivative math (2026-08-19 fix, see PIDController.hpp's own
+     * docstring). Pass <= 0 for "use ts_ as before" (first call after
+     * (re)construction, or a caller that doesn't track real time). */
+    return g_pid->calculate(setpoint_px, measurement_px, dt_s);
+}
+
+extern "C" double pid_wrapper_calculate2(double setpoint_px, double measurement_px, double dt_s)
+{
+    /* Second axis, see g_pid2's docstring above. */
+    return g_pid2->calculate(setpoint_px, measurement_px, dt_s);
 }
 
 extern "C" void pid_wrapper_reset(void)
 {
     g_pid->reset();
+    g_pid2->reset();
 }

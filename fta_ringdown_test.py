@@ -33,7 +33,7 @@ MICRONS_PER_PIXEL = 3.0
 REPLY_RE = re.compile(r"^(OK|ERR|STATUS|WARN)\b")
 TELEMETRY_RE = re.compile(
     r"^seq=\s*(\d+)\s+status=(\d+)\s+x=(-?\d+\.\d)\s+y=(-?\d+\.\d)\s+"
-    r"tgt=(-?\d+\.\d)\s+dac_y=(-?\d+)\s+pkts=(\d+)\s+errs=(\d+)$")
+    r"tgt=(-?\d+\.\d)\s+dac_y=(-?\d+)\s+tick=(\d+)\s+pkts=(\d+)\s+errs=(\d+)$")
 
 BLUE = "#2a78d6"
 ORANGE = "#eb6834"
@@ -66,7 +66,13 @@ def send_command(ser, cmd, char_delay=0.02, reply_timeout=2.0, retries=5):
     return None
 
 
-def _reader_thread(ser, t0, records, stop_event):
+def _reader_thread(ser, records, stop_event):
+    """Records the FIRMWARE's own tick (HAL_GetTick(), ms) per sample, not
+    a host-side arrival timestamp -- see main()'s docstring on why host
+    timestamps from this thread are unusable for fine-grained timing
+    (Windows thread-scheduling granularity batches readline() calls into
+    ~15-16ms bursts, confirmed directly, unaffected by
+    winmm.timeBeginPeriod(1))."""
     while not stop_event.is_set():
         try:
             raw = ser.readline()
@@ -74,7 +80,6 @@ def _reader_thread(ser, t0, records, stop_event):
             continue
         if not raw:
             continue
-        now = time.monotonic() - t0
         m = TELEMETRY_RE.match(raw.decode(errors="replace").strip())
         if not m:
             continue
@@ -83,7 +88,8 @@ def _reader_thread(ser, t0, records, stop_event):
             continue
         x = float(m.group(3))
         y = float(m.group(4))
-        records.append((now, x, y))
+        tick_ms = int(m.group(7))
+        records.append((tick_ms, x, y))
 
 
 def damped_sine(t, amp, freq_hz, zeta, phase, offset, t0):
@@ -108,6 +114,23 @@ def main():
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
+    # Windows' default ~15.6ms system timer tick doesn't just inflate
+    # time.sleep() (already found and fixed elsewhere this project, see
+    # fta_closed_loop_sine_response_test_vcp.py) -- it also coarsens
+    # thread-scheduling granularity, which silently batched this script's
+    # _reader_thread's readline() calls into ~15-16ms buckets, discovered
+    # by re-examining a saved run's own t[] array (69-86% of consecutive
+    # samples shared an identical timestamp). For a ~15-65ms-period
+    # oscillation, that's only ~1-4 real timestamp buckets per cycle --
+    # nowhere near enough for a trustworthy frequency fit, despite the
+    # underlying telemetry itself arriving at up to ~465Hz. Same standard
+    # Windows high-resolution-timer request as the sine-test script.
+    import atexit
+    import ctypes
+    winmm = ctypes.WinDLL("winmm")
+    winmm.timeBeginPeriod(1)
+    atexit.register(winmm.timeEndPeriod, 1)
+
     import serial
 
     port = args.port or find_fta_port()
@@ -127,11 +150,11 @@ def main():
 
     records = []
     stop_event = threading.Event()
-    t0 = time.monotonic()
-    reader = threading.Thread(target=_reader_thread, args=(ser, t0, records, stop_event), daemon=True)
+    reader = threading.Thread(target=_reader_thread, args=(ser, records, stop_event), daemon=True)
     ser.reset_input_buffer()
     reader.start()
 
+    t0 = time.monotonic()  # host time, only used for the human-readable pulse-timing print below
     time.sleep(0.3)  # baseline hold, amp off, at base_dac_y (physically wherever it last settled)
 
     # Pre-load the step target while amp is still off (no physical effect yet),
@@ -174,28 +197,83 @@ def main():
     ser.close()
 
     print(f"Captured {len(records)} telemetry samples "
-          f"(pulse on at {t_pulse_on*1000:.0f}ms, off at {t_pulse_off*1000:.0f}ms).")
+          f"(host-approximate: pulse on at {t_pulse_on*1000:.0f}ms, off at {t_pulse_off*1000:.0f}ms "
+          f"-- see below for the data-driven tick-based pulse-off estimate actually used for the fit).")
     if len(records) < 20:
         print("Not enough samples to analyze.")
         return
 
-    t = np.array([r[0] for r in records])
+    tick_ms = np.array([r[0] for r in records], dtype=np.float64)
+    t = (tick_ms - tick_ms[0]) / 1000.0  # firmware-clock seconds, relative to first sample
     x = np.array([r[1] for r in records])
     y = np.array([r[2] for r in records])
 
+    # Locate a trustworthy fit-window start on the firmware-tick timeline.
+    # Two earlier approaches both failed once real (not host-timestamp-
+    # bucketed) resolution revealed the amp is actually driven for the
+    # FULL host-paced amp_enable-to-amp_disable duration (~500-800ms in
+    # practice, not the nominal --pulse-ms=80ms -- paced command
+    # transmission dominates, same finding as the negative-lag t0 bug
+    # elsewhere in this project) -- long enough that a real, forced
+    # oscillation happens DURING that driven window, with drops
+    # comparable in size to the true post-amp-off one. Neither "biggest
+    # single-sample drop" nor "host-measured elapsed time" reliably
+    # landed past the end of that forced portion; both fed curve_fit a
+    # mixed forced+free window that converged on the slow envelope
+    # instead of the real fast free-decay oscillation (visible by eye
+    # once plotted, a much bigger/cleaner swing after everything else).
+    #
+    # Robust instead: the GLOBAL MINIMUM of x is unambiguous -- nothing
+    # can drive the system past that trough once the amp is genuinely
+    # off, so it must be part of the real free decay, not the forced
+    # portion. Back up ~60ms (comfortably more than half a period at any
+    # plausible frequency this rig has shown, 15-40Hz) to land on the
+    # peak immediately preceding that trough, guaranteeing the fit window
+    # captures the decay's largest, cleanest swing.
+    rise_idx = int(np.argmax(x))  # peak of the amp-on-driven excursion, plot marker only
+    min_idx = int(np.argmin(x))
+    back_off_s = 0.06
+    off_idx = int(np.searchsorted(t, t[min_idx] - back_off_s))
+    off_idx = min(max(off_idx, 0), len(t) - 1)
+    t_pulse_off_tick = t[off_idx]
+    print(f"Fit window anchored on global-minimum trough at {t[min_idx]*1000:.0f}ms "
+          f"(sample {min_idx}); starting fit at {t_pulse_off_tick*1000:.0f}ms "
+          f"(sample {off_idx} of {len(t)})")
+
     # Fit the decay starting shortly after the amp turns off (avoid the
     # amp-on transient itself, which isn't the free-decay portion).
-    fit_mask = t > (t_pulse_off + 0.01)
+    fit_mask = t > (t_pulse_off_tick + 0.01)
     t_fit = t[fit_mask]
     x_fit = x[fit_mask]
 
-    freq_guess = 11.0  # this project's previously-documented open-loop resonance estimate
+    # Data-driven initial frequency guess (FFT peak on a uniformly-
+    # resampled version of the fit window) rather than a hardcoded value
+    # -- this project's own prior guesses (11Hz, then 15Hz) both turned
+    # out to bias curve_fit toward the wrong answer once real (not
+    # host-timestamp-bucketed) resolution revealed the true oscillation
+    # was faster than either. Real samples arrive with a few ms of
+    # jitter, not perfectly evenly spaced, so interpolate onto a uniform
+    # grid first for a clean spectrum.
+    if len(t_fit) > 16:
+        t_uniform = np.linspace(t_fit[0], t_fit[-1], len(t_fit))
+        x_uniform = np.interp(t_uniform, t_fit, x_fit)
+        x_uniform = x_uniform - x_uniform.mean()
+        dt_uniform = t_uniform[1] - t_uniform[0]
+        freqs = np.fft.rfftfreq(len(x_uniform), d=dt_uniform)
+        mag = np.abs(np.fft.rfft(x_uniform * np.hanning(len(x_uniform))))
+        mag[0] = 0.0  # zero out DC
+        freq_guess = float(freqs[np.argmax(mag)])
+        if freq_guess < 1.0:
+            freq_guess = 15.0
+        print(f"FFT-based frequency guess for curve_fit seeding: {freq_guess:.2f}Hz")
+    else:
+        freq_guess = 15.0
     amp_guess = (x_fit.max() - x_fit.min()) / 2.0
     offset_guess = x_fit[-20:].mean()
-    p0 = [amp_guess, freq_guess, 0.05, 0.0, offset_guess, t_pulse_off]
+    p0 = [amp_guess, freq_guess, 0.05, 0.0, offset_guess, t_pulse_off_tick]
     try:
         popt, pcov = curve_fit(
-            lambda tt, amp, freq_hz, zeta, phase, offset: damped_sine(tt, amp, freq_hz, zeta, phase, offset, t_pulse_off),
+            lambda tt, amp, freq_hz, zeta, phase, offset: damped_sine(tt, amp, freq_hz, zeta, phase, offset, t_pulse_off_tick),
             t_fit, x_fit, p0=p0[:5], maxfev=20000,
             bounds=([0, 1, 0.001, -np.pi, -1e6], [1e4, 60, 2.0, np.pi, 1e6]))
         amp_fit, freq_fit, zeta_fit, phase_fit, offset_fit = popt
@@ -206,7 +284,8 @@ def main():
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_path = args.out or f"results/fta_ringdown_{ts}.npz"
-    save_kwargs = dict(t=t, x=x, y=y, t_pulse_on=t_pulse_on, t_pulse_off=t_pulse_off,
+    save_kwargs = dict(t=t, x=x, y=y, t_pulse_off_tick=t_pulse_off_tick,
+                        t_pulse_on_host_approx=t_pulse_on, t_pulse_off_host_approx=t_pulse_off,
                         base_dac_y=args.base_dac_y, offset_dac=args.offset_dac, pulse_ms=args.pulse_ms)
     if fit_ok:
         save_kwargs.update(freq_hz=freq_fit, zeta=zeta_fit, amp_px=amp_fit)
@@ -229,11 +308,11 @@ def main():
     ax.tick_params(colors=MUTED, labelsize=9, length=3)
 
     ax.plot(t, x, color=BLUE, linewidth=1.2, label="measured cx")
-    ax.axvline(t_pulse_on, color=MUTED, linewidth=0.8, linestyle=(0, (1, 2)), label="amp on")
-    ax.axvline(t_pulse_off, color=ORANGE, linewidth=0.8, linestyle=(0, (1, 2)), label="amp off")
+    ax.axvline(t[rise_idx], color=MUTED, linewidth=0.8, linestyle=(0, (1, 2)), label="amp on (approx, peak of rise)")
+    ax.axvline(t_pulse_off_tick, color=ORANGE, linewidth=0.8, linestyle=(0, (1, 2)), label="amp off (data-driven)")
     if fit_ok:
-        t_plot = np.linspace(t_pulse_off, t[-1], 500)
-        fit_curve = damped_sine(t_plot, amp_fit, freq_fit, zeta_fit, phase_fit, offset_fit, t_pulse_off)
+        t_plot = np.linspace(t_pulse_off_tick, t[-1], 500)
+        fit_curve = damped_sine(t_plot, amp_fit, freq_fit, zeta_fit, phase_fit, offset_fit, t_pulse_off_tick)
         ax.plot(t_plot, fit_curve, color="#2a2a2a", linewidth=1.0, linestyle=(0, (4, 2)),
                 label=f"fit: {freq_fit:.1f}Hz, zeta={zeta_fit:.3f}")
 

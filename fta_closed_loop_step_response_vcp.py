@@ -95,7 +95,7 @@ MICRONS_PER_PIXEL = 3.0  # OV9281 pixel pitch, same constant used throughout thi
 REPLY_RE = re.compile(r"^(OK|ERR|STATUS|WARN)\b")
 TELEMETRY_RE = re.compile(
     r"^seq=\s*(\d+)\s+status=(\d+)\s+x=(-?\d+\.\d)\s+y=(-?\d+\.\d)\s+"
-    r"tgt=(-?\d+\.\d)\s+dac_y=(-?\d+)\s+pkts=(\d+)\s+errs=(\d+)$")
+    r"tgt=(-?\d+\.\d)\s+dac_y=(-?\d+)\s+tick=(\d+)\s+pkts=(\d+)\s+errs=(\d+)$")
 STATUS_FIELD_RE = {
     "dac_x": re.compile(r"dac_x=(-?\d+)"),
     "dac_y": re.compile(r"dac_y=(-?\d+)"),
@@ -104,6 +104,17 @@ STATUS_FIELD_RE = {
     "tel_age_ms": re.compile(r"tel_age_ms=(\d+)"),
     "target_x": re.compile(r"target_x=(-?[\d.]+)"),
     "target_x_set": re.compile(r"target_x_set=(\d+)"),
+    "notch": re.compile(r"notch=(\d+)"),
+    "notch_freq_millihz": re.compile(r"notch_freq_millihz=(-?\d+)"),
+    "notch_q_milli": re.compile(r"notch_q_milli=(-?\d+)"),
+    "lead": re.compile(r"lead=(\d+)"),
+    "lead_fz_millihz": re.compile(r"lead_fz_millihz=(-?\d+)"),
+    "lead_fp_millihz": re.compile(r"lead_fp_millihz=(-?\d+)"),
+    "out_limit": re.compile(r"out_limit=(-?\d+)"),
+    "ctrl_rate_millihz": re.compile(r"ctrl_rate_millihz=(-?\d+)"),
+    "ctrl_interval_ms": re.compile(r"ctrl_interval_ms=(\d+)"),
+    "smoothing": re.compile(r"smoothing=(\d+)"),
+    "axis2": re.compile(r"axis2=(\d+)"),
 }
 
 BLUE = "#2a78d6"
@@ -126,7 +137,17 @@ def send_command(ser, cmd, char_delay=0.02, reply_timeout=2.0):
     found necessary this session (2026-08-13, see CLAUDE.md and this
     module's docstring): a burst write of a whole command line reliably
     loses bytes at the Pi's current high telemetry rate. Returns the
-    first OK/ERR/STATUS/WARN reply line seen, or None on timeout."""
+    first OK/ERR/STATUS/WARN reply line seen, or None on timeout.
+
+    Clears stale input right before writing (2026-08-19 fix): at the
+    ~465Hz telemetry rate, a command whose reply never arrives leaves
+    ~2s of already-buffered telemetry sitting unread. Without this reset,
+    the NEXT command's reply-matching window gets spent draining that
+    stale backlog instead of watching for a genuinely fresh reply --
+    confirmed directly to cascade into repeated timeouts (get_status
+    itself failing 5/5 retries) even though get_status called in
+    isolation right afterward succeeds instantly."""
+    ser.reset_input_buffer()
     for ch in cmd + "\n":
         ser.write(ch.encode("ascii"))
         time.sleep(char_delay)
@@ -158,6 +179,17 @@ def get_status(ser, retries=5):
                 "tel_age_ms": int(matches["tel_age_ms"].group(1)),
                 "target_x": float(matches["target_x"].group(1)),
                 "target_x_set": int(matches["target_x_set"].group(1)),
+                "notch": int(matches["notch"].group(1)),
+                "notch_freq_millihz": int(matches["notch_freq_millihz"].group(1)),
+                "notch_q_milli": int(matches["notch_q_milli"].group(1)),
+                "lead": int(matches["lead"].group(1)),
+                "lead_fz_millihz": int(matches["lead_fz_millihz"].group(1)),
+                "lead_fp_millihz": int(matches["lead_fp_millihz"].group(1)),
+                "out_limit": int(matches["out_limit"].group(1)),
+                "ctrl_rate_millihz": int(matches["ctrl_rate_millihz"].group(1)),
+                "ctrl_interval_ms": int(matches["ctrl_interval_ms"].group(1)),
+                "smoothing": int(matches["smoothing"].group(1)),
+                "axis2": int(matches["axis2"].group(1)),
             }
     raise RuntimeError("No parseable get_status reply after several attempts -- check the serial link/firmware.")
 
@@ -238,7 +270,20 @@ def _reader_thread(ser, t0, records, stop_event):
     """Sole reader of the serial port for the whole recording window --
     same discipline as fta_step_response_test_vcp.py: the main thread only
     writes (the single burst step command) while this thread is running,
-    never reads, so lines never get split across two concurrent readers."""
+    never reads, so lines never get split across two concurrent readers.
+
+    Records BOTH a host arrival timestamp and the firmware's own tick=
+    field per sample (2026-08-19 fix): host arrival timestamps alone get
+    batched into ~15-16ms bursts by Windows thread-scheduling granularity
+    (confirmed directly -- 85% of consecutive samples landed on the exact
+    same host timestamp in one recorded run), the same bug already fixed
+    in fta_ringdown_test.py and fta_closed_loop_onboard_sine_test.py.
+    Unlike those two, this script's t_step is measured on the HOST clock
+    (the step command has no firmware-reported echo the way the sine
+    generator's tgt= field provides), so main() fits an affine mapping
+    between host time and firmware tick using every recorded sample
+    (least-squares over thousands of points averages out the per-sample
+    jitter) rather than just switching wholesale to tick-based time."""
     while not stop_event.is_set():
         try:
             raw = ser.readline()
@@ -246,7 +291,7 @@ def _reader_thread(ser, t0, records, stop_event):
             continue
         if not raw:
             continue
-        now = time.monotonic() - t0
+        host_now = time.monotonic() - t0
         m = TELEMETRY_RE.match(raw.decode(errors="replace").strip())
         if not m:
             continue
@@ -255,7 +300,8 @@ def _reader_thread(ser, t0, records, stop_event):
             continue
         x = float(m.group(3))
         y = float(m.group(4))
-        records.append((now, x, y))
+        tick_ms = int(m.group(7))
+        records.append((host_now, x, y, tick_ms))
 
 
 def main():
@@ -269,6 +315,49 @@ def main():
     parser.add_argument("--fc-milli", type=int, default=None,
                          help="derivative filter cutoff, milli-Hz (e.g. 5000 = 5.0Hz); "
                               "omit to leave firmware's current fc unchanged")
+    parser.add_argument("--out-limit", type=int, default=None,
+                         help="symmetric +-limit (DAC counts) passed to PIDController's "
+                              "setOutputLimits(), e.g. 500; omit to leave firmware's current "
+                              "limit unchanged (defaults to +-3905, the full DAC span, at boot)")
+    parser.add_argument("--ctrl-rate-milli", type=int, default=None,
+                         help="throttle the control loop to this rate, milli-Hz (e.g. 200000 = "
+                              "200Hz), and set the PID's ts_s to match, in one firmware command; "
+                              "0 disables the throttle (full telemetry-driven rate, the default); "
+                              "omit to leave firmware's current setting unchanged")
+    parser.add_argument("--smoothing", type=int, default=None, choices=[0, 1],
+                         help="0/1: feed the PID the mean of every confident sample since the "
+                              "last control step (boxcar anti-aliasing pre-filter) instead of "
+                              "just the latest raw sample; independent of --ctrl-rate-milli; "
+                              "omit to leave firmware's current setting unchanged")
+    parser.add_argument("--axis2", type=int, default=None, choices=[0, 1],
+                         help="0/1: enable/disable the second control axis (dac_x <- cy) -- "
+                              "0 leaves dac_x fixed at its bumpless-transfer base instead of "
+                              "correcting, for A/B comparison; omit to leave firmware's current "
+                              "setting unchanged")
+    parser.add_argument("--notch-freq-milli", type=int, default=None,
+                         help="resonance notch filter center freq, milli-Hz (e.g. 38500 = 38.5Hz); "
+                              "omit to leave the notch in its current state (disabled by default)")
+    parser.add_argument("--notch-q-milli", type=int, default=3000,
+                         help="notch filter Q*1000 (default 3000 = Q of 3.0), only used if "
+                              "--notch-freq-milli is given")
+    parser.add_argument("--notch-off", action="store_true",
+                         help="explicitly disable the notch filter before this run (sends "
+                              "notch_off) -- use this rather than just omitting "
+                              "--notch-freq-milli if a PREVIOUS run may have left it enabled, "
+                              "since the firmware's notch state persists across runs")
+    parser.add_argument("--lead-fz-milli", type=int, default=None,
+                         help="lead compensator zero freq, milli-Hz (e.g. 9600 = 9.6Hz); "
+                              "must be paired with --lead-fp-milli (fz < fp required by firmware); "
+                              "omit to leave the lead filter in its current state (disabled by "
+                              "default). Uses whatever ctrl_rate is CURRENTLY set when this runs, "
+                              "so pass --ctrl-rate-milli in the same invocation if changing both.")
+    parser.add_argument("--lead-fp-milli", type=int, default=None,
+                         help="lead compensator pole freq, milli-Hz (e.g. 65000 = 65Hz); "
+                              "must be paired with --lead-fz-milli")
+    parser.add_argument("--lead-off", action="store_true",
+                         help="explicitly disable the lead compensator before this run (sends "
+                              "lead_off) -- same reasoning as --notch-off: firmware state "
+                              "persists across runs")
     parser.add_argument("--pre-s", type=float, default=0.5)
     parser.add_argument("--post-s", type=float, default=3.0)
     parser.add_argument("--settle-tol-px", type=float, default=2.0)
@@ -325,6 +414,55 @@ def main():
     print(send_command(ser, f"set_kd {args.kd_milli}"))
     if args.fc_milli is not None:
         print(send_command(ser, f"set_fc {args.fc_milli}"))
+    if args.out_limit is not None:
+        print(send_command(ser, f"set_out_limit {args.out_limit}"))
+    if args.ctrl_rate_milli is not None:
+        print(send_command(ser, f"set_ctrl_rate {args.ctrl_rate_milli}"))
+    if args.smoothing is not None:
+        print(send_command(ser, f"set_smoothing {args.smoothing}"))
+    if args.axis2 is not None:
+        print(send_command(ser, f"set_axis2 {args.axis2}"))
+    if args.notch_off:
+        print(send_command(ser, "notch_off"))
+    elif args.notch_freq_milli is not None:
+        print(send_command(ser, f"set_notch {args.notch_freq_milli} {args.notch_q_milli}"))
+    # Lead compensator sent AFTER ctrl_rate above -- cmd_set_lead configures
+    # its filter coefficients using whatever g_ctrl_rate_millihz is set to
+    # AT THAT MOMENT (see main.c's lead_filter_t comment on why it's tied
+    # to the real current rate rather than a hardcoded constant, unlike the
+    # notch's known stale-457.5Hz bug) -- so ctrl_rate must land first if
+    # both are being changed in the same invocation.
+    if args.lead_off:
+        print(send_command(ser, "lead_off"))
+    elif args.lead_fz_milli is not None and args.lead_fp_milli is not None:
+        print(send_command(ser, f"set_lead {args.lead_fz_milli} {args.lead_fp_milli}"))
+    elif args.lead_fz_milli is not None or args.lead_fp_milli is not None:
+        print("ERR: --lead-fz-milli and --lead-fp-milli must both be given together -- aborting.")
+        ser.close()
+        raise SystemExit(1)
+    # Ground truth, not just an echo of the CLI args: the firmware's notch/
+    # lead state persists in RAM across runs, so a run that passes none of
+    # these flags could still be running with a filter some EARLIER run
+    # left enabled. Read it back rather than assume.
+    notch_st = get_status(ser)
+    notch_active = bool(notch_st["notch"])
+    notch_freq_hz = notch_st["notch_freq_millihz"] / 1000.0
+    notch_q = notch_st["notch_q_milli"] / 1000.0
+    lead_active = bool(notch_st["lead"])
+    lead_fz_hz = notch_st["lead_fz_millihz"] / 1000.0
+    lead_fp_hz = notch_st["lead_fp_millihz"] / 1000.0
+    out_limit = notch_st["out_limit"]
+    ctrl_rate_millihz = notch_st["ctrl_rate_millihz"]
+    ctrl_interval_ms = notch_st["ctrl_interval_ms"]
+    smoothing = bool(notch_st["smoothing"])
+    axis2 = bool(notch_st["axis2"])
+    print(f"notch: {'ON @ ' + format(notch_freq_hz, '.1f') + 'Hz Q=' + format(notch_q, '.1f') if notch_active else 'OFF'}")
+    print(f"lead: {'ON  fz=' + format(lead_fz_hz, '.1f') + 'Hz fp=' + format(lead_fp_hz, '.1f') + 'Hz' if lead_active else 'OFF'}")
+    print(f"ctrl_rate: {ctrl_rate_millihz/1000.0:.1f}Hz (throttle interval {ctrl_interval_ms}ms, "
+          f"0=unthrottled)")
+    print(f"out_limit: +-{out_limit} counts")
+    print(f"smoothing (boxcar pre-filter): {'ON' if smoothing else 'OFF'}")
+    print(f"axis2 (dac_x <- cy): {'ON' if axis2 else 'OFF (dac_x held fixed)'}")
     print(send_command(ser, "set_mode closed_loop"))
     time.sleep(0.3)  # let it settle at the zero-error hold before recording
 
@@ -348,7 +486,7 @@ def main():
     for ch in f"set_target_x {target_to}\n":
         ser.write(ch.encode("ascii"))
         time.sleep(0.02)
-    t_step = time.monotonic() - t0
+    t_step_host = time.monotonic() - t0
     time.sleep(args.post_s)
 
     stop_event.set()
@@ -374,9 +512,20 @@ def main():
         print(f"Only {len(records)} usable telemetry samples -- not enough to analyze.")
         return
 
-    t = np.array([r[0] for r in records])
+    host_arr = np.array([r[0] for r in records])
     x = np.array([r[1] for r in records])
     y = np.array([r[2] for r in records])
+    tick_ms = np.array([r[3] for r in records], dtype=np.float64)
+    # Fit an affine mapping from host time to firmware tick (ms) using
+    # every sample -- least squares over thousands of points averages out
+    # the ~15-16ms OS-scheduling jitter on host_arr, giving a far more
+    # precise t_step than trusting the host-clock value directly would
+    # (see _reader_thread's docstring for why host timestamps alone can't
+    # be trusted here).
+    a, b = np.polyfit(host_arr, tick_ms, 1)
+    tick_ms_at_step = a * t_step_host + b
+    t = (tick_ms - tick_ms[0]) / 1000.0
+    t_step = (tick_ms_at_step - tick_ms[0]) / 1000.0
     span = t[-1] - t[0]
     print(f"Captured {len(records)} telemetry samples ({span:.3f}s span, "
           f"~{len(records) / span if span > 0 else 0:.0f}/s average).")
@@ -406,17 +555,26 @@ def main():
     np.savez(out_path, t=t, x=x, y=y, t_step=t_step,
               base_dac_y=args.base_dac_y, step_px=args.step_px,
               target_from=target_from, target_to=target_to,
-              kp_milli=args.kp_milli, ki_milli=args.ki_milli, kd_milli=args.kd_milli)
+              kp_milli=args.kp_milli, ki_milli=args.ki_milli, kd_milli=args.kd_milli,
+              notch_active=notch_active, notch_freq_hz=notch_freq_hz, notch_q=notch_q,
+              lead_active=lead_active, lead_fz_hz=lead_fz_hz, lead_fp_hz=lead_fp_hz,
+              out_limit=out_limit, ctrl_rate_millihz=ctrl_rate_millihz,
+              ctrl_interval_ms=ctrl_interval_ms, smoothing=smoothing, axis2=axis2)
     print(f"Saved raw time series to {out_path}")
 
-    # --- plot ---
-    fig, ax = plt.subplots(figsize=(9, 4.5), dpi=150)
-    ax.set_facecolor("white")
-    for spine in ("top", "right"):
-        ax.spines[spine].set_visible(False)
-    for spine in ("left", "bottom"):
-        ax.spines[spine].set_color(GRID)
-    ax.tick_params(colors=MUTED, labelsize=9, length=3)
+    # --- plot --- two panels: cx (the driven axis) on top, cy (the OTHER
+    # axis -- what axis2, when enabled, is trying to hold steady) below,
+    # sharing the time axis, so a Y-step test directly shows whether the
+    # second axis controller visibly changes cy's behavior.
+    fig, (ax, ax_y) = plt.subplots(2, 1, figsize=(9, 6.5), dpi=150, sharex=True,
+                                    gridspec_kw={"height_ratios": [1.4, 1]})
+    for a in (ax, ax_y):
+        a.set_facecolor("white")
+        for spine in ("top", "right"):
+            a.spines[spine].set_visible(False)
+        for spine in ("left", "bottom"):
+            a.spines[spine].set_color(GRID)
+        a.tick_params(colors=MUTED, labelsize=9, length=3)
 
     ax.axhline(target_from, color=TARGET_COLOR, linewidth=1.0, linestyle=(0, (2, 2)), alpha=0.7)
     ax.plot([t_step, t[-1]], [target_to, target_to], color=TARGET_COLOR, linewidth=1.2,
@@ -428,13 +586,30 @@ def main():
     sec.tick_params(colors=MUTED, labelsize=9, length=3)
     sec.set_ylabel("µm", fontsize=9, color=MUTED)
 
-    ax.set_xlabel("time (s)", fontsize=9.5, color=MUTED)
     ax.set_ylabel("cx (px)", fontsize=9.5, color=MUTED)
     ax.legend(frameon=False, fontsize=9, loc="upper right")
+
+    ax_y.plot(t, y, color="#c9962c", linewidth=1.2, label="measured cy (other axis)")
+    ax_y.axvline(t_step, color=MUTED, linewidth=0.8, linestyle=(0, (1, 2)))
+    ax_y.set_xlabel("time (s)", fontsize=9.5, color=MUTED)
+    ax_y.set_ylabel("cy (px)", fontsize=9.5, color=MUTED)
+    y_std = y.std()
+    y_range = y.max() - y.min()
+    ax_y.text(0.02, 0.95, f"cy std={y_std:.2f}px  range={y_range:.2f}px", transform=ax_y.transAxes,
+              fontsize=8.5, color="#0b0b0b", va="top", ha="left",
+              bbox=dict(facecolor="white", edgecolor=GRID, alpha=0.9, pad=3))
+    ax_y.legend(frameon=False, fontsize=8.5, loc="upper right")
 
     if metrics is not None:
         parts = [f"step: {args.step_px:+.1f}px @ dac_y={args.base_dac_y}",
                  f"Kp={args.kp_milli/1000:.2f} Ki={args.ki_milli/1000:.2f} Kd={args.kd_milli/1000:.2f}"]
+        if out_limit < 3905:  # firmware default is +-3905 (full DAC span) -- only worth
+            parts.append(f"out_limit: ±{out_limit} counts (tightened anti-windup)")  # flagging when tightened
+        if ctrl_interval_ms > 0:
+            parts.append(f"ctrl_rate: {ctrl_rate_millihz/1000.0:.0f}Hz (throttled, "
+                          f"{ctrl_interval_ms}ms gate)")
+        if smoothing:
+            parts.append("smoothing: boxcar ON")
         if metrics["rise_time_s"] is not None:
             parts.append(f"rise: {metrics['rise_time_s']*1000:.0f}ms")
         if metrics["overshoot_pct"] is not None:
@@ -447,7 +622,74 @@ def main():
                 color="#0b0b0b", va="bottom", ha="left",
                 bbox=dict(facecolor="white", edgecolor=GRID, alpha=0.9, pad=4))
 
-    fig.suptitle("Closed-loop step response, dac_y → cx", fontsize=13, fontweight="bold")
+    # Notch-filter badge -- always shown (not just when active), high-
+    # contrast, so a viewer glancing at a saved PNG can't mistake a
+    # notch-filtered run for a plain-PID one or vice versa. Ground-truth
+    # (from get_status), not just an echo of whatever CLI args were passed.
+    if notch_active:
+        notch_label = f"NOTCH ON: {notch_freq_hz:.1f}Hz  Q={notch_q:.1f}"
+        notch_box = dict(facecolor="#fff3cd", edgecolor="#c9962c", alpha=0.95, pad=5)
+        notch_color = "#7a5b00"
+    else:
+        notch_label = "notch: off"
+        notch_box = dict(facecolor="white", edgecolor=GRID, alpha=0.8, pad=4)
+        notch_color = MUTED
+    ax.text(0.02, 0.97, notch_label, transform=ax.transAxes, fontsize=9,
+            fontweight=("bold" if notch_active else "normal"), color=notch_color,
+            va="top", ha="left", bbox=notch_box)
+
+    # Lead-compensator badge -- stacked directly under the notch badge
+    # (same top-left corner, same "always shown, ground-truth" reasoning).
+    if lead_active:
+        lead_label = f"LEAD ON: fz={lead_fz_hz:.1f}Hz  fp={lead_fp_hz:.1f}Hz"
+        lead_box = dict(facecolor="#d9ecff", edgecolor="#2a78d6", alpha=0.95, pad=5)
+        lead_color = "#0b3d73"
+    else:
+        lead_label = "lead: off"
+        lead_box = dict(facecolor="white", edgecolor=GRID, alpha=0.8, pad=4)
+        lead_color = MUTED
+    ax.text(0.02, 0.89, lead_label, transform=ax.transAxes, fontsize=9,
+            fontweight=("bold" if lead_active else "normal"), color=lead_color,
+            va="top", ha="left", bbox=lead_box)
+
+    # Control-rate throttle badge -- top-right (notch's badge owns top-left),
+    # only shown when active: throttling is a deliberate deviation from real
+    # operating conditions (not a normal tuning knob like Kp/Ki), so a
+    # throttled run should never be mistaken for a full-rate one at a glance.
+    if ctrl_interval_ms > 0:
+        ax.text(0.98, 0.97, f"THROTTLED: {ctrl_rate_millihz/1000.0:.0f}Hz "
+                f"(gate {ctrl_interval_ms}ms)", transform=ax.transAxes, fontsize=9,
+                fontweight="bold", color="#8a1f1f", va="top", ha="right",
+                bbox=dict(facecolor="#fde2e2", edgecolor="#b33a3a", alpha=0.95, pad=5))
+
+    # Smoothing badge -- bottom-right (notch owns top-left, throttle owns
+    # top-right), only shown when active for the same "never mistaken at
+    # a glance" reasoning as the other two.
+    if smoothing:
+        ax.text(0.98, 0.03, "BOXCAR SMOOTHING ON", transform=ax.transAxes, fontsize=9,
+                fontweight="bold", color="#1f6b3a", va="bottom", ha="right",
+                bbox=dict(facecolor="#e3f5e8", edgecolor="#3a9c5c", alpha=0.95, pad=5))
+
+    # axis2 badge -- on the cy panel itself, since that's the axis it
+    # controls. Always shown (on AND off), since "was axis2 active" is
+    # exactly the thing an A/B comparison plot needs to be unambiguous
+    # about at a glance.
+    axis2_label = "AXIS2 ON (dac_x correcting cy)" if axis2 else "axis2 OFF (dac_x held fixed)"
+    axis2_box = (dict(facecolor="#e3f5e8", edgecolor="#3a9c5c", alpha=0.95, pad=4) if axis2
+                 else dict(facecolor="white", edgecolor=GRID, alpha=0.85, pad=4))
+    ax_y.text(0.98, 0.95, axis2_label, transform=ax_y.transAxes, fontsize=8.5,
+              fontweight=("bold" if axis2 else "normal"),
+              color=("#1f6b3a" if axis2 else MUTED), va="top", ha="right", bbox=axis2_box)
+
+    title = "Closed-loop step response, dac_y → cx (+ cy, axis2 "
+    title += "ON)" if axis2 else "OFF)"
+    if notch_active:
+        title += f"  (notch @ {notch_freq_hz:.1f}Hz)"
+    if ctrl_interval_ms > 0:
+        title += f"  (throttled {ctrl_rate_millihz/1000.0:.0f}Hz)"
+    if smoothing:
+        title += "  (boxcar smoothing)"
+    fig.suptitle(title, fontsize=13, fontweight="bold")
     fig.tight_layout()
     png_path = out_path.rsplit(".", 1)[0] + ".png"
     fig.savefig(png_path, facecolor="white")

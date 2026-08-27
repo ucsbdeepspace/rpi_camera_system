@@ -179,6 +179,20 @@ static volatile int32_t    g_last_dac_y = DAC_MIN_COUNT;
  * file can echo the last-commanded gains back in cmd_get_status. */
 static int32_t g_target_x_scaled = 0;   /* pixel setpoint for cx, POSITION_SCALE-scaled */
 static uint8_t g_target_x_set    = 0;   /* set_mode closed_loop refuses to engage until this is 1 */
+static int32_t g_target_y_scaled = 0;   /* second-axis (dac_x <- cy) setpoint, POSITION_SCALE-
+                                          * scaled -- added 2026-08-19, "identical parameters"
+                                          * completeness axis. Auto-captured (bumpless, "hold cy
+                                          * where it already is") on set_mode closed_loop, no
+                                          * separate set_target_y command -- kept deliberately
+                                          * simple given limited time to implement/validate this. */
+static int32_t g_closed_loop_base_dac_x = DAC_MIN_COUNT;  /* bumpless-transfer bias for the second
+                                          * axis, mirrors g_closed_loop_base_dac_y below */
+static uint8_t g_axis2_enabled = 1;     /* 0 = second axis (dac_x <- cy) holds dac_x fixed instead
+                                          * of correcting -- added so a Y-axis step test can be run
+                                          * with the second controller on vs. off, identical
+                                          * otherwise, to directly check whether it's doing anything
+                                          * useful rather than assuming. Default on (matches
+                                          * behavior before this flag existed). */
 static int32_t g_kp_milli = 0;          /* Kp = g_kp_milli/1000, DAC counts per pixel of error */
 static int32_t g_ki_milli = 0;          /* Ki = g_ki_milli/1000, DAC counts per (pixel*second) */
 static int32_t g_kd_milli = 0;          /* Kd = g_kd_milli/1000, DAC counts per (pixel/second) */
@@ -188,7 +202,233 @@ static int32_t g_fc_millihz = 20000;    /* derivative filter cutoff = g_fc_milli
                                           * rig's ~15.3Hz resonance (see pid_wrapper.cpp) --
                                           * live-settable via set_fc so this can be retried without
                                           * a reflash per attempt. */
+static int32_t g_out_limit_counts = (DAC_MAX_COUNT - DAC_MIN_COUNT);  /* symmetric +-limit passed to
+                                          * PIDController::setOutputLimits() -- defaults to the full
+                                          * DAC span (so back-calculation anti-windup never engages
+                                          * for a normal-sized correction), live-settable via
+                                          * set_out_limit to test tightening it. See pid_wrapper.cpp. */
+static uint32_t g_control_interval_ms = 0;   /* 0 = unthrottled (fires on every confident packet);
+                                          * live-settable via set_ctrl_rate, added 2026-08-19 to
+                                          * test whether throttling the control rate back down
+                                          * recovers pre-ROI-change stability, without a reflash
+                                          * per attempt (supersedes the one-off DIAG_CONTROL_INTERVAL_MS
+                                          * used earlier the same day, since removed). Sets ts_s to
+                                          * match in the SAME command (cmd_set_ctrl_rate), so the two
+                                          * can't silently drift apart the way DIAG_CONTROL_INTERVAL_MS
+                                          * and ts_s did. */
+static uint32_t g_last_ctrl_step_tick = 0;
+static int32_t  g_ctrl_rate_millihz = 457500;  /* informational, reported via get_status -- matches
+                                          * whatever ts_s the PID was last constructed with */
+static int32_t  g_smooth_sum = 0;      /* running sum of tel_x_scaled (POSITION_SCALE-scaled)
+                                          * since the last control-step firing -- accumulated
+                                          * on EVERY confident packet regardless of whether
+                                          * smoothing is enabled, so toggling it never sees stale
+                                          * data. Added 2026-08-19 to test whether a boxcar
+                                          * (accumulate-and-average) pre-filter, a proper anti-
+                                          * aliasing decimation filter, does better than the
+                                          * existing throttle's naive skip-based decimation
+                                          * (which just keeps whichever single sample happens to
+                                          * cross the interval gate, discarding the rest and
+                                          * doing nothing to reduce noise or prevent aliasing). */
+static uint32_t g_smooth_count = 0;
+static uint8_t  g_smoothing_enabled = 0;  /* 0 = feed the PID the latest raw sample (today's
+                                          * existing behavior); 1 = feed it the mean of every
+                                          * confident sample since the last control step. Works
+                                          * at ANY g_control_interval_ms setting, including 0
+                                          * (unthrottled) -- deliberately decoupled from the
+                                          * throttle so full-rate+smoothing, throttled+smoothing,
+                                          * and throttled+no-smoothing can all be tested and
+                                          * compared, to separate "does averaging help" from
+                                          * "does throttling help" instead of conflating them. */
+static uint32_t g_pulse_step_tick = 0;  /* HAL_GetTick() at the exact moment cmd_pulse_step
+                                          * wrote the DAC -- added 2026-08-19 for a real closed-
+                                          * loop-delay measurement immune to host-clock timing
+                                          * (see get_status's pulse_tick= field). 0 = never fired
+                                          * since boot. */
 static int32_t g_closed_loop_base_dac_y = DAC_MIN_COUNT;  /* bumpless-transfer bias, see cmd_set_mode */
+static int32_t g_notch_freq_millihz = 0;  /* 0 = notch disabled; see cmd_set_notch/notch_filter_t */
+static int32_t g_notch_q_milli = 0;       /* Q*1000, only meaningful while the notch is enabled */
+static int32_t g_lead_fz_millihz = 0;     /* 0 = lead disabled; see cmd_set_lead/lead_filter_t */
+static int32_t g_lead_fp_millihz = 0;     /* only meaningful while the lead filter is enabled */
+
+/* --- Resonance notch filter ----------------------------------------------
+ * Added 2026-08-19 after every attempt to use PIDController.hpp's D term
+ * failed regardless of its low-pass filter's cutoff (1-20Hz tried,
+ * combined with Kd from 0.001-0.05, against Ki=19 and Ki=200 -- every
+ * single combination was worse than plain P+I, see CLAUDE.md). Root
+ * cause: this rig has a real, directly-measured ~38.5Hz lightly-damped
+ * mechanical resonance (free-decay ring-down test, peak/trough-spacing
+ * method -- see CLAUDE.md, same date), and a simple single-pole low-pass
+ * can't reject that specific frequency without also killing useful
+ * signal in the 10-20Hz band this project actually needs. A notch
+ * (band-stop) filter targets just the resonance and leaves everything
+ * else -- including the target disturbance band -- largely untouched.
+ *
+ * Standard 2nd-order IIR biquad notch, coefficients per the RBJ "Audio
+ * EQ Cookbook" formulas (widely-used, well-tested reference design, not
+ * derived from scratch here). Filters the MEASURED position before it
+ * reaches the PID controller at all -- not just the D term's own input
+ * -- so P and I are also protected from reacting to (and potentially
+ * reinforcing) the resonance, matching the observation that even Kp
+ * alone had far less margin than expected (unstable by Kp=2.5).
+ *
+ * fs (assumed sample rate) shares the same fixed-rate caveat as
+ * pid_wrapper.h's ts_s -- baked in at notch_configure() time, not
+ * measured per-call. Re-verify/reconfigure if the real control rate
+ * changes again (see pid_wrapper.h's docstring for the general issue). */
+typedef struct
+{
+  float b0, b1, b2, a1, a2;
+  float x1, x2, y1, y2;
+  uint8_t enabled;
+} notch_filter_t;
+
+static notch_filter_t g_notch = {0};
+
+static void notch_configure(float freq_hz, float q, float sample_rate_hz)
+{
+  float w0 = 2.0f * 3.14159265358979323846f * freq_hz / sample_rate_hz;
+  float alpha = sinf(w0) / (2.0f * q);
+  float cos_w0 = cosf(w0);
+  float a0 = 1.0f + alpha;
+
+  g_notch.b0 = 1.0f / a0;
+  g_notch.b1 = -2.0f * cos_w0 / a0;
+  g_notch.b2 = 1.0f / a0;
+  g_notch.a1 = -2.0f * cos_w0 / a0;
+  g_notch.a2 = (1.0f - alpha) / a0;
+  g_notch.x1 = g_notch.x2 = g_notch.y1 = g_notch.y2 = 0.0f;
+}
+
+static float notch_apply(float x)
+{
+  float y;
+
+  if (!g_notch.enabled)
+  {
+    return x;
+  }
+  y = g_notch.b0 * x + g_notch.b1 * g_notch.x1 + g_notch.b2 * g_notch.x2
+       - g_notch.a1 * g_notch.y1 - g_notch.a2 * g_notch.y2;
+  g_notch.x2 = g_notch.x1;
+  g_notch.x1 = x;
+  g_notch.y2 = g_notch.y1;
+  g_notch.y1 = y;
+  return y;
+}
+
+/* seed_px -- the real, current measured position, NOT zero. Found the hard
+ * way (2026-08-19, live hardware, twice, see the lead compensator's own
+ * block comment below for the full story): zero-seeding a filter whose
+ * real input is already sitting at a large nonzero DC value (e.g. cx~239px,
+ * never anywhere near 0) creates a bogus, unphysical "step" from 0 to the
+ * real baseline the very first time the filter runs after a reset -- for
+ * the lead compensator specifically, that single-sample transient can be
+ * SEVERAL TIMES the real baseline value (confirmed: b0~2.78 for one tested
+ * config, a 239px baseline read back as 663px on sample 1), immediately
+ * driving the DAC hard in response to a completely fake error. The notch's
+ * own transient from zero-seeding is much smaller (its DC gain is ~1, not
+ * ~2.78+) but the same principle applies, so it gets the same treatment
+ * here for consistency -- seeding both x1/x2 and y1/y2 to the real current
+ * value means a constant input produces a constant (correct) output
+ * immediately, no startup transient at all. Same "bumpless" principle this
+ * file already applies to g_closed_loop_base_dac_y at mode engagement,
+ * just applied to filter state instead of the DAC bias. */
+static void notch_reset_state(float seed_px)
+{
+  g_notch.x1 = g_notch.x2 = g_notch.y1 = g_notch.y2 = seed_px;
+}
+
+/* --- Lead compensator ------------------------------------------------------
+ * Added 2026-08-19, direct follow-on to the notch filter above and to the
+ * same day's open-loop Bode sweep (rpi_camera_system CLAUDE.md): the notch
+ * measurably improved 5-10Hz tracking but made 15-20Hz WORSE (its stopband
+ * skirt attenuates real signal there, and it never raised the Ki
+ * stability ceiling at all). Worked through by hand with the user first
+ * (not built blind): the Bode data shows the actual mechanism is loop
+ * PHASE MARGIN eroding as Ki pushes gain-crossover up toward the 38.5Hz
+ * resonance -- a lead compensator adds phase specifically in the
+ * crossover region, which is the textbook tool for exactly this failure
+ * mode (unlike the notch, which only removes gain/energy at one
+ * frequency and does nothing for the broader phase deficit building up
+ * well before the resonance). First-pass target: zero ~9-10Hz, pole
+ * ~60-65Hz, sized by hand for roughly +48 degrees of phase boost peaking
+ * near 25Hz (see the design conversation in this project's history) --
+ * meant as a STARTING POINT to verify and iterate on the bench, not a
+ * final, precisely-solved answer (the hand math is a genuinely coupled
+ * two-unknown problem -- see that conversation for why a clean single
+ * formula doesn't exist here).
+ *
+ * C(s) = (1 + s/wz) / (1 + s/wp), wz < wp -- one real zero, one real
+ * pole, discretized via the standard bilinear (Tustin) transform into a
+ * first-order IIR (simpler than the notch's biquad: only one previous
+ * input/output sample needed, not two). Filters the measurement in
+ * series with the notch, same position in the signal chain (before the
+ * PID sees it) -- order between the two doesn't matter for an LTI
+ * cascade (G1*G2 = G2*G1), so notch-then-lead vs lead-then-notch would
+ * give the same result; notch-then-lead was picked arbitrarily.
+ *
+ * Sample-rate handling -- explicitly NOT repeating the notch's known bug
+ * (notch_configure is hardcoded to 457.5Hz regardless of the real
+ * ctrl_rate, silently wrong whenever throttled -- see CLAUDE.md's
+ * "Notch filter retested honestly" entry for how that confounded an
+ * earlier comparison). lead_configure instead takes the sample rate as
+ * an explicit argument, and cmd_set_lead passes g_ctrl_rate_millihz/1000
+ * -- the REAL current rate, not a hardcoded constant. Still has the same
+ * residual limitation the notch has: if set_ctrl_rate changes AFTER
+ * set_lead, the coefficients go stale until set_lead is reissued -- not
+ * fixed here (would need coefficients recomputed every call, more
+ * complexity than a first firmware pass needs), just not made WORSE by
+ * hardcoding on top of it. */
+typedef struct
+{
+  float b0, b1, a1;
+  float x1, y1;
+  uint8_t enabled;
+} lead_filter_t;
+
+static lead_filter_t g_lead = {0};
+
+static void lead_configure(float fz_hz, float fp_hz, float sample_rate_hz)
+{
+  float T = 1.0f / sample_rate_hz;
+  float Kz = 1.0f / (3.14159265358979323846f * fz_hz * T);
+  float Kp_ = 1.0f / (3.14159265358979323846f * fp_hz * T);
+
+  g_lead.b0 = (1.0f + Kz) / (1.0f + Kp_);
+  g_lead.b1 = (1.0f - Kz) / (1.0f + Kp_);
+  g_lead.a1 = (1.0f - Kp_) / (1.0f + Kp_);
+  g_lead.x1 = g_lead.y1 = 0.0f;
+}
+
+static float lead_apply(float x)
+{
+  float y;
+
+  if (!g_lead.enabled)
+  {
+    return x;
+  }
+  y = g_lead.b0 * x + g_lead.b1 * g_lead.x1 - g_lead.a1 * g_lead.y1;
+  g_lead.x1 = x;
+  g_lead.y1 = y;
+  return y;
+}
+
+/* seed_px -- see notch_reset_state's docstring for the full story (found
+ * live, twice, on hardware 2026-08-19). Zero-seeding this filter was
+ * confirmed to produce a single-sample output of ~2.78x a real 239px
+ * baseline (~663px) -- a bogus, unphysical "error" large enough to slam
+ * the DAC and kick the real beam into sustained oscillation, which is
+ * what actually happened on the bench, twice, before this was traced back
+ * to filter initialization rather than the lead compensator's frequency-
+ * domain design. Seeding x1=y1=seed_px (this filter's DC gain is ~1, same
+ * as the notch) means a constant input produces the correct constant
+ * output immediately -- no bogus transient. */
+static void lead_reset_state(float seed_px)
+{
+  g_lead.x1 = g_lead.y1 = seed_px;
+}
 
 /* On-board sine setpoint generator -- 2026-08-13 "emergency" addition,
  * added after this session spent a very long time chasing why the VCP
@@ -211,6 +451,26 @@ static int32_t  g_sine_center_scaled   = 0;  /* POSITION_SCALE-scaled, same unit
 static int32_t  g_sine_amplitude_scaled = 0; /* POSITION_SCALE-scaled */
 static int32_t  g_sine_freq_millihz    = 0;
 static uint32_t g_sine_start_tick      = 0;
+
+/* Open-loop plant excitation (2026-08-19) -- for measuring a real open-
+ * loop Bode plot (dac_y -> cx) instead of only ever characterizing the
+ * closed loop. Drives dac_y DIRECTLY via apply_dac(), bypassing the PID
+ * entirely (unlike g_sine_active above, which moves the closed-loop
+ * TARGET and lets the controller chase it) -- only meaningful, and only
+ * armed, in MODE_OPEN_LOOP. Units are plain DAC counts (not
+ * POSITION_SCALE-scaled) since this writes the DAC directly, not a pixel
+ * target. Reuses the existing dac_y=/tick= telemetry relay fields as the
+ * ground-truth commanded waveform -- no new telemetry field needed, since
+ * apply_dac() already updates g_last_dac_y (and hence what gets reported)
+ * regardless of who called it. A host-side fit against BOTH the reported
+ * dac_y (input) and measured x (output), on the same tick timebase, gives
+ * magnitude and phase with no host-clock trust required, same trick
+ * already used for g_sine_active via the tgt= field. */
+static uint8_t  g_open_sine_active         = 0;
+static int32_t  g_open_sine_center_counts  = 0;
+static int32_t  g_open_sine_amplitude_counts = 0;
+static int32_t  g_open_sine_freq_millihz   = 0;
+static uint32_t g_open_sine_start_tick     = 0;
 
 /* Single-byte interrupt-driven VCP (USART2) receive, re-armed on every
  * completion/error -- same one-shot-then-rearm pattern as the I2C
@@ -270,7 +530,13 @@ static uint16_t          vcp_cur_len  = 0;  /* length assembled so far into vcp_
  * the largest message (get_status's ~220-byte reply) with a little
  * margin. */
 #define TX_QUEUE_DEPTH   8U
-#define TX_MSG_MAX_LEN   256U
+#define TX_MSG_MAX_LEN   520U  /* bumped 400->460 2026-08-19 for the open_sine=/
+                                * open_sine_freq_millihz= STATUS fields, then
+                                * 460->520 same day for lead=/lead_fz_millihz=/
+                                * lead_fp_millihz= -- matches this file's
+                                * established pattern of growing this
+                                * alongside line[] whenever a new STATUS
+                                * field is added. */
 typedef struct { char data[TX_MSG_MAX_LEN]; uint16_t len; } tx_msg_t;
 static tx_msg_t          tx_queue[TX_QUEUE_DEPTH];
 static volatile uint8_t  tx_head  = 0;  /* next slot enqueue_tx fills */
@@ -310,10 +576,23 @@ static void cmd_set_kp(const char *arg);
 static void cmd_set_ki(const char *arg);
 static void cmd_set_kd(const char *arg);
 static void cmd_set_fc(const char *arg);
+static void cmd_set_out_limit(const char *arg);
+static void cmd_set_ctrl_rate(const char *arg);
+static void cmd_pulse_step(const char *arg);
+static void cmd_set_smoothing(const char *arg);
+static void cmd_set_axis2(const char *arg);
+static void cmd_set_notch(const char *arg);
+static void cmd_notch_off(void);
+static void cmd_set_lead(const char *arg);
+static void cmd_lead_off(void);
 static void cmd_start_sine(const char *arg);
 static void cmd_stop_sine(void);
 static void update_sine_target(uint32_t now);
+static void cmd_start_open_sine(const char *arg);
+static void cmd_stop_open_sine(void);
+static void update_open_sine_dac(uint32_t now);
 static void run_closed_loop_step(int16_t tel_x_scaled, uint32_t now);
+static void run_closed_loop_step_axis2(int16_t tel_y_scaled, uint32_t now);
 
 /* USER CODE END PFP */
 
@@ -388,8 +667,15 @@ int main(void)
    * correction is added to g_closed_loop_base_dac_y and then hard-
    * clamped to [DAC_MIN_COUNT, DAC_MAX_COUNT] by apply_dac() regardless,
    * so this only needs to be wide enough not to clip a legitimate
-   * correction before that final clamp does. */
-  pid_wrapper_init(0.0, 0.0, 0.0, 1.0 / 210.0, (double)g_fc_millihz / 1000.0,
+   * correction before that final clamp does.
+   *
+   * ts_s = 1/457.5, matching the ~440-475Hz telemetry rate the Pi streams
+   * at post-ROI-change (see CLAUDE.md, 2026-08-18 "Pi-side I2C1 baud
+   * change" entry) now that the temporary ~200Hz control-rate throttle
+   * (DIAG_CONTROL_INTERVAL_MS, used to falsify sample rate as the cause
+   * of the Kp=1.75/Ki=200 instability) has been removed and
+   * run_closed_loop_step fires on every confident packet again. */
+  pid_wrapper_init(0.0, 0.0, 0.0, 1.0 / 457.5, (double)g_fc_millihz / 1000.0,
                     -(double)(DAC_MAX_COUNT - DAC_MIN_COUNT), (double)(DAC_MAX_COUNT - DAC_MIN_COUNT));
 
   /* USER CODE END 2 */
@@ -474,7 +760,7 @@ int main(void)
       int16_t  y;
       uint32_t pkt_count;
       uint32_t err_count;
-      char     line[120];
+      char     line[140];
       int      len;
 
       /* Snapshot under a brief IRQ-disable so a new packet landing
@@ -521,14 +807,60 @@ int main(void)
        * usable. Skipping a step just holds the DAC at its last commanded
        * value -- the staleness watchdog above (1Hz) is what actually
        * catches a fully-dead stream. */
-      if (g_mode == MODE_CLOSED_LOOP && (status & 1U))
+      /* Boxcar accumulator -- every confident packet feeds it, regardless
+       * of whether this cycle ends up firing a control step or whether
+       * smoothing is even enabled (see g_smooth_sum's docstring). Must
+       * run BEFORE the control-step block below so a firing on THIS same
+       * packet includes it. */
+      if (status & 1U)
+      {
+        g_smooth_sum += x;
+        g_smooth_count++;
+      }
+
+      if (g_mode == MODE_CLOSED_LOOP && (status & 1U)
+          && (g_control_interval_ms == 0U
+              || (HAL_GetTick() - g_last_ctrl_step_tick) >= g_control_interval_ms))
       {
         uint32_t ctrl_now = HAL_GetTick();
+        int16_t  ctrl_x = x;
+
+        if (g_smoothing_enabled && g_smooth_count > 0U)
+        {
+          ctrl_x = (int16_t)(g_smooth_sum / (int32_t)g_smooth_count);
+        }
+        g_smooth_sum = 0;
+        g_smooth_count = 0U;
+
         if (g_sine_active)
         {
           update_sine_target(ctrl_now);
         }
-        run_closed_loop_step(x, ctrl_now);
+        run_closed_loop_step(ctrl_x, ctrl_now);
+        /* Second axis, dac_x <- cy -- see its own docstring. g_axis2_enabled
+         * gates whether it corrects at all (set_axis2 0 leaves dac_x
+         * fixed at its bumpless-transfer base, for A/B comparison against
+         * the primary axis alone). Uses the same ctrl_now (and hence the
+         * same dt_s, computed from the same g_last_ctrl_step_tick before
+         * it's updated below) as the primary axis -- both axes fire on
+         * the same telemetry packet. */
+        if (g_axis2_enabled)
+        {
+          run_closed_loop_step_axis2(y, ctrl_now);
+        }
+        g_last_ctrl_step_tick = ctrl_now;
+      }
+
+      /* Open-loop plant excitation -- see update_open_sine_dac's
+       * docstring. Deliberately its own gate, independent of the
+       * MODE_CLOSED_LOOP block above (mutually exclusive in practice
+       * since cmd_start_open_sine refuses to arm outside MODE_OPEN_LOOP,
+       * but g_open_sine_active isn't force-cleared on a mode change, so
+       * checking g_mode here rather than trusting that alone is the
+       * belt-and-suspenders version). */
+      if (g_mode == MODE_OPEN_LOOP && g_open_sine_active && (status & 1U))
+      {
+        update_open_sine_dac(HAL_GetTick());
       }
 
       {
@@ -559,12 +891,30 @@ int main(void)
          * a host-side plot show the real actuator command alongside the
          * resulting cx/tgt trace, instead of having to infer it from the
          * control law offline. */
+
+        /* tick_now: added 2026-08-19 after finding host-side arrival
+         * timestamps are unusable for fine-grained timing analysis --
+         * Python's reader thread on Windows only gets scheduled roughly
+         * every ~15ms, so it drains whatever backlog piled up in one
+         * tight burst (near-identical time.monotonic() values) rather
+         * than timestamping each line as it actually arrives. Confirmed
+         * directly: re-examining a saved ring-down capture found 69-86%
+         * of consecutive host timestamps were EXACTLY identical, even
+         * with winmm.timeBeginPeriod(1) applied (that fixes Sleep()
+         * granularity, not thread-scheduling granularity -- didn't help
+         * here). HAL_GetTick() is the firmware's own free-running 1ms
+         * SysTick counter, immune to host OS scheduling -- reporting it
+         * per sample lets host-side analysis reconstruct real inter-
+         * sample timing without trusting when Python happened to get
+         * CPU time. */
+        uint32_t tick_now = HAL_GetTick();
+
         len = snprintf(line, sizeof(line),
-                        "seq=%3u status=%u x=%s%d.%01d y=%s%d.%01d tgt=%s%d.%01d dac_y=%ld pkts=%lu errs=%lu\r\n",
+                        "seq=%3u status=%u x=%s%d.%01d y=%s%d.%01d tgt=%s%d.%01d dac_y=%ld tick=%lu pkts=%lu errs=%lu\r\n",
                         (unsigned)seq, (unsigned)status,
                         x_sign, x_whole, x_frac, y_sign, y_whole, y_frac,
                         tgt_sign, tgt_whole, tgt_frac,
-                        (long)g_last_dac_y,
+                        (long)g_last_dac_y, (unsigned long)tick_now,
                         (unsigned long)pkt_count, (unsigned long)err_count);
       }
       if (len > 0)
@@ -963,8 +1313,10 @@ static void apply_dac(fta_axis_t axis, int32_t value)
  *
  * As of 2026-08-18, the P/I/D math + anti-windup that used to live
  * directly in this function is PIDController.hpp (via pid_wrapper.h),
- * used verbatim per Phil's e-mail -- see that header for the class
- * itself and pid_wrapper.h for the calling convention/unit choices.
+ * originally used verbatim per Phil's e-mail, minimally modified
+ * 2026-08-19 to take a real per-call dt (see that header's own docstring
+ * and pid_wrapper.h for the calling convention/unit choices) -- this
+ * function measures that dt from `now` against g_last_ctrl_step_tick.
  * pid_wrapper_calculate() returns a CORRECTION relative to
  * g_closed_loop_base_dac_y, not an absolute DAC value; apply_dac()
  * still does the final hardware clamp exactly as before. */
@@ -973,20 +1325,81 @@ static void run_closed_loop_step(int16_t tel_x_scaled, uint32_t now)
   double  target_px;
   double  measured_px;
   double  correction;
+  double  dt_s;
   int32_t output;
+  float   filtered_x_px;
 
-  (void)now;  /* PIDController.hpp's calculate() has no dt argument --
-               * ts_ is fixed at construction (see pid_wrapper.h's
-               * docstring on why), so the real per-packet tick is no
-               * longer needed here. */
+  /* Real measured dt (seconds) since the PREVIOUS firing, read from
+   * g_last_ctrl_step_tick BEFORE the caller updates it for this firing --
+   * 2026-08-19 fix, see pid_wrapper.h's docstring and PIDController.hpp's
+   * own docstring for why (this loop fires on irregular telemetry
+   * arrival, not a fixed timer, so a constant assumed ts_ silently mis-
+   * weights the integral/derivative). g_last_ctrl_step_tick==0 means
+   * "never fired since mode engagement" (reset there, see cmd_set_mode)
+   * -- dt_s stays <=0 in that case so pid_wrapper_calculate falls back to
+   * ts_ instead of computing a bogus multi-second "dt" from tick 0. */
+  dt_s = -1.0;
+  if (g_last_ctrl_step_tick != 0U && now > g_last_ctrl_step_tick)
+  {
+    dt_s = (double)(now - g_last_ctrl_step_tick) / 1000.0;
+  }
 
-  target_px   = (double)g_target_x_scaled / (double)POSITION_SCALE;
-  measured_px = (double)tel_x_scaled / (double)POSITION_SCALE;
+  target_px = (double)g_target_x_scaled / (double)POSITION_SCALE;
 
-  correction = pid_wrapper_calculate(target_px, measured_px);
+  /* Notch-filter the measurement BEFORE it reaches the PID controller
+   * (see the notch_filter_t comment above for why here, not just inside
+   * D). Passes through unchanged (notch_apply is a no-op) unless
+   * explicitly enabled via set_notch. */
+  filtered_x_px = notch_apply((float)tel_x_scaled / (float)POSITION_SCALE);
+  /* Lead compensator, in series after the notch (order doesn't matter
+   * for an LTI cascade -- see lead_filter_t's comment). No-op unless
+   * explicitly enabled via set_lead. */
+  filtered_x_px = lead_apply(filtered_x_px);
+  measured_px = (double)filtered_x_px;
+
+  correction = pid_wrapper_calculate(target_px, measured_px, dt_s);
   output = g_closed_loop_base_dac_y + (int32_t)correction;
 
   apply_dac(AXIS_Y, output);  /* clamps internally to [DAC_MIN_COUNT, DAC_MAX_COUNT] */
+}
+
+/* Second axis (dac_x -> cy), added 2026-08-19 -- "identical parameters"
+ * completeness axis (same Kp/Ki/Kd as the primary axis, via pid_wrapper's
+ * lockstep-reconstructed g_pid2, see pid_wrapper.cpp). Deliberately
+ * simpler than run_closed_loop_step: no notch, no boxcar smoothing, no
+ * sine generator -- just the dt-aware PID, given limited time to
+ * implement and validate this today.
+ *
+ * SIGN NOTE, important: the locked-optics calibration found dac_x's
+ * effect on cy is -0.104 px/count (rpi_camera_system CLAUDE.md,
+ * 2026-08-12) -- OPPOSITE SIGN from dac_y's +0.126 px/count effect on cx
+ * that run_closed_loop_step relies on. Feeding identical-sign gains into
+ * an identical control law would drive this axis in the WRONG direction
+ * (positive feedback, immediate divergence) -- the correction is
+ * negated before being applied to correct for this, so "identical
+ * parameters" (same Kp/Ki magnitude) still produces a correctly-signed
+ * physical response. */
+static void run_closed_loop_step_axis2(int16_t tel_y_scaled, uint32_t now)
+{
+  double  target_py;
+  double  measured_py;
+  double  correction;
+  double  dt_s;
+  int32_t output;
+
+  dt_s = -1.0;
+  if (g_last_ctrl_step_tick != 0U && now > g_last_ctrl_step_tick)
+  {
+    dt_s = (double)(now - g_last_ctrl_step_tick) / 1000.0;
+  }
+
+  target_py = (double)g_target_y_scaled / (double)POSITION_SCALE;
+  measured_py = (double)tel_y_scaled / (double)POSITION_SCALE;
+
+  correction = pid_wrapper_calculate2(target_py, measured_py, dt_s);
+  output = g_closed_loop_base_dac_x - (int32_t)correction;  /* negated -- see sign note above */
+
+  apply_dac(AXIS_X, output);  /* clamps internally to [DAC_MIN_COUNT, DAC_MAX_COUNT] */
 }
 
 /* --- Amp / safety -------------------------------------------------------- */
@@ -1177,6 +1590,42 @@ static void process_command_line(char *line)
   {
     cmd_set_fc(arg);
   }
+  else if (strcmp(cmd, "set_out_limit") == 0)
+  {
+    cmd_set_out_limit(arg);
+  }
+  else if (strcmp(cmd, "set_ctrl_rate") == 0)
+  {
+    cmd_set_ctrl_rate(arg);
+  }
+  else if (strcmp(cmd, "pulse_step") == 0)
+  {
+    cmd_pulse_step(arg);
+  }
+  else if (strcmp(cmd, "set_smoothing") == 0)
+  {
+    cmd_set_smoothing(arg);
+  }
+  else if (strcmp(cmd, "set_axis2") == 0)
+  {
+    cmd_set_axis2(arg);
+  }
+  else if (strcmp(cmd, "set_notch") == 0)
+  {
+    cmd_set_notch(arg);
+  }
+  else if (strcmp(cmd, "notch_off") == 0)
+  {
+    cmd_notch_off();
+  }
+  else if (strcmp(cmd, "set_lead") == 0)
+  {
+    cmd_set_lead(arg);
+  }
+  else if (strcmp(cmd, "lead_off") == 0)
+  {
+    cmd_lead_off();
+  }
   else if (strcmp(cmd, "start_sine") == 0)
   {
     cmd_start_sine(arg);
@@ -1184,6 +1633,14 @@ static void process_command_line(char *line)
   else if (strcmp(cmd, "stop_sine") == 0)
   {
     cmd_stop_sine();
+  }
+  else if (strcmp(cmd, "start_open_sine") == 0)
+  {
+    cmd_start_open_sine(arg);
+  }
+  else if (strcmp(cmd, "stop_open_sine") == 0)
+  {
+    cmd_stop_open_sine();
   }
   else
   {
@@ -1225,7 +1682,36 @@ static void cmd_set_mode(const char *arg)
      * integral/derivative history for the same reason this file's
      * previous hand-rolled version zeroed its own integral here. */
     g_closed_loop_base_dac_y = g_last_dac_y;
-    pid_wrapper_reset();
+    g_closed_loop_base_dac_x = g_last_dac_x;  /* same, second axis */
+    /* Second axis's setpoint is auto-captured (bumpless "hold cy where it
+     * already is"), not a separately-commanded target -- no set_target_y
+     * exists. IRQ-guarded read, same pattern as the packet-processing
+     * snapshot in main()'s while(1) loop (only I2C1 ever writes
+     * g_latest_beam). */
+    HAL_NVIC_DisableIRQ(I2C1_EV_IRQn);
+    HAL_NVIC_DisableIRQ(I2C1_ER_IRQn);
+    g_target_y_scaled = g_latest_beam.y;
+    {
+      /* Bumpless filter-state seed, same read (same IRQ guard) as the
+       * target_y capture just above -- see notch_reset_state/
+       * lead_reset_state's own docstrings for why this matters. */
+      float seed_px = (float)g_latest_beam.x / (float)POSITION_SCALE;
+      HAL_NVIC_EnableIRQ(I2C1_EV_IRQn);
+      HAL_NVIC_EnableIRQ(I2C1_ER_IRQn);
+      pid_wrapper_reset();
+      notch_reset_state(seed_px);  /* clear stale history AND seed at the real current value --
+                                    * see this function's own docstring for why zero-seeding is wrong. */
+      lead_reset_state(seed_px);   /* same reasoning, for the lead compensator */
+    }
+    g_smooth_sum = 0;      /* clear any pre-engagement boxcar accumulation, same reasoning */
+    g_smooth_count = 0U;
+    g_last_ctrl_step_tick = 0U;  /* so the first real dt measurement (see run_closed_loop_step)
+                                  * doesn't compute a bogus dt against a stale tick from a
+                                  * previous engagement -- 0 is the documented "never fired
+                                  * since engagement" sentinel there. */
+    g_open_sine_active = 0;  /* belt-and-suspenders -- open-loop plant excitation has no
+                              * business running once the PID owns dac_y (see
+                              * update_open_sine_dac's own g_mode check too). */
     g_mode = MODE_CLOSED_LOOP;
     send_line("OK mode=closed_loop\r\n");
   }
@@ -1242,14 +1728,15 @@ static void cmd_set_axis(fta_axis_t axis, const char *arg)
   char  resp[48];
   int   len;
 
-  if (axis == AXIS_Y && g_mode == MODE_CLOSED_LOOP)
+  if (g_mode == MODE_CLOSED_LOOP)
   {
-    /* dac_y is under closed-loop control in this mode (run_closed_loop_step
-     * writes it every telemetry packet) -- a manual set_y here would just
-     * get overwritten on the next control step, or fight it in between.
-     * Reject explicitly rather than silently accepting a command that
-     * wouldn't do what it looks like it does. */
-    send_line("ERR set_y is under closed-loop control -- set_mode open_loop first\r\n");
+    /* Both dac_y (cx-error axis) and, as of 2026-08-19, dac_x (cy-error
+     * axis) are under closed-loop control in this mode -- a manual
+     * set_x/set_y here would just get overwritten on the next control
+     * step, or fight it in between. Reject explicitly rather than
+     * silently accepting a command that wouldn't do what it looks like
+     * it does. */
+    send_line("ERR set_x/set_y is under closed-loop control -- set_mode open_loop first\r\n");
     return;
   }
 
@@ -1425,6 +1912,107 @@ static void update_sine_target(uint32_t now)
   g_target_x_scaled = (int32_t)(center_scaled + amplitude_scaled * sinf(phase));
 }
 
+/* start_open_sine FREQ_MILLIHZ AMPLITUDE_COUNTS CENTER_COUNTS -- drives
+ * dac_y directly as a sine, bypassing the PID entirely (see this
+ * feature's docstring by the g_open_sine_* globals above). Only valid in
+ * MODE_OPEN_LOOP -- rejected in closed_loop the same way cmd_set_axis
+ * rejects a manual set_y there, since dac_y is under PID control in that
+ * mode and this would just fight it. Parsing mirrors cmd_start_sine's
+ * hand-rolled three-integer parse (process_command_line only splits on
+ * the first space). */
+static void cmd_start_open_sine(const char *arg)
+{
+  long  freq_millihz, amplitude_counts, center_counts;
+  char *p = (char *)arg;
+  char *endptr;
+  char  resp[80];
+  int   len;
+
+  if (g_mode != MODE_OPEN_LOOP)
+  {
+    send_line("ERR start_open_sine requires open_loop mode\r\n");
+    return;
+  }
+
+  if (arg == NULL || arg[0] == '\0')
+  {
+    send_line("ERR start_open_sine requires FREQ_MILLIHZ AMPLITUDE_COUNTS CENTER_COUNTS\r\n");
+    return;
+  }
+
+  freq_millihz = strtol(p, &endptr, 10);
+  if (endptr == p)
+  {
+    send_line("ERR invalid freq_millihz\r\n");
+    return;
+  }
+  p = endptr;
+  while (*p == ' ') { p++; }
+
+  amplitude_counts = strtol(p, &endptr, 10);
+  if (endptr == p)
+  {
+    send_line("ERR invalid amplitude_counts\r\n");
+    return;
+  }
+  p = endptr;
+  while (*p == ' ') { p++; }
+
+  center_counts = strtol(p, &endptr, 10);
+  if (endptr == p)
+  {
+    send_line("ERR invalid center_counts\r\n");
+    return;
+  }
+
+  if (freq_millihz <= 0)
+  {
+    send_line("ERR freq_millihz must be positive\r\n");
+    return;
+  }
+
+  g_open_sine_freq_millihz      = (int32_t)freq_millihz;
+  g_open_sine_amplitude_counts  = (int32_t)amplitude_counts;
+  g_open_sine_center_counts     = (int32_t)center_counts;
+  g_open_sine_start_tick        = HAL_GetTick();
+  g_open_sine_active            = 1;
+
+  len = snprintf(resp, sizeof(resp),
+                  "OK open_sine_started freq_millihz=%ld amplitude=%ld center=%ld start_tick=%lu\r\n",
+                  freq_millihz, amplitude_counts, center_counts, (unsigned long)g_open_sine_start_tick);
+  if (len > 0)
+  {
+    send_line(resp);
+  }
+}
+
+static void cmd_stop_open_sine(void)
+{
+  g_open_sine_active = 0;
+  send_line("OK open_sine_stopped\r\n");
+}
+
+/* Called once per confident telemetry packet (main()'s while(1) loop)
+ * while g_open_sine_active -- computes
+ * dac_y(t) = center + amplitude*sin(2*pi*freq*(t-t0)) directly, using the
+ * same HAL_GetTick() timebase as update_sine_target(), and writes it via
+ * apply_dac() (clamped to [DAC_MIN_COUNT, DAC_MAX_COUNT] internally, same
+ * as every other DAC write in this file). Runs at full telemetry rate,
+ * NOT gated by g_control_interval_ms -- that throttle exists for the
+ * PID's own stability tuning and has no bearing on open-loop plant
+ * excitation, where the sharpest available timebase resolution is what
+ * we actually want. */
+static void update_open_sine_dac(uint32_t now)
+{
+  float elapsed_s = (float)(now - g_open_sine_start_tick) / 1000.0f;
+  float freq_hz = (float)g_open_sine_freq_millihz / 1000.0f;
+  float phase = 2.0f * 3.14159265358979323846f * freq_hz * elapsed_s;
+  float value = (float)g_open_sine_center_counts
+                + (float)g_open_sine_amplitude_counts * sinf(phase);
+
+  apply_dac(AXIS_Y, (int32_t)value);
+}
+
 /* Kp/Ki/Kd are taken as milli-units integers (e.g. "set_kp 2500" ->
  * Kp=2.5) rather than a float string -- strtol only, no strtof/newlib
  * float-scanf dependency, same rationale as decode_scaled's existing
@@ -1573,6 +2161,378 @@ static void cmd_set_fc(const char *arg)
   }
 }
 
+/* Symmetric +-limit (DAC counts) passed to PIDController::setOutputLimits(),
+ * e.g. "set_out_limit 500" -> the p+i+d sum saturates at +-500 rather than
+ * the default +-(DAC_MAX_COUNT-DAC_MIN_COUNT). Added 2026-08-19 to test
+ * whether tightening this recovers some of the settling-time/overshoot
+ * regression found after adopting PIDController.hpp -- see CLAUDE.md and
+ * pid_wrapper.h. Deliberately does NOT reset the integral (matches
+ * pid_wrapper_set_out_limits' own choice) -- meant for A/B comparison
+ * mid-run, not a fresh start. */
+static void cmd_set_out_limit(const char *arg)
+{
+  long  val;
+  char *endptr;
+  char  resp[48];
+  int   len;
+
+  if (arg == NULL || arg[0] == '\0')
+  {
+    send_line("ERR set_out_limit requires an argument (DAC counts, e.g. 500)\r\n");
+    return;
+  }
+
+  val = strtol(arg, &endptr, 10);
+  if (endptr == arg)
+  {
+    send_line("ERR invalid integer\r\n");
+    return;
+  }
+
+  if (val <= 0)
+  {
+    send_line("ERR out_limit must be positive\r\n");
+    return;
+  }
+
+  g_out_limit_counts = (int32_t)val;
+  pid_wrapper_set_out_limits(-(double)g_out_limit_counts, (double)g_out_limit_counts);
+
+  len = snprintf(resp, sizeof(resp), "OK out_limit=%ld\r\n", val);
+  if (len > 0)
+  {
+    send_line(resp);
+  }
+}
+
+/* set_ctrl_rate MILLIHZ -- throttles how often run_closed_loop_step
+ * actually fires (gated by HAL_GetTick(), see the call site in main()'s
+ * while(1) loop) AND sets the PID's ts_s to match, in ONE command --
+ * added 2026-08-19 to test control-rate-throttling hypotheses (does
+ * going back to a ~200Hz-equivalent cadence recover pre-ROI-change
+ * stability) without a reflash per attempt, and specifically to avoid
+ * the throttle-rate/ts_s mismatch that happened earlier the same day
+ * with the since-removed DIAG_CONTROL_INTERVAL_MS diagnostic (that one
+ * required updating two separately-maintained values by hand and they
+ * silently drifted apart for the rest of that session). MILLIHZ=0
+ * disables the throttle (fires on every confident packet, normal
+ * operation) and resets ts_s to the default full telemetry rate
+ * (1/457.5s); a positive MILLIHZ throttles to that rate (e.g. 200000 =
+ * 200Hz) and sets ts_s = 1000.0/MILLIHZ to match. Resets
+ * g_last_ctrl_step_tick so the new interval takes effect from the next
+ * packet, not stalled waiting out whatever the old interval had already
+ * elapsed. */
+static void cmd_set_ctrl_rate(const char *arg)
+{
+  long  rate_millihz;
+  char *endptr;
+  char  resp[64];
+  int   len;
+
+  if (arg == NULL || arg[0] == '\0')
+  {
+    send_line("ERR set_ctrl_rate requires an argument (milli-Hz, 0=unthrottled)\r\n");
+    return;
+  }
+
+  rate_millihz = strtol(arg, &endptr, 10);
+  if (endptr == arg)
+  {
+    send_line("ERR invalid integer\r\n");
+    return;
+  }
+
+  if (rate_millihz < 0)
+  {
+    send_line("ERR rate_millihz must be >= 0\r\n");
+    return;
+  }
+
+  if (rate_millihz == 0)
+  {
+    g_control_interval_ms = 0U;
+    g_ctrl_rate_millihz = 457500;
+    pid_wrapper_set_ts(1.0 / 457.5);
+  }
+  else
+  {
+    g_control_interval_ms = (uint32_t)(1000000L / rate_millihz);
+    if (g_control_interval_ms == 0U)
+    {
+      g_control_interval_ms = 1U;  /* 1ms is the floor -- HAL_GetTick() resolution */
+    }
+    g_ctrl_rate_millihz = (int32_t)rate_millihz;
+    pid_wrapper_set_ts(1000.0 / (double)rate_millihz);
+  }
+  g_last_ctrl_step_tick = 0U;
+
+  len = snprintf(resp, sizeof(resp), "OK ctrl_rate_millihz=%ld ctrl_interval_ms=%lu\r\n",
+                 rate_millihz, (unsigned long)g_control_interval_ms);
+  if (len > 0)
+  {
+    send_line(resp);
+  }
+}
+
+/* pulse_step DELTA -- applies DELTA (signed DAC counts) to dac_y and
+ * latches g_pulse_step_tick = HAL_GetTick() at the exact moment of the
+ * write, for a real closed-loop-delay measurement immune to host-clock
+ * timing (added 2026-08-19). Open-loop and amp-enabled only, same
+ * reasoning as set_x/set_y -- a meaningful delay measurement needs a
+ * real physical step, not one that's either fighting the control loop
+ * or has no physical effect because the amp is off. The confirmation
+ * reply can be (and often is, under load) lost same as any other VCP
+ * reply -- get_status's pulse_tick= field is the durable, ground-truth
+ * way to recover the applied tick, not this reply. */
+static void cmd_pulse_step(const char *arg)
+{
+  long    delta;
+  char   *endptr;
+  char    resp[64];
+  int     len;
+  int32_t new_dac_y;
+
+  if (g_mode == MODE_CLOSED_LOOP)
+  {
+    send_line("ERR pulse_step is open_loop only -- set_mode open_loop first\r\n");
+    return;
+  }
+
+  if (!g_amp_enabled)
+  {
+    send_line("ERR amp is disabled -- pulse_step would have no physical effect, amp_enable first\r\n");
+    return;
+  }
+
+  if (arg == NULL || arg[0] == '\0')
+  {
+    send_line("ERR pulse_step requires an argument (signed DAC counts, e.g. 50 or -50)\r\n");
+    return;
+  }
+
+  delta = strtol(arg, &endptr, 10);
+  if (endptr == arg)
+  {
+    send_line("ERR invalid integer\r\n");
+    return;
+  }
+
+  new_dac_y = g_last_dac_y + (int32_t)delta;
+  apply_dac(AXIS_Y, new_dac_y);
+  g_pulse_step_tick = HAL_GetTick();
+
+  len = snprintf(resp, sizeof(resp), "OK pulse_step delta=%ld dac_y=%ld tick=%lu\r\n",
+                 delta, (long)g_last_dac_y, (unsigned long)g_pulse_step_tick);
+  if (len > 0)
+  {
+    send_line(resp);
+  }
+}
+
+/* set_smoothing 0|1 -- toggles whether run_closed_loop_step is fed the
+ * mean of every confident sample since the last control step (a boxcar
+ * anti-aliasing pre-filter) instead of just the latest raw sample.
+ * Independent of g_control_interval_ms (set_ctrl_rate) -- both can be
+ * varied separately, see g_smoothing_enabled's docstring. Resets the
+ * accumulator on toggle so switching mid-run never uses stale data. */
+static void cmd_set_smoothing(const char *arg)
+{
+  long  val;
+  char *endptr;
+  char  resp[32];
+  int   len;
+
+  if (arg == NULL || arg[0] == '\0')
+  {
+    send_line("ERR set_smoothing requires an argument (0 or 1)\r\n");
+    return;
+  }
+
+  val = strtol(arg, &endptr, 10);
+  if (endptr == arg || (val != 0 && val != 1))
+  {
+    send_line("ERR set_smoothing requires 0 or 1\r\n");
+    return;
+  }
+
+  g_smoothing_enabled = (uint8_t)val;
+  g_smooth_sum = 0;
+  g_smooth_count = 0U;
+
+  len = snprintf(resp, sizeof(resp), "OK smoothing=%ld\r\n", val);
+  if (len > 0)
+  {
+    send_line(resp);
+  }
+}
+
+/* set_axis2 0|1 -- toggles whether the second axis (dac_x <- cy) actively
+ * corrects (1, default) or just holds dac_x fixed at its bumpless-
+ * transfer base (0), without touching the primary axis at all. Added
+ * 2026-08-19 so a Y-axis step test can be run twice, identical otherwise,
+ * to directly check whether the second axis is doing anything useful. */
+static void cmd_set_axis2(const char *arg)
+{
+  long  val;
+  char *endptr;
+  char  resp[32];
+  int   len;
+
+  if (arg == NULL || arg[0] == '\0')
+  {
+    send_line("ERR set_axis2 requires an argument (0 or 1)\r\n");
+    return;
+  }
+
+  val = strtol(arg, &endptr, 10);
+  if (endptr == arg || (val != 0 && val != 1))
+  {
+    send_line("ERR set_axis2 requires 0 or 1\r\n");
+    return;
+  }
+
+  g_axis2_enabled = (uint8_t)val;
+
+  len = snprintf(resp, sizeof(resp), "OK axis2=%ld\r\n", val);
+  if (len > 0)
+  {
+    send_line(resp);
+  }
+}
+
+/* set_notch FREQ_MILLIHZ Q_MILLI -- configures and enables the resonance
+ * notch filter (see notch_filter_t above). Q_MILLI is Q*1000 (e.g. 3000
+ * = Q of 3.0); higher Q = narrower, more precise rejection but less
+ * forgiving of frequency-estimate error, lower Q = wider/more robust but
+ * eats into more of the surrounding spectrum. Assumes a fixed sample
+ * rate (see notch_configure's own docstring) -- same 457.5Hz this
+ * firmware's ts_s already assumes, kept consistent rather than
+ * independently configurable for now. */
+static void cmd_set_notch(const char *arg)
+{
+  long  freq_millihz, q_milli;
+  char *p = (char *)arg;
+  char *endptr;
+  char  resp[64];
+  int   len;
+
+  if (arg == NULL || arg[0] == '\0')
+  {
+    send_line("ERR set_notch requires FREQ_MILLIHZ Q_MILLI\r\n");
+    return;
+  }
+
+  freq_millihz = strtol(p, &endptr, 10);
+  if (endptr == p)
+  {
+    send_line("ERR invalid freq_millihz\r\n");
+    return;
+  }
+  p = endptr;
+  while (*p == ' ') { p++; }
+
+  q_milli = strtol(p, &endptr, 10);
+  if (endptr == p)
+  {
+    send_line("ERR invalid q_milli\r\n");
+    return;
+  }
+
+  if (freq_millihz <= 0 || q_milli <= 0)
+  {
+    send_line("ERR freq_millihz and q_milli must both be positive\r\n");
+    return;
+  }
+
+  g_notch_freq_millihz = (int32_t)freq_millihz;
+  g_notch_q_milli = (int32_t)q_milli;
+  notch_configure((float)g_notch_freq_millihz / 1000.0f, (float)g_notch_q_milli / 1000.0f, 457.5f);
+  g_notch.enabled = 1;
+
+  len = snprintf(resp, sizeof(resp), "OK notch_freq_millihz=%ld q_milli=%ld\r\n", freq_millihz, q_milli);
+  if (len > 0)
+  {
+    send_line(resp);
+  }
+}
+
+static void cmd_notch_off(void)
+{
+  g_notch.enabled = 0;
+  g_notch_freq_millihz = 0;
+  g_notch_q_milli = 0;
+  send_line("OK notch_off\r\n");
+}
+
+/* set_lead FZ_MILLIHZ FP_MILLIHZ -- configures and enables the lead
+ * compensator (see lead_filter_t above). FZ (zero) must be less than FP
+ * (pole) -- that ordering is what makes it a LEAD (phase-adding) network
+ * rather than a lag network; rejected explicitly rather than silently
+ * doing the wrong thing. Uses g_ctrl_rate_millihz for the sample rate
+ * (the REAL current control rate), not a hardcoded constant -- see this
+ * feature's block comment for why that matters. */
+static void cmd_set_lead(const char *arg)
+{
+  long  fz_millihz, fp_millihz;
+  char *p = (char *)arg;
+  char *endptr;
+  char  resp[64];
+  int   len;
+
+  if (arg == NULL || arg[0] == '\0')
+  {
+    send_line("ERR set_lead requires FZ_MILLIHZ FP_MILLIHZ\r\n");
+    return;
+  }
+
+  fz_millihz = strtol(p, &endptr, 10);
+  if (endptr == p)
+  {
+    send_line("ERR invalid fz_millihz\r\n");
+    return;
+  }
+  p = endptr;
+  while (*p == ' ') { p++; }
+
+  fp_millihz = strtol(p, &endptr, 10);
+  if (endptr == p)
+  {
+    send_line("ERR invalid fp_millihz\r\n");
+    return;
+  }
+
+  if (fz_millihz <= 0 || fp_millihz <= 0)
+  {
+    send_line("ERR fz_millihz and fp_millihz must both be positive\r\n");
+    return;
+  }
+  if (fz_millihz >= fp_millihz)
+  {
+    send_line("ERR fz_millihz must be less than fp_millihz (zero before pole, for phase LEAD)\r\n");
+    return;
+  }
+
+  g_lead_fz_millihz = (int32_t)fz_millihz;
+  g_lead_fp_millihz = (int32_t)fp_millihz;
+  lead_configure((float)g_lead_fz_millihz / 1000.0f, (float)g_lead_fp_millihz / 1000.0f,
+                 (float)g_ctrl_rate_millihz / 1000.0f);
+  g_lead.enabled = 1;
+
+  len = snprintf(resp, sizeof(resp), "OK lead_fz_millihz=%ld fp_millihz=%ld\r\n", fz_millihz, fp_millihz);
+  if (len > 0)
+  {
+    send_line(resp);
+  }
+}
+
+static void cmd_lead_off(void)
+{
+  g_lead.enabled = 0;
+  g_lead_fz_millihz = 0;
+  g_lead_fp_millihz = 0;
+  send_line("OK lead_off\r\n");
+}
+
 static void cmd_amp_enable(void)
 {
   amp_enable();
@@ -1604,7 +2564,7 @@ static void cmd_get_status(void)
   int16_t  tel_x_scaled, tel_y_scaled;
   uint32_t pkt_count, err_count, last_tel_tick, now;
   int32_t  dac_x, dac_y;
-  char     line[280];
+  char     line[520];  /* grown alongside TX_MSG_MAX_LEN, see that #define's comment */
   int      len;
 
   /* Same 2026-08-13 fix as the telemetry snapshot in main()'s while(1)
@@ -1648,7 +2608,12 @@ static void cmd_get_status(void)
                     "tel_x=%s%d.%01d tel_y=%s%d.%01d tel_seq=%u tel_status=%u "
                     "tel_age_ms=%lu pkts=%lu errs=%lu uptime=%lus "
                     "target_x_set=%u target_x=%s%d.%01d kp_milli=%ld ki_milli=%ld kd_milli=%ld "
-                    "fc_millihz=%ld sine=%u sine_freq_millihz=%ld\r\n",
+                    "fc_millihz=%ld out_limit=%ld ctrl_rate_millihz=%ld ctrl_interval_ms=%lu "
+                    "pulse_tick=%lu smoothing=%u axis2=%u "
+                    "notch=%u notch_freq_millihz=%ld notch_q_milli=%ld "
+                    "lead=%u lead_fz_millihz=%ld lead_fp_millihz=%ld "
+                    "open_sine=%u open_sine_freq_millihz=%ld "
+                    "sine=%u sine_freq_millihz=%ld\r\n",
                     (g_mode == MODE_OPEN_LOOP) ? "open_loop" : "closed_loop",
                     (unsigned)amp_en, (unsigned)estop_latched,
                     (long)dac_x, (long)dac_y,
@@ -1659,7 +2624,13 @@ static void cmd_get_status(void)
                     (unsigned long)(now / 1000U),
                     (unsigned)g_target_x_set, tgt_sign, tgt_whole, tgt_frac,
                     (long)g_kp_milli, (long)g_ki_milli, (long)g_kd_milli,
-                    (long)g_fc_millihz,
+                    (long)g_fc_millihz, (long)g_out_limit_counts,
+                    (long)g_ctrl_rate_millihz, (unsigned long)g_control_interval_ms,
+                    (unsigned long)g_pulse_step_tick, (unsigned)g_smoothing_enabled,
+                    (unsigned)g_axis2_enabled,
+                    (unsigned)g_notch.enabled, (long)g_notch_freq_millihz, (long)g_notch_q_milli,
+                    (unsigned)g_lead.enabled, (long)g_lead_fz_millihz, (long)g_lead_fp_millihz,
+                    (unsigned)g_open_sine_active, (long)g_open_sine_freq_millihz,
                     (unsigned)g_sine_active, (long)g_sine_freq_millihz);
   }
   if (len > 0)
