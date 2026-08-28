@@ -217,6 +217,23 @@ static uint32_t g_control_interval_ms = 0;   /* 0 = unthrottled (fires on every 
                                           * can't silently drift apart the way DIAG_CONTROL_INTERVAL_MS
                                           * and ts_s did. */
 static uint32_t g_last_ctrl_step_tick = 0;
+/* Monotonic, unconditional count of real run_closed_loop_step() firings
+ * (primary axis, dac_y<-cx) -- added 2026-08-27 to replace two flawed
+ * throughput/jitter proxies found the same day: (1) detecting dac_y
+ * VALUE CHANGES as a firing proxy, which goes blind whenever a real
+ * firing's correction rounds to the same integer (near-settled periods),
+ * silently undercounting; (2) comparing this EMA-smoothed
+ * meas_ctrl_rate_millihz (a near-instantaneous recent-rate snapshot)
+ * directly against a true window-averaged raw packet rate, which can
+ * (and did, at 102%) produce a nonsensical ratio since the two are
+ * different statistics over different effective windows. This counter
+ * increments exactly once per REAL firing, unconditionally -- no proxy,
+ * no averaging. Relayed per-packet as cseq= (see the telemetry print in
+ * main()) alongside tick=, so a host script can directly count exact
+ * firings over any window (last_cseq-first_cseq) and get true per-firing
+ * intervals from consecutive increments' tick= values, with no gating on
+ * dac_y or any derived rate. */
+static uint32_t g_ctrl_step_seq = 0;
 static int32_t  g_ctrl_rate_millihz = 457500;  /* informational, reported via get_status -- matches
                                           * whatever ts_s the PID was last constructed with */
 static int32_t  g_smooth_sum = 0;      /* running sum of tel_x_scaled (POSITION_SCALE-scaled)
@@ -814,7 +831,7 @@ int main(void)
       int16_t  y;
       uint32_t pkt_count;
       uint32_t err_count;
-      char     line[140];
+      char     line[165];  /* grown 140->165 2026-08-27 for cseq= (see g_ctrl_step_seq) */
       int      len;
 
       /* Snapshot under a brief IRQ-disable so a new packet landing
@@ -877,6 +894,7 @@ int main(void)
               || (HAL_GetTick() - g_last_ctrl_step_tick) >= g_control_interval_ms))
       {
         uint32_t ctrl_now = HAL_GetTick();
+        g_ctrl_step_seq++;  /* real, unconditional firing count -- see its own docstring */
         int16_t  ctrl_x = x;
 
         if (g_smoothing_enabled && g_smooth_count > 0U)
@@ -964,12 +982,13 @@ int main(void)
         uint32_t tick_now = HAL_GetTick();
 
         len = snprintf(line, sizeof(line),
-                        "seq=%3u status=%u x=%s%d.%01d y=%s%d.%01d tgt=%s%d.%01d dac_y=%ld tick=%lu pkts=%lu errs=%lu\r\n",
+                        "seq=%3u status=%u x=%s%d.%01d y=%s%d.%01d tgt=%s%d.%01d dac_y=%ld tick=%lu pkts=%lu errs=%lu cseq=%lu\r\n",
                         (unsigned)seq, (unsigned)status,
                         x_sign, x_whole, x_frac, y_sign, y_whole, y_frac,
                         tgt_sign, tgt_whole, tgt_frac,
                         (long)g_last_dac_y, (unsigned long)tick_now,
-                        (unsigned long)pkt_count, (unsigned long)err_count);
+                        (unsigned long)pkt_count, (unsigned long)err_count,
+                        (unsigned long)g_ctrl_step_seq);
       }
       if (len > 0)
       {

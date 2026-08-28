@@ -5581,6 +5581,195 @@ still accurate); the lead-compensator investigation, still open and
 unrelated to any of today's fixes; Bode/ring-down on the other axis,
 flagged in the entry above, still not started.
 
+### Revert-and-retest: double precision ruled out as the cause of the Ki=500 divergence/settling regression; two flawed measurement methods found and fixed while chasing an honest double-vs-float comparison; a new firmware ground-truth counter built; ring-down re-run on both axes and the resonance has moved from 38.5Hz to ~47-50Hz (2026-08-27)
+
+Direct follow-up to the entry above: with float+`-O2` landed, a real Ki=500
+closed-loop divergence/settling regression turned up (still diverges,
+where it was historically clean), and it wasn't clear whether float
+precision itself was a contributing factor or whether it was purely
+mechanical (a hysteresis issue found and mostly fixed earlier the same
+day via cable straightening + manual actuator jogging). User's framing:
+**"revert and retest, let's just be sure."**
+
+**Revert done properly, isolating ONLY the precision variable.**
+`PIDController.hpp`/`pid_wrapper.h`/`.cpp`/`main.c`'s call sites reverted
+double→float, deliberately keeping `-O2` (the build-optimization change)
+constant — reverting that too would have re-conflated two variables
+instead of isolating one. Rebuilt (`.text` 31468→34612 bytes, consistent
+with double-emulation code reappearing), reflashed (hit the by-now-
+routine post-reflash silence glitch once, resolved by reflashing again,
+as it always has this session).
+
+**Result: identical behavior under double, both tests.** Kp=1.75/Ki=500,
+axis2 on: **diverged**, `max_dev=387.9px` — essentially the same
+magnitude as the float build's 390.5px. Kp=1.75/Ki=200: **clean but
+slow**, 17.0% overshoot / 2988ms settle — matching the float build's
+post-mechanical-fix pattern closely. **Float precision is ruled out as
+the cause of the Ki=500 regression** — same divergence, same character,
+under double. The regression is mechanical (or at least not explained by
+precision), consistent with the hysteresis finding from earlier the same
+day. Restored float+`-O2` afterward (`git checkout` on the three files
+that matched HEAD exactly; `main.c` needed the double→float edits
+reapplied by hand since it also carries unrelated same-day changes that
+must NOT be reverted — the self-calibrating notch/lead EMA and the lead
+compensator).
+
+**Follow-up thread: fixing a slide claiming this precision switch also
+improved timing "consistency" (jitter/CV) — this uncovered real, deeper
+measurement problems, not just noise.** The existing slide's chart
+(`scratch_ctrl_jitter_check.py`, built earlier this session) compared
+**full-rate vs. throttled-200Hz**, both already under the float+`-O2`
+build — never actually a before/after precision comparison at all, and
+its "CV roughly halved" claim quoted older, differently-sourced numbers
+presented as if they were a controlled result. User caught this
+directly ("slide 19 shouldn't include throttled, it should compare
+before and after the switch to single precision — and what is meant by
+'CV' on that slide?"). CV = coefficient of variation (std/mean) of the
+firing-interval distribution, a measure of timing regularity.
+
+**Attempt 1 (flawed): a fresh double-vs-float jitter histogram via
+`dac_y`-value-change detection.** Same method `scratch_ctrl_jitter_check.py`
+already used (detect when `dac_y`, the DAC-register output, changes
+value, treat that as a "firing"). Result was wildly noisy even across
+repeated trials on the IDENTICAL build — float CV ranged 88-127% across
+3 back-to-back trials at Kp=1.75/Ki=15/full-rate, nothing like a stable
+number. **User identified the root cause precisely, unprompted**: "only
+measuring dac_y changes instead of firings of the PID loop is a critical
+mistake." Correct — during near-settled periods the loop keeps firing
+every packet, but the correction often rounds to the same integer DAC
+count, so real firings go structurally invisible to this method. Not
+sampling noise — a wrong measurement, and it retroactively invalidated
+the ORIGINAL slide's "CV halved" claim too (same method), not just
+today's fresh attempt.
+
+**Attempt 2 (also flawed, self-caught): a throughput-fraction comparison
+using `meas_ctrl_rate_millihz` (the firmware's EMA of recent firing
+rate) divided by a host-measured windowed-average raw packet rate.**
+Produced a **102% reading** — impossible if "control steps fired" is
+truly bounded by "packets arrived." Root cause: `meas_ctrl_rate_millihz`
+is a near-instantaneous EMA snapshot (~20-sample window) at the moment
+of the LAST reply, while the raw-rate denominator was a true average
+over the full ~4.5s measurement window — two different statistics over
+different effective time spans, not directly comparable as a ratio.
+Caught before the slide was rebuilt around it a second time; user's
+reaction was blunt and fair ("we've made a bit of a mess... I'm not
+confident in any of this now") — correctly so, two flawed methods in a
+row.
+
+**Real fix: a new firmware ground-truth counter, `g_ctrl_step_seq`
+(`main.c`), per the user's own suggested design** ("number each sample
+end to end and plainly see skipped numbers"). A plain `uint32_t`,
+incremented unconditionally exactly once per real `run_closed_loop_step()`
+firing (no proxy, no averaging), relayed per-packet as a new `cseq=`
+telemetry field alongside the existing `tick=`. Firing count over any
+window is now a plain integer subtraction (`last_cseq - first_cseq`);
+real per-firing intervals come directly from consecutive increments'
+`tick=` deltas, with no gating on `dac_y` or any derived rate. `line[]`
+grown 140→165 bytes for the new field. Build clean, `.text` 31468→31500
+(float+`-O2`+counter). **`scratch_cseq_measurement.py`** built as the
+new host-side driver (repo root, not committed, matches this session's
+scratch-script convention).
+
+**First run with the new counter immediately surfaced a second real,
+previously-invisible bug**: 4-8% of telemetry LINES were being lost in
+transit per trial (83-163 of ~2000 lines), confirmed via the Pi's own
+relayed `seq=` byte (u8, wraps) showing real gaps. This had been
+silently undercounting the denominator in every earlier measurement this
+session that counted captured lines rather than trusting embedded
+sequence data — exactly what produced the impossible >100% reading.
+Fixed the analysis (not the line loss itself, which is a separate,
+unexplored TX-queue/host-read-timing question) by using the unwrapped
+`pi_seq` delta as the raw-packet-count denominator instead of counting
+captured lines — robust to line loss, since whatever DID arrive still
+carries the true cumulative count. Also added a tick-delta sanity filter
+(reject any inter-sample gap >500ms) after finding one genuinely
+corrupted/torn line (two lines' bytes concatenated across a lost read)
+had produced a 10,200-*second* fake "interval" that blew up the naive
+CV to 8+ million percent — syntactically valid per the regex, semantically
+garbage.
+
+**Clean result, 3 trials each, `-O2` held constant on both sides:**
+
+| | double, `-O2` | float, `-O2` (current) |
+|---|---|---|
+| throughput fraction per trial | 94.7%, 95.3%, 95.3% | 100%, 77.8%, 100% |
+| pooled firing-interval CV | 26.6% (n=6330) | 37.4% (n=5814) |
+| pooled mean interval | 2.30ms | 2.20ms |
+
+No impossible values, no massive outliers, tight and reproducible across
+all 3 double trials specifically. **This does not support the original
+slide's "float is faster and more consistent" claim** — if anything,
+double reads tighter here. Net honest conclusion: `-O2` is doing the
+real work (both precisions land in the 78-100% range, both far above the
+`-O0` baseline's documented ~64-66%); whether float adds anything
+further on top of `-O2` is genuinely unresolved by this data (n=3 per
+condition, one float trial notably lower than the other two). **Slide
+19 pulled from the deck entirely** (`python-pptx` slide removal via
+`_sldIdLst`/`drop_rel`, zip integrity verified afterward — no orphaned
+parts, matching this project's established safe-removal recipe) rather
+than left in a still-shaky state. `results/fta_cseq_jitter_final.png`
+holds the real histogram; `results/fta_precision_before_after.png`,
+`fta_o2_vs_precision_credit.png`, `fta_precision_jitter_histogram.png`
+are earlier, superseded/flawed attempts, deliberately NOT committed.
+
+**Ring-down test generalized to both axes and re-run — a further real,
+reproducible finding.** `fta_ringdown_test.py` gained `--axis x|y`
+(x=pulse `dac_y`/watch `cx`, the original/primary pathway; y=pulse
+`dac_x`/watch `cy`, never ring-down-tested before) and folded in the
+model-free peak/trough-spacing frequency estimate as the PRIMARY result
+(previously only an ad hoc side script, `scratch_ringdown_peak_analysis.py`,
+built 2026-08-19 after `curve_fit` converged on the wrong answer twice on
+the same data) — `curve_fit`'s fit is now reported as secondary/for
+damping-ratio only. Needed a `TELEMETRY_RE` fix first (same "add a wire
+field, forget the other consuming script" class of bug this project has
+hit repeatedly — `cseq=` broke this script's regex the same way `tgt=`/
+`dac_y=`/`tick=` broke others before it).
+
+**x-axis (dac_y→cx, primary): 47.3Hz, then 47.0Hz on an immediate
+repeat** — tight, reproducible (`curve_fit` gave nonsense both times,
+zeta≈1.0, confirming it's still not trustworthy here, consistent with
+this project's established finding). **y-axis (dac_x→cy, second axis,
+first-ever ring-down): 50.1Hz, one trial.** Both axes land close to each
+other, notably NOT close to the previously-documented 38.5Hz. Since both
+today's measurements and the original 38.5Hz used the same trustworthy
+tick-timestamped peak-spacing method (not the older, since-discredited
+host-timestamp-bucketed approach), this reads as a real, reproducible
+shift in the physical resonance since that measurement was taken, not a
+methodology artifact — worth stating plainly if this goes into a
+bench-vs-FEA comparison, not silently swapped in as if it were always
+the number.
+
+**Real cosmetic bug found and fixed while reviewing the y-axis plot**:
+the "amp on" marker (`rise_idx = argmax(x)`) assumed the driven excursion
+is always a rise — true for the positive-gain x-axis, wrong for the
+y-axis, whose locked-optics-calibration gain is NEGATIVE (dac_x→cy:
+-0.104 px/count, 2026-08-12) — so the real driven excursion there is a
+dip, and `argmax` was landing on an unrelated later feature. Fixed to
+pick whichever of max/min is further from the pre-pulse baseline,
+regardless of sign. Purely a plot annotation — never affected the actual
+fit-window anchor (`argmin`-based, already sign-agnostic) or the
+frequency measurement itself.
+
+**State left**: hardware safely idle (`mode=open_loop amp=0 estop=0
+dac_x=95 dac_y=95`) after every test, confirmed via `get_status`.
+Firmware is float+`-O2`+the new `g_ctrl_step_seq`/`cseq=` counter — the
+committed double↔float question is resolved (float is fine, keep it;
+`-O2` is the real throughput fix); the `cseq` counter addition and
+`fta_ringdown_test.py`'s axis/peak-spacing generalization are new,
+real, keep-worthy changes pending commit. `docs/session_results_2026-08-18_pid_tuning.pptx`
+has slide 19 removed (zip-integrity-verified).
+
+**Not yet done**: the physical cause of the 38.5Hz→~47-50Hz resonance
+shift (rig change? cable/hysteresis fix side effect? never investigated
+further); the y-axis resonance has only one trial, unlike x's two
+matching runs — worth a repeat before trusting it equally; the
+double-vs-float `-O2` throughput-fraction question is still only 3
+trials per side, with one float outlier (77.8%) unexplained; whether the
+real ~4-8% VCP line loss found via the `cseq`/`pi_seq` cross-check is
+itself worth root-causing (TX queue depth? host read timing?) is
+untouched; the Ki=500 divergence's actual mechanical root cause (beyond
+"not float") remains unconfirmed.
+
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 
 Frequency-domain complement to the step-response tests, motivated by the
