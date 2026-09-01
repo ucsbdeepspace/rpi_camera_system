@@ -558,6 +558,11 @@ static int32_t  g_open_sine_center_counts  = 0;
 static int32_t  g_open_sine_amplitude_counts = 0;
 static int32_t  g_open_sine_freq_millihz   = 0;
 static uint32_t g_open_sine_start_tick     = 0;
+/* which DAC axis the open-loop sine drives -- 2026-09-01, added to
+ * characterize the second (dac_x -> cy) pathway the same way as the
+ * primary one; defaults to AXIS_Y so any existing script that omits the
+ * new optional 4th start_open_sine argument keeps its old behavior. */
+static fta_axis_t g_open_sine_axis         = AXIS_Y;
 
 /* Single-byte interrupt-driven VCP (USART2) receive, re-armed on every
  * completion/error -- same one-shot-then-rearm pattern as the I2C
@@ -867,7 +872,8 @@ int main(void)
       int16_t  y;
       uint32_t pkt_count;
       uint32_t err_count;
-      char     line[165];  /* grown 140->165 2026-08-27 for cseq= (see g_ctrl_step_seq) */
+      char     line[190];  /* grown 140->165 2026-08-27 for cseq= (see g_ctrl_step_seq),
+                            * 165->190 2026-09-01 for dac_x= (see g_last_dac_x below) */
       int      len;
 
       /* Snapshot under a brief IRQ-disable so a new packet landing
@@ -998,7 +1004,14 @@ int main(void)
          * hardware setpoint, not a pixel measurement. Reporting it lets
          * a host-side plot show the real actuator command alongside the
          * resulting cx/tgt trace, instead of having to infer it from the
-         * control law offline. */
+         * control law offline.
+         *
+         * g_last_dac_x added 2026-09-01, same reasoning, needed so the
+         * open-loop Bode test can fit against a per-sample ground-truth
+         * commanded value when driving dac_x (axis=0) via the newly
+         * axis-selectable start_open_sine -- previously only dac_y was
+         * relayed, which worked for the already-characterized dac_y->cx
+         * pathway but left no ground truth for a dac_x-driven sweep. */
 
         /* tick_now: added 2026-08-19 after finding host-side arrival
          * timestamps are unusable for fine-grained timing analysis --
@@ -1018,11 +1031,11 @@ int main(void)
         uint32_t tick_now = HAL_GetTick();
 
         len = snprintf(line, sizeof(line),
-                        "seq=%3u status=%u x=%s%d.%01d y=%s%d.%01d tgt=%s%d.%01d dac_y=%ld tick=%lu pkts=%lu errs=%lu cseq=%lu\r\n",
+                        "seq=%3u status=%u x=%s%d.%01d y=%s%d.%01d tgt=%s%d.%01d dac_y=%ld dac_x=%ld tick=%lu pkts=%lu errs=%lu cseq=%lu\r\n",
                         (unsigned)seq, (unsigned)status,
                         x_sign, x_whole, x_frac, y_sign, y_whole, y_frac,
                         tgt_sign, tgt_whole, tgt_frac,
-                        (long)g_last_dac_y, (unsigned long)tick_now,
+                        (long)g_last_dac_y, (long)g_last_dac_x, (unsigned long)tick_now,
                         (unsigned long)pkt_count, (unsigned long)err_count,
                         (unsigned long)g_ctrl_step_seq);
       }
@@ -2053,20 +2066,25 @@ static void update_sine_target(uint32_t now)
   g_target_x_scaled = (int32_t)(center_scaled + amplitude_scaled * sinf(phase));
 }
 
-/* start_open_sine FREQ_MILLIHZ AMPLITUDE_COUNTS CENTER_COUNTS -- drives
- * dac_y directly as a sine, bypassing the PID entirely (see this
- * feature's docstring by the g_open_sine_* globals above). Only valid in
- * MODE_OPEN_LOOP -- rejected in closed_loop the same way cmd_set_axis
- * rejects a manual set_y there, since dac_y is under PID control in that
- * mode and this would just fight it. Parsing mirrors cmd_start_sine's
- * hand-rolled three-integer parse (process_command_line only splits on
- * the first space). */
+/* start_open_sine FREQ_MILLIHZ AMPLITUDE_COUNTS CENTER_COUNTS [AXIS] --
+ * drives dac_y (or dac_x if AXIS=0 is given) directly as a sine,
+ * bypassing the PID entirely (see this feature's docstring by the
+ * g_open_sine_* globals above). AXIS is optional (0=x, 1=y, matching
+ * fta_axis_t) and defaults to 1 (y) if omitted, so every existing
+ * 3-argument caller keeps driving dac_y exactly as before -- added
+ * 2026-09-01 to characterize the dac_x->cy pathway the same way as the
+ * already-characterized dac_y->cx one. Only valid in MODE_OPEN_LOOP --
+ * rejected in closed_loop the same way cmd_set_axis rejects a manual
+ * set_y/set_x there, since both DAC channels are under PID control in
+ * that mode and this would just fight it. Parsing mirrors
+ * cmd_start_sine's hand-rolled integer parse (process_command_line only
+ * splits on the first space). */
 static void cmd_start_open_sine(const char *arg)
 {
-  long  freq_millihz, amplitude_counts, center_counts;
+  long  freq_millihz, amplitude_counts, center_counts, axis_arg;
   char *p = (char *)arg;
   char *endptr;
-  char  resp[80];
+  char  resp[100];
   int   len;
 
   if (g_mode != MODE_OPEN_LOOP)
@@ -2105,6 +2123,22 @@ static void cmd_start_open_sine(const char *arg)
     send_line("ERR invalid center_counts\r\n");
     return;
   }
+  p = endptr;
+  while (*p == ' ') { p++; }
+
+  /* AXIS is optional -- if strtol finds nothing (endptr == p, e.g. an
+   * empty/whitespace-only remainder), keep the default AXIS_Y rather
+   * than erroring, so old 3-argument callers are unaffected. */
+  axis_arg = strtol(p, &endptr, 10);
+  if (endptr == p)
+  {
+    axis_arg = (long)AXIS_Y;
+  }
+  if (axis_arg != (long)AXIS_X && axis_arg != (long)AXIS_Y)
+  {
+    send_line("ERR axis must be 0 (x) or 1 (y)\r\n");
+    return;
+  }
 
   if (freq_millihz <= 0)
   {
@@ -2115,12 +2149,13 @@ static void cmd_start_open_sine(const char *arg)
   g_open_sine_freq_millihz      = (int32_t)freq_millihz;
   g_open_sine_amplitude_counts  = (int32_t)amplitude_counts;
   g_open_sine_center_counts     = (int32_t)center_counts;
+  g_open_sine_axis              = (fta_axis_t)axis_arg;
   g_open_sine_start_tick        = HAL_GetTick();
   g_open_sine_active            = 1;
 
   len = snprintf(resp, sizeof(resp),
-                  "OK open_sine_started freq_millihz=%ld amplitude=%ld center=%ld start_tick=%lu\r\n",
-                  freq_millihz, amplitude_counts, center_counts, (unsigned long)g_open_sine_start_tick);
+                  "OK open_sine_started freq_millihz=%ld amplitude=%ld center=%ld axis=%ld start_tick=%lu\r\n",
+                  freq_millihz, amplitude_counts, center_counts, axis_arg, (unsigned long)g_open_sine_start_tick);
   if (len > 0)
   {
     send_line(resp);
@@ -2151,7 +2186,7 @@ static void update_open_sine_dac(uint32_t now)
   float value = (float)g_open_sine_center_counts
                 + (float)g_open_sine_amplitude_counts * sinf(phase);
 
-  apply_dac(AXIS_Y, (int32_t)value);
+  apply_dac(g_open_sine_axis, (int32_t)value);
 }
 
 /* Kp/Ki/Kd are taken as milli-units integers (e.g. "set_kp 2500" ->
@@ -2789,7 +2824,7 @@ static void cmd_get_status(void)
                     "notch=%u notch_freq_millihz=%ld notch_q_milli=%ld "
                     "lead=%u lead_fz_millihz=%ld lead_fp_millihz=%ld "
                     "meas_ctrl_rate_millihz=%ld "
-                    "open_sine=%u open_sine_freq_millihz=%ld "
+                    "open_sine=%u open_sine_freq_millihz=%ld open_sine_axis=%u "
                     "sine=%u sine_freq_millihz=%ld\r\n",
                     (g_mode == MODE_OPEN_LOOP) ? "open_loop" : "closed_loop",
                     (unsigned)amp_en, (unsigned)estop_latched,
@@ -2810,6 +2845,7 @@ static void cmd_get_status(void)
                     (unsigned)g_lead.enabled, (long)g_lead_fz_millihz, (long)g_lead_fp_millihz,
                     (long)(1000000.0f / g_measured_ctrl_interval_ms),
                     (unsigned)g_open_sine_active, (long)g_open_sine_freq_millihz,
+                    (unsigned)g_open_sine_axis,
                     (unsigned)g_sine_active, (long)g_sine_freq_millihz);
   }
   if (len > 0)

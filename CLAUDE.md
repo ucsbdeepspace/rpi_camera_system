@@ -6037,6 +6037,47 @@ Follow-up to the user's sharp question: "are we sure it's handling dt correctly,
 
 **State left**: hardware safely idle (`mode=open_loop amp=0 estop=0 dac_x=95(bumpless-transfer leftover on dac_x, harmless with amp off) dac_y=95`), confirmed via `get_status` after every trial. `PIDController.hpp`'s derivative-on-measurement fix is the one real, kept change from this entry — committed separately from the (reverted, not kept) dt-aware notch/lead attempt. Raw D-term retest data: `results/fta_dfix_*.npz`/`.png` (not yet committed as of this entry). **Not yet done**: root-causing the `set_fc` anomaly; a proper Kd/fc 2D sweep now that the catastrophic-failure confound is removed (only 6 points tried, all at fc=10Hz except the two Kd=0 references); whether D ever becomes net-beneficial at some (Kd, fc) combination not yet tried, now that the kick confound is gone — genuinely open again, not closed the way the pre-fix testing implied.
 
+### First-ever open-loop Bode sweep on the second axis (dac_x -> cy) — real, clean 18-point data, and its resonance peak (~47-50Hz) closely corroborates the earlier ring-down remeasurement on the same axis (2026-09-01, same day)
+
+Direct continuation of "what to try now" — axis 2 (dac_x -> cy) has never had a proper frequency-response characterization, only a single-step smoke test and one ring-down trial (50.1Hz, see "Ring-down test generalized to both axes" above). The existing open-loop Bode tooling (`start_open_sine`/`fta_open_loop_bode_test.py`, built 2026-08-19) was hardcoded to drive `dac_y` only, so this needed real firmware extension, not just a new host-side flag.
+
+**Firmware changes** (`main.c`): `start_open_sine` now takes an optional 4th argument, `AXIS` (0=x, 1=y, matching `fta_axis_t`), defaulting to 1 (y) so every existing 3-argument caller is unaffected — `g_open_sine_axis` global, consumed by `update_open_sine_dac()`'s `apply_dac()` call. `get_status` gained `open_sine_axis=` for ground-truth visibility (same pattern as every other live-tunable feature this project has added). **A real gap found while wiring this up**: the per-packet telemetry relay line only ever reported `dac_y=`, never `dac_x=` — fine for the already-characterized `dac_y->cx` pathway, but it meant a `dac_x`-driven sweep would have no per-sample ground-truth commanded value to fit against (the whole "fit both traces, diff cancels" trick this test method relies on needs a REPORTED command on the same timebase, not an assumed one). Added `dac_x=%ld` (from `g_last_dac_x`) to the telemetry line, `line[]` grown 165->190 for headroom. Build clean, `.text` grew ~31596->31816 across the two build passes (axis-selectable sine + the telemetry field), flashed, confirmed alive/idle both times via `get_status`.
+
+**`fta_open_loop_bode_test.py` extended with `--axis x|y`** (default y, unchanged behavior): `TELEMETRY_RE` updated for the new `dac_x=` field; `_reader_thread` picks measured=x/commanded=dac_y for axis=y or measured=y/commanded=dac_x for axis=x; `run_one_frequency` sends `set_x`/`set_y` and the new 4th `start_open_sine` argument accordingly, and `verify_open_sine_state` now also confirms `open_sine_axis` matches before trusting a start was real; `emergency_cleanup` resets both `set_x 95` and `set_y 95` now (belt-and-suspenders, matches the existing pattern elsewhere in this project); plot titles/labels and the default `--out-prefix` (auto-suffixed `_xaxis` unless the user overrides it) are axis-aware so an x-axis sweep can't be visually or file-name-confused with a y-axis one, or silently overwrite one.
+
+**Validated with a single point first (10Hz, axis=x)** before committing to a full sweep: gain=0.0792 px/count, a real, distinct value from axis y's ~0.089-0.093 at the same frequency — confirms the new measurement path is actually exercising the second, physically different pathway, not accidentally re-measuring the first. The raw wrapped lag read as a "negative" -39.6ms, which looked alarming in isolation but is the same known single-tone wraparound ambiguity this project has flagged repeatedly (a passive system can't truly lead its command; a wrapped negative lag near a period boundary just needs a full sweep to unwrap correctly) -- not investigated as a bug, since it resolved cleanly once the full sweep was run.
+
+**Full 18-point sweep, 1-55Hz, amplitude=150 counts, base_dac=2048** (same grid and amplitude as the fresh axis-y sweep earlier this session), all 18 points succeeded:
+
+| freq (Hz) | gain (px/count) | lag (deg, unwrapped) |
+|---|---|---|
+| 1 | 0.0814 | -173.5 |
+| 2 | 0.0799 | -170.0 |
+| 3 | 0.0732 | -163.8 |
+| 5 | 0.0773 | -159.1 |
+| 7 | 0.0761 | -152.9 |
+| 10 | 0.0754 | -145.2 |
+| 13 | 0.0826 | -130.0 |
+| 15 | 0.0847 | -122.8 |
+| 18 | 0.0856 | -110.2 |
+| 20 | 0.0906 | -103.6 |
+| 25 | 0.1016 | -84.3 |
+| 30 | 0.1209 | -64.1 |
+| 35 | 0.1460 | -39.3 |
+| 40 | 0.1967 | -17.0 |
+| 44 | 0.3156 | 3.2 |
+| **47** | **0.6342** | 41.3 |
+| **50** | **0.6384** | 132.6 |
+| 55 | 0.2052 | -173.7 (near-resonance aliasing, see below) |
+
+**Real, cross-validated resonance found: peak gain 0.63-0.64 px/count at 47-50Hz** (grid-limited to that 3Hz window, true peak could sit anywhere inside it) — an ~8x amplification over the ~0.07-0.08 px/count low-frequency baseline. **This closely matches the ring-down remeasurement already on record for this exact pathway (50.1Hz, single trial, "Revert-and-retest" entry above)** — two independently-different methods (forced swept-sine here, free decay there) landing on essentially the same number is the same kind of strong cross-validation that established the primary axis's resonance figure. **Notably gentler than the primary axis's resonance**: axis 1 peaked at ~11x its own DC gain (0.997 vs ~0.09 px/count); axis 2 peaks at ~8x (0.64 vs ~0.08) -- a real, lower-Q, less severe peak, not just a smaller number by coincidence of units. Both axes' resonances land in the same rough 40-50Hz neighborhood -- worth flagging for the FEA/flexure-redesign work already in progress (see the FEA-vs-bench slides): this isn't a problem unique to one axis, and it's worth checking whether the two axes share a common physical mode (e.g. a flexure cross-coupling resonance) or are genuinely independent before finalizing a stiffening design that might only address one.
+
+**One thing that looks odd but isn't a new bug, flagged so it isn't mistaken for one later**: unlike axis y's fresh sweep (which started near 6° lag at 1Hz), axis x's unwrapped phase starts near -170° even at 1Hz. Expected, not investigated further: axis x's static gain is already established as NEGATIVE (dac_x's effect on cy is -0.104 px/count, locked-optics calibration, 2026-08-12) -- a negative gain is mathematically indistinguishable from a ~180° phase offset in a single-tone fit with no external sign reference, the exact phenomenon this project already root-caused and fixed once before (see "RESOLVED (2026-08-06): the 'large phase lag' below was a sign-unaware analysis bug"). `fit_bode_point()` doesn't take an explicit sign reference the way that earlier fix's `fit_sine()` eventually did -- this doesn't need fixing for the gain/resonance conclusions above (magnitude is sign-independent) but would need addressing if this axis's absolute phase/lag numbers are ever load-bearing for a future compensator design.
+
+Combined summary figure: `results/fta_open_loop_bode_xaxis_summary.png`. Per-frequency 2x2 diagnostic plots (full-duration + zoomed, both measured cy and commanded dac_x, fit overlaid): `results/fta_open_loop_bode_xaxis_<freq>Hz_<timestamp>.png`/`.npz`.
+
+**State left**: hardware safely idle (`mode=open_loop amp=0 estop=0 dac_x=95 dac_y=95`), confirmed via `get_status` after the sweep. Firmware (`start_open_sine` AXIS arg, `dac_x=` telemetry field, `open_sine_axis=` status field) and `fta_open_loop_bode_test.py`'s `--axis` support are both new, tested, and ready to commit. **Not yet done**: a ring-down repeat on axis x (still only one trial, per the still-open item from "Revert-and-retest" above); resolving the true peak location within the unsampled 47-50Hz gap (a finer-grid sub-sweep, e.g. 46/47/48/49/50Hz, would resolve this cheaply); whether axis x's resonance interacts with axis y's the way a shared mechanical mode would predict (would need a cross-axis excitation test -- drive one axis, watch the other's resonance response -- not attempted); using this real axis-x data for any compensator/notch design the way axis y's data has already been used, if axis 2 tuning is ever pursued more seriously than its current "holds steady, prevents drift" role.
+
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 
 Frequency-domain complement to the step-response tests, motivated by the

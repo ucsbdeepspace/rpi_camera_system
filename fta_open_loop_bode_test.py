@@ -57,9 +57,12 @@ FTA_BAUD = 460800
 MICRONS_PER_PIXEL = 3.0  # OV9281 pixel pitch, same constant used throughout this project.
 
 REPLY_RE = re.compile(r"^(OK|ERR|STATUS|WARN)\b")
+# dac_x= added 2026-09-01 alongside the axis-selectable open-loop sine
+# generator -- previously only dac_y was relayed per-packet, which had no
+# ground truth for a dac_x-driven (axis=x) sweep.
 TELEMETRY_RE = re.compile(
     r"^seq=\s*(\d+)\s+status=(\d+)\s+x=(-?\d+\.\d)\s+y=(-?\d+\.\d)\s+"
-    r"tgt=(-?\d+\.\d)\s+dac_y=(-?\d+)\s+tick=(\d+)\s+pkts=(\d+)\s+errs=(\d+)\s+cseq=(\d+)$")
+    r"tgt=(-?\d+\.\d)\s+dac_y=(-?\d+)\s+dac_x=(-?\d+)\s+tick=(\d+)\s+pkts=(\d+)\s+errs=(\d+)\s+cseq=(\d+)$")
 # Core fields only required for the connectivity/amp check -- open_sine
 # fields are read separately with retries, same reasoning as the
 # 2026-08-19 fix in fta_closed_loop_onboard_sine_test.py (a corrupted/
@@ -72,6 +75,7 @@ STATUS_FIELD_RE = {
     "tel_age_ms": re.compile(r"tel_age_ms=(\d+)"),
     "open_sine": re.compile(r"open_sine=(\d+)"),
     "open_sine_freq_millihz": re.compile(r"open_sine_freq_millihz=(-?\d+)"),
+    "open_sine_axis": re.compile(r"open_sine_axis=(\d+)"),
 }
 CORE_STATUS_FIELDS = ("dac_x", "dac_y", "amp", "tel_x", "tel_age_ms")
 ALL_STATUS_FIELDS = tuple(STATUS_FIELD_RE.keys())
@@ -142,6 +146,7 @@ def get_status(ser, retries=20, required=ALL_STATUS_FIELDS):
         if all(matches[k] for k in required):
             os_m = matches["open_sine"]
             osf_m = matches["open_sine_freq_millihz"]
+            osa_m = matches["open_sine_axis"]
             return {
                 "dac_x": int(matches["dac_x"].group(1)),
                 "dac_y": int(matches["dac_y"].group(1)),
@@ -150,6 +155,7 @@ def get_status(ser, retries=20, required=ALL_STATUS_FIELDS):
                 "tel_age_ms": int(matches["tel_age_ms"].group(1)),
                 "open_sine": int(os_m.group(1)) if os_m else 0,
                 "open_sine_freq_millihz": int(osf_m.group(1)) if osf_m else 0,
+                "open_sine_axis": int(osa_m.group(1)) if osa_m else 1,
             }
     raise RuntimeError("No parseable get_status reply after several attempts.")
 
@@ -192,7 +198,14 @@ def fit_bode_point(t, measured_x, commanded_dac_y, freq):
     }
 
 
-def _reader_thread(ser, records, stop_event):
+def _reader_thread(ser, records, stop_event, axis="y"):
+    """axis='y' (default, dac_y->cx pathway): measured=x (group 3),
+    commanded=dac_y (group 6). axis='x' (dac_x->cy pathway): measured=y
+    (group 4), commanded=dac_x (group 7) -- added 2026-09-01 alongside the
+    firmware's axis-selectable start_open_sine, to characterize the
+    second control pathway with the same rigor as the first."""
+    meas_group = 3 if axis == "y" else 4
+    dac_group = 6 if axis == "y" else 7
     while not stop_event.is_set():
         try:
             raw = ser.readline()
@@ -206,21 +219,21 @@ def _reader_thread(ser, records, stop_event):
         status = int(m.group(2))
         if not (status & 1):
             continue
-        x = float(m.group(3))
-        dac_y = int(m.group(6))
-        tick_ms = int(m.group(7))
-        records.append((tick_ms, x, dac_y))
+        measured = float(m.group(meas_group))
+        dac_commanded = int(m.group(dac_group))
+        tick_ms = int(m.group(8))
+        records.append((tick_ms, measured, dac_commanded))
 
 
 def emergency_cleanup(ser):
-    for cmd in ("stop_open_sine", "set_mode open_loop", "set_y 95", "amp_disable"):
+    for cmd in ("stop_open_sine", "set_mode open_loop", "set_y 95", "set_x 95", "amp_disable"):
         try:
             send_command(ser, cmd)
         except Exception:
             pass
 
 
-def verify_open_sine_state(ser, expect_active, expect_freq_millihz=None, max_reads=8):
+def verify_open_sine_state(ser, expect_active, expect_freq_millihz=None, expect_axis=None, max_reads=8):
     """Requires TWO CONSECUTIVE matching get_status reads before trusting a
     value -- added 2026-09-01 after a real, physically-observed incident:
     a single-read check here was accepting corrupted-but-still-regex-
@@ -243,14 +256,16 @@ def verify_open_sine_state(ser, expect_active, expect_freq_millihz=None, max_rea
             agree_count = 0
             last = None
             continue
-        cur = (bool(st["open_sine"]), st["open_sine_freq_millihz"])
+        cur = (bool(st["open_sine"]), st["open_sine_freq_millihz"], st["open_sine_axis"])
         if cur == last:
             agree_count += 1
             if agree_count >= 2:
-                active, freq_mh = cur
+                active, freq_mh, axis_val = cur
                 if active != expect_active:
                     return False
                 if expect_active and expect_freq_millihz is not None and freq_mh != expect_freq_millihz:
+                    return False
+                if expect_active and expect_axis is not None and axis_val != expect_axis:
                     return False
                 return True
         else:
@@ -276,13 +291,19 @@ def ensure_stopped(ser, max_attempts=5):
                         "aborting rather than risk starting another sine on top of a possibly-still-running one.")
 
 
-def run_one_frequency(ser, freq, amplitude_counts, base_dac_y, duration, amp_was_enabled):
-    """Runs a single Bode point. Returns a dict of results, or None on a
-    soft failure (already left hardware idle in that case). Raises
-    RuntimeError on a failure that couldn't be safely cleaned up -- caller
-    must treat that as a hard stop, not skip-and-continue."""
-    print(f"\n--- {freq:.2f} Hz ---")
-    send_command(ser, f"set_y {base_dac_y}")
+def run_one_frequency(ser, freq, amplitude_counts, base_dac, duration, amp_was_enabled, axis="y"):
+    """Runs a single Bode point. axis='y' drives dac_y, measures cx (the
+    original, already-characterized pathway); axis='x' drives dac_x,
+    measures cy (the second axis, added 2026-09-01 -- see the firmware's
+    axis-selectable start_open_sine and the new dac_x= telemetry field).
+    Returns a dict of results, or None on a soft failure (already left
+    hardware idle in that case). Raises RuntimeError on a failure that
+    couldn't be safely cleaned up -- caller must treat that as a hard
+    stop, not skip-and-continue."""
+    print(f"\n--- {freq:.2f} Hz (axis={axis}) ---")
+    axis_num = 1 if axis == "y" else 0
+    set_cmd = "set_y" if axis == "y" else "set_x"
+    send_command(ser, f"{set_cmd} {base_dac}")
     time.sleep(0.4)
 
     # Retry the SEND itself, not just the verification read -- diagnosed
@@ -296,9 +317,10 @@ def run_one_frequency(ser, freq, amplitude_counts, base_dac_y, duration, amp_was
     freq_millihz = round(freq * 1000)
     confirmed = False
     for attempt in range(5):
-        reply = send_command(ser, f"start_open_sine {freq_millihz} {amplitude_counts} {base_dac_y}")
+        reply = send_command(ser, f"start_open_sine {freq_millihz} {amplitude_counts} {base_dac} {axis_num}")
         print(reply)
-        confirmed = verify_open_sine_state(ser, expect_active=True, expect_freq_millihz=freq_millihz)
+        confirmed = verify_open_sine_state(ser, expect_active=True, expect_freq_millihz=freq_millihz,
+                                            expect_axis=axis_num)
         if confirmed:
             break
         print(f"  start_open_sine not confirmed (attempt {attempt+1}/5) -- stopping and resending...")
@@ -311,30 +333,30 @@ def run_one_frequency(ser, freq, amplitude_counts, base_dac_y, duration, amp_was
 
     records = []
     stop_event = threading.Event()
-    reader = threading.Thread(target=_reader_thread, args=(ser, records, stop_event), daemon=True)
+    reader = threading.Thread(target=_reader_thread, args=(ser, records, stop_event, axis), daemon=True)
     reader.start()
     time.sleep(duration)
     stop_event.set()
     reader.join(timeout=1.0)
 
     ensure_stopped(ser)
-    send_command(ser, f"set_y {base_dac_y}")
+    send_command(ser, f"{set_cmd} {base_dac}")
 
     if len(records) < 10:
         print(f"  only {len(records)} samples, skipping")
         return None
 
     tick_ms = np.array([r[0] for r in records], dtype=np.float64)
-    x = np.array([r[1] for r in records])
-    dac_y = np.array([r[2] for r in records], dtype=np.float64)
+    measured = np.array([r[1] for r in records])
+    dac_commanded = np.array([r[2] for r in records], dtype=np.float64)
     t = (tick_ms - tick_ms[0]) / 1000.0
 
-    fit = fit_bode_point(t, x, dac_y, freq)
+    fit = fit_bode_point(t, measured, dac_commanded, freq)
     print(f"  {len(records)} samples over {t[-1]:.2f}s (~{len(records)/t[-1]:.0f}/s)  "
           f"gain={fit['gain_px_per_count']:.4f} px/count  lag={fit['lag_ms']:.1f}ms "
           f"({fit['lag_deg']:.1f} deg)")
 
-    return {"freq": freq, "t": t, "x": x, "dac_y": dac_y, **fit}
+    return {"freq": freq, "t": t, "x": measured, "dac_y": dac_commanded, "axis": axis, **fit}
 
 
 def save_point_plot(result, amplitude_counts, base_dac_y, out_path):
@@ -349,6 +371,9 @@ def save_point_plot(result, amplitude_counts, base_dac_y, out_path):
     what actually lets a fit be checked by eye at those frequencies."""
     t, x, dac_y = result["t"], result["x"], result["dac_y"]
     freq = result["freq"]
+    axis = result.get("axis", "y")
+    meas_label = "measured cx (px)" if axis == "y" else "measured cy (px)"
+    dac_label = "commanded dac_y (counts)" if axis == "y" else "commanded dac_x (counts)"
     w = 2.0 * math.pi * freq
     t_fit = np.linspace(t[0], t[-1], 2000)
     x_fit = (result["fit_Ax"] * np.sin(w * t_fit) + result["fit_Bx"] * np.cos(w * t_fit)
@@ -372,8 +397,8 @@ def save_point_plot(result, amplitude_counts, base_dac_y, out_path):
         a.tick_params(colors=MUTED, labelsize=8.5, length=3)
 
     for a, az, raw, fit_curve, color, fit_color, ylabel in (
-        (ax1, ax1z, x, x_fit, BLUE, "#1a4d8f", "measured cx (px)"),
-        (ax2, ax2z, dac_y, d_fit, ORANGE, "#a8480f", "commanded dac_y (counts)"),
+        (ax1, ax1z, x, x_fit, BLUE, "#1a4d8f", meas_label),
+        (ax2, ax2z, dac_y, d_fit, ORANGE, "#a8480f", dac_label),
     ):
         a.scatter(t, raw, color=color, s=8, alpha=0.45, linewidths=0)
         a.plot(t_fit, fit_curve, color=fit_color, linewidth=1.3)
@@ -387,7 +412,8 @@ def save_point_plot(result, amplitude_counts, base_dac_y, out_path):
     ax2.set_xlabel("time (s)", fontsize=9.5, color=MUTED)
     ax2z.set_xlabel("time (s)", fontsize=9.5, color=MUTED)
 
-    fig.suptitle(f"{freq:.2f} Hz open-loop plant excitation -- "
+    axis_desc = "dac_y->cx" if axis == "y" else "dac_x->cy"
+    fig.suptitle(f"{freq:.2f} Hz open-loop plant excitation ({axis_desc}) -- "
                  f"gain={result['gain_px_per_count']:.4f} px/count, "
                  f"lag={result['lag_ms']:.1f}ms ({result['lag_deg']:.1f} deg)",
                  fontsize=11.5, color="#1A1A2E", x=0.02, ha="left")
@@ -431,9 +457,11 @@ def save_bode_summary(results, out_path):
         a.set_xscale("log")
         a.grid(True, which="both", color=GRID, linewidth=0.6)
 
+    axis = results[order[0]].get("axis", "y")
+    axis_desc = "dac_y -> cx" if axis == "y" else "dac_x -> cy"
     ax1.plot(freqs, gains_um, color=BLUE, marker="o", linewidth=1.8, markersize=5)
     ax1.set_ylabel("open-loop gain (µm / DAC count)", fontsize=9.5, color=MUTED)
-    ax1.set_title("Open-loop plant Bode plot (dac_y -> beam displacement)",
+    ax1.set_title(f"Open-loop plant Bode plot ({axis_desc})",
                    fontsize=12, color="#1A1A2E", loc="left")
     # Peak marker computed from THIS sweep's own data -- was previously a
     # hardcoded 38.5Hz literal, which went stale the moment the resonance
@@ -478,6 +506,16 @@ def main():
                               "itself implicated in the incident that prompted this rewrite, but "
                               "smaller reduces the consequence of any future confirmation bug.")
     parser.add_argument("--base-dac-y", type=int, default=2048)
+    parser.add_argument("--axis", choices=("x", "y"), default="y",
+                         help="which DAC axis to drive: 'y' (default) is the original, "
+                              "already-characterized dac_y->cx pathway; 'x' drives dac_x->cy "
+                              "(added 2026-09-01, never characterized this way before). "
+                              "--base-dac-y is reused as the base position for whichever axis "
+                              "is selected -- 2048 has no established 'clean operating point' "
+                              "pedigree on the x axis the way it does on y (see CLAUDE.md's "
+                              "minor-loop hysteresis section, y-axis only), so treat --axis x "
+                              "results with that caveat until/unless axis x gets its own "
+                              "equivalent characterization.")
     parser.add_argument("--duration", type=float, default=None)
     parser.add_argument("--port", default=None)
     parser.add_argument("--out", default=None)
@@ -517,20 +555,28 @@ def main():
             ser.close()
             raise SystemExit(1)
 
+    out_prefix = args.out_prefix
+    if args.axis == "x" and out_prefix == "results/fta_open_loop_bode":
+        # Default prefix made axis-specific so an --axis x sweep can't
+        # silently collide with/overwrite --axis y result files sharing
+        # the same frequency labels -- only applied when the user hasn't
+        # already customized --out-prefix themselves.
+        out_prefix = "results/fta_open_loop_bode_xaxis"
+
     results = []
     try:
         for freq in freqs:
             duration = args.duration if args.duration is not None else max(2.0, 8.0 / freq)
             result = run_one_frequency(ser, freq, args.amplitude_counts, args.base_dac_y,
-                                        duration, amp_was_enabled)
+                                        duration, amp_was_enabled, axis=args.axis)
             if result is None:
                 continue
             ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             if args.out and len(freqs) == 1:
                 out_path = args.out
             else:
-                out_path = f"{args.out_prefix}_{freq:g}Hz_{ts}.npz"
-            np.savez(out_path, t=result["t"], x=result["x"], dac_y=result["dac_y"],
+                out_path = f"{out_prefix}_{freq:g}Hz_{ts}.npz"
+            np.savez(out_path, t=result["t"], x=result["x"], dac_y=result["dac_y"], axis=args.axis,
                      freq=freq, amplitude_counts=args.amplitude_counts, base_dac_y=args.base_dac_y,
                      gain_px_per_count=result["gain_px_per_count"], lag_ms=result["lag_ms"],
                      lag_deg=result["lag_deg"],
@@ -545,7 +591,7 @@ def main():
         ser.close()
 
     if len(results) >= 3:
-        summary_path = f"{args.out_prefix}_summary.png"
+        summary_path = f"{out_prefix}_summary.png"
         save_bode_summary(results, summary_path)
         print(f"\nSaved Bode summary to {summary_path}")
 
