@@ -33,13 +33,29 @@
 // is comfortably more than this loop needs. Same P/I/D terms, same back-
 // calculation anti-windup, same EMA-filtered derivative, same dt-aware
 // timing -- only the storage/arithmetic type changed.
+//
+// derivative-on-measurement fix, 2026-09-01 -- third, explicit, user-
+// approved deviation. The derivative term was computed as
+// (error - prev_error)/dt, labeled "on measurement" to avoid derivative
+// kick, but that's only equal to the measurement's own derivative when
+// setpoint is unchanged between calls -- algebraically
+// (error-prev_error)/dt = d(setpoint)/dt - d(measurement)/dt, so the
+// moment setpoint moves (a step in target, or every tick of the on-board
+// sine generator -- exactly the two scenarios this project's D-term
+// tests all used) it silently reintroduces the setpoint-derivative spike
+// this technique exists to remove. Fixed by differencing the raw
+// measurement directly (prev_measurement_ instead of deriving it back
+// out of prev_error_) -- identical output to the old formula whenever
+// setpoint IS held constant (the only case they were ever equivalent),
+// genuinely kick-free otherwise. Same P/I/anti-windup/dt-handling,
+// unchanged.
 class PIDController {
 public:
     // Constructor initializes tuning parameters and sample time
     PIDController(float kp, float ki, float kd, float ts, float fc = 0.0f)
         : kp_(kp), ki_(ki), kd_(kd), ts_(ts), fc_(fc),
           prev_error_(0.0f), integral_(0.0f), prev_d_meas_(0.0f),
-          min_output_(-1.0f), max_output_(1.0f) {}
+          prev_measurement_(0.0f), min_output_(-1.0f), max_output_(1.0f) {}
 
     // Set physical actuator saturation limit boundaries
     void setOutputLimits(float min, float max) {
@@ -52,6 +68,7 @@ public:
         prev_error_ = 0.0f;
         integral_ = 0.0f;
         prev_d_meas_ = 0.0f;
+        prev_measurement_ = 0.0f;
     }
 
     // Process loop: Computes next output command given setpoint and current
@@ -73,8 +90,13 @@ public:
         float i_term = ki_ * integral_;
 
         // 3. Derivative Term on Measurement (Prevents derivative kick)
-        // D = (Error - PrevError) / dt, filtered using Exponential Moving Average
-        float raw_d_meas = (error - prev_error_) / dt;
+        // D = -(Measurement - PrevMeasurement) / dt, filtered using an
+        // Exponential Moving Average. Differences the raw measurement
+        // directly (not derived from error) so a setpoint change between
+        // calls can't leak into this term -- see the class-level comment
+        // for why the old (error-prev_error)/dt formula wasn't actually
+        // setpoint-independent despite its "on Measurement" label.
+        float raw_d_meas = -(measurement - prev_measurement_) / dt;
         float alpha;
         if (fc_ > 0.0f) {
             float rc = 1.0f / (2.0f * 3.14159265358979323846f * fc_);
@@ -100,6 +122,7 @@ public:
         // Save states for next cycle
         prev_error_ = error;
         prev_d_meas_ = filtered_d_meas;
+        prev_measurement_ = measurement;
 
         return output;
     }
@@ -107,6 +130,7 @@ public:
 private:
     float kp_, ki_, kd_, ts_, fc_;
     float prev_error_, integral_, prev_d_meas_;
+    float prev_measurement_;
     float min_output_, max_output_;
 };
 
