@@ -140,6 +140,22 @@ static volatile struct
 
 static volatile uint32_t g_packet_count = 0;          /* valid packets received */
 static volatile uint32_t g_checksum_error_count = 0;   /* corrupt packets dropped */
+/* Confident (status bit0 set) packets received -- added 2026-09-01 to
+ * answer a direct question: does every incoming I2C message that COULD
+ * drive a control step actually get one, or does the single-slot
+ * g_latest_beam "mailbox" (overwritten by a new ISR arrival before the
+ * main loop drains g_new_packet_ready, not a queue -- see this file's own
+ * architecture notes) silently drop some? ISR-level, unconditional of
+ * g_mode, so a before/after get_status diff against g_ctrl_step_seq
+ * (which only increments in MODE_CLOSED_LOOP) is airtight ground truth --
+ * both are plain firmware counters, immune to the ~4-8% VCP telemetry
+ * LINE loss already found and root-caused to a host/relay-level issue,
+ * separate from this ISR/mailbox question (see CLAUDE.md, 2026-08-27
+ * "cseq" entry). A gap here (confident delta > ctrl-step delta, while in
+ * closed_loop, unthrottled) would mean real firings are being lost
+ * before ever reaching run_closed_loop_step(), not just under-reported
+ * to the host. */
+static volatile uint32_t g_confident_packet_count = 0;
 
 /* HAL_GetTick() at the last valid packet -- used by get_status/heartbeat to
  * report telemetry age. Written only inside process_beam_packet (ISR
@@ -1268,6 +1284,10 @@ static void process_beam_packet(const uint8_t *buf)
   g_latest_beam.y = (int16_t)((uint16_t)buf[5] | ((uint16_t)buf[6] << 8));
   g_latest_beam_tick = HAL_GetTick();
   g_packet_count++;
+  if (buf[2] & 1U)
+  {
+    g_confident_packet_count++;  /* see this counter's own docstring */
+  }
   g_new_packet_ready = 1;
 
   HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_3);
@@ -2697,7 +2717,7 @@ static void cmd_get_status(void)
 {
   uint8_t  seq, status, amp_en, estop_latched;
   int16_t  tel_x_scaled, tel_y_scaled;
-  uint32_t pkt_count, err_count, last_tel_tick, now;
+  uint32_t pkt_count, err_count, confident_count, last_tel_tick, now;
   int32_t  dac_x, dac_y;
   char     line[520];  /* grown alongside TX_MSG_MAX_LEN, see that #define's comment */
   int      len;
@@ -2720,6 +2740,7 @@ static void cmd_get_status(void)
   last_tel_tick = g_latest_beam_tick;
   pkt_count     = g_packet_count;
   err_count     = g_checksum_error_count;
+  confident_count = g_confident_packet_count;
   amp_en        = g_amp_enabled;
   estop_latched = g_estop_latched;
   dac_x         = g_last_dac_x;
@@ -2741,7 +2762,7 @@ static void cmd_get_status(void)
     len = snprintf(line, sizeof(line),
                     "STATUS mode=%s amp=%u estop=%u dac_x=%ld dac_y=%ld "
                     "tel_x=%s%d.%01d tel_y=%s%d.%01d tel_seq=%u tel_status=%u "
-                    "tel_age_ms=%lu pkts=%lu errs=%lu uptime=%lus "
+                    "tel_age_ms=%lu pkts=%lu errs=%lu confident_pkts=%lu cseq=%lu uptime=%lus "
                     "target_x_set=%u target_x=%s%d.%01d kp_milli=%ld ki_milli=%ld kd_milli=%ld "
                     "fc_millihz=%ld out_limit=%ld ctrl_rate_millihz=%ld ctrl_interval_ms=%lu "
                     "pulse_tick=%lu smoothing=%u axis2=%u "
@@ -2757,6 +2778,7 @@ static void cmd_get_status(void)
                     (unsigned)seq, (unsigned)status,
                     (unsigned long)tel_age_ms,
                     (unsigned long)pkt_count, (unsigned long)err_count,
+                    (unsigned long)confident_count, (unsigned long)g_ctrl_step_seq,
                     (unsigned long)(now / 1000U),
                     (unsigned)g_target_x_set, tgt_sign, tgt_whole, tgt_frac,
                     (long)g_kp_milli, (long)g_ki_milli, (long)g_kd_milli,
