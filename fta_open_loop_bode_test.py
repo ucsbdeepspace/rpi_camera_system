@@ -59,7 +59,7 @@ MICRONS_PER_PIXEL = 3.0  # OV9281 pixel pitch, same constant used throughout thi
 REPLY_RE = re.compile(r"^(OK|ERR|STATUS|WARN)\b")
 TELEMETRY_RE = re.compile(
     r"^seq=\s*(\d+)\s+status=(\d+)\s+x=(-?\d+\.\d)\s+y=(-?\d+\.\d)\s+"
-    r"tgt=(-?\d+\.\d)\s+dac_y=(-?\d+)\s+tick=(\d+)\s+pkts=(\d+)\s+errs=(\d+)$")
+    r"tgt=(-?\d+\.\d)\s+dac_y=(-?\d+)\s+tick=(\d+)\s+pkts=(\d+)\s+errs=(\d+)\s+cseq=(\d+)$")
 # Core fields only required for the connectivity/amp check -- open_sine
 # fields are read separately with retries, same reasoning as the
 # 2026-08-19 fix in fta_closed_loop_onboard_sine_test.py (a corrupted/
@@ -75,6 +75,24 @@ STATUS_FIELD_RE = {
 }
 CORE_STATUS_FIELDS = ("dac_x", "dac_y", "amp", "tel_x", "tel_age_ms")
 ALL_STATUS_FIELDS = tuple(STATUS_FIELD_RE.keys())
+
+# Line-completeness check -- added 2026-09-01 after diagnosing a real,
+# previously-undiscovered bug: the STATUS reply has grown to 600+ bytes
+# this session (confident_pkts=, cseq=, meas_ctrl_rate_millihz=, several
+# filter fields all added over the day), which takes ~13ms to transmit at
+# 460800 baud -- long enough that it now regularly gets TORN mid-
+# transmission by the TX queue moving on to newer telemetry, confirmed by
+# direct inspection: "...open_sine_freq_millihz=10seq=102 status=1 x=..."
+# with no line break at all, a genuinely truncated value silently
+# concatenated with the next telemetry line. Every earlier "confirmation"
+# bug chased today (garbled digits, retries not helping, slower pacing
+# not helping) was actually this one root cause. `\bsine=` (word-boundary
+# anchored) matches the LAST "sine=" field specifically, not the
+# "open_sine=" field earlier in the line (no word boundary between the
+# "_" and "s" in "open_sine", since "_" counts as a word character) --
+# if this trailing pair is present, the line reached its true end intact
+# and nothing earlier in it can have been silently truncated either.
+STATUS_LINE_COMPLETE_RE = re.compile(r"\bsine=\d+\s+sine_freq_millihz=-?\d+")
 
 BLUE = "#2a78d6"
 ORANGE = "#eb6834"
@@ -108,10 +126,17 @@ def send_command(ser, cmd, char_delay=0.02, reply_timeout=2.0, retries=1):
     return None
 
 
-def get_status(ser, retries=5, required=ALL_STATUS_FIELDS):
+def get_status(ser, retries=20, required=ALL_STATUS_FIELDS):
     for _ in range(retries):
         reply = send_command(ser, "get_status", retries=1)
         if reply is None or not reply.startswith("STATUS"):
+            continue
+        if not STATUS_LINE_COMPLETE_RE.search(reply):
+            # Torn mid-transmission (see STATUS_LINE_COMPLETE_RE's own
+            # docstring) -- any field parsed from this reply, even one
+            # that appears earlier and looks superficially fine, cannot
+            # be trusted, since the tear can land anywhere. Discard the
+            # whole reply and retry rather than risk a truncated value.
             continue
         matches = {k: rx.search(reply) for k, rx in STATUS_FIELD_RE.items()}
         if all(matches[k] for k in required):
@@ -195,30 +220,93 @@ def emergency_cleanup(ser):
             pass
 
 
+def verify_open_sine_state(ser, expect_active, expect_freq_millihz=None, max_reads=8):
+    """Requires TWO CONSECUTIVE matching get_status reads before trusting a
+    value -- added 2026-09-01 after a real, physically-observed incident:
+    a single-read check here was accepting corrupted-but-still-regex-
+    parseable open_sine_freq_millihz values (garbled under heavy VCP load,
+    e.g. reading back 1/100th or 1/1000th of the real commanded value) as
+    if they were confirmed, causing every point in an 18-point sweep to
+    report "not confirmed" and skip -- while the sine was actually running
+    on the firmware the whole time, cascading into the next frequency's
+    start_open_sine without ever being cleanly stopped. A real value
+    should read back IDENTICALLY on two back-to-back reads; a corrupted
+    one is unlikely to corrupt to the exact same wrong value twice.
+    Returns True/False, never raises (caller decides what a persistent
+    False means)."""
+    last = None
+    agree_count = 0
+    for _ in range(max_reads):
+        try:
+            st = get_status(ser, retries=3)
+        except RuntimeError:
+            agree_count = 0
+            last = None
+            continue
+        cur = (bool(st["open_sine"]), st["open_sine_freq_millihz"])
+        if cur == last:
+            agree_count += 1
+            if agree_count >= 2:
+                active, freq_mh = cur
+                if active != expect_active:
+                    return False
+                if expect_active and expect_freq_millihz is not None and freq_mh != expect_freq_millihz:
+                    return False
+                return True
+        else:
+            agree_count = 1
+        last = cur
+    return False
+
+
+def ensure_stopped(ser, max_attempts=5):
+    """Retries stop_open_sine + double-confirmed verify_open_sine_state
+    until open_sine=0 actually reads back consistently. Raises RuntimeError
+    (caller should treat this as a hard abort, not skip-and-continue) if it
+    can't be confirmed -- silently moving on to the next frequency while
+    the previous sine might still be running is exactly what caused a real
+    uncontrolled-actuator incident (2026-09-01)."""
+    for attempt in range(max_attempts):
+        send_command(ser, "stop_open_sine")
+        if verify_open_sine_state(ser, expect_active=False):
+            return
+        print(f"  stop_open_sine not yet confirmed (attempt {attempt+1}/{max_attempts}), retrying...")
+        time.sleep(0.3)
+    raise RuntimeError("Could not confirm open_sine actually stopped after repeated attempts -- "
+                        "aborting rather than risk starting another sine on top of a possibly-still-running one.")
+
+
 def run_one_frequency(ser, freq, amplitude_counts, base_dac_y, duration, amp_was_enabled):
     """Runs a single Bode point. Returns a dict of results, or None on a
-    hard failure (already left hardware idle in that case)."""
+    soft failure (already left hardware idle in that case). Raises
+    RuntimeError on a failure that couldn't be safely cleaned up -- caller
+    must treat that as a hard stop, not skip-and-continue."""
     print(f"\n--- {freq:.2f} Hz ---")
     send_command(ser, f"set_y {base_dac_y}")
     time.sleep(0.4)
 
+    # Retry the SEND itself, not just the verification read -- diagnosed
+    # 2026-09-01: failures here were NOT corrupted status replies, they
+    # were the outgoing start_open_sine COMMAND losing trailing digit
+    # characters in transit under heavy concurrent telemetry load (every
+    # observed failure was missing exactly 2 or 3 trailing zeros, e.g.
+    # "10000" arriving at the firmware as "100" -- the firmware was
+    # correctly reporting back exactly what it received, so re-reading
+    # status alone could never fix this, only resending the command can).
     freq_millihz = round(freq * 1000)
-    reply = send_command(ser, f"start_open_sine {freq_millihz} {amplitude_counts} {base_dac_y}")
-    print(reply)
-
-    # Ground-truth check (same reasoning as fta_closed_loop_onboard_sine_test.py
-    # 2026-08-19: a lost reply doesn't mean the command didn't land -- only
-    # treat it as a real failure if get_status ALSO disagrees).
-    try:
-        verify_st = get_status(ser, retries=10)
-        confirmed = bool(verify_st["open_sine"]) and verify_st["open_sine_freq_millihz"] == freq_millihz
-    except RuntimeError:
-        print("WARNING: get_status failed to verify start_open_sine -- proceeding anyway.")
-        confirmed = True
+    confirmed = False
+    for attempt in range(5):
+        reply = send_command(ser, f"start_open_sine {freq_millihz} {amplitude_counts} {base_dac_y}")
+        print(reply)
+        confirmed = verify_open_sine_state(ser, expect_active=True, expect_freq_millihz=freq_millihz)
+        if confirmed:
+            break
+        print(f"  start_open_sine not confirmed (attempt {attempt+1}/5) -- stopping and resending...")
+        ensure_stopped(ser)
+        time.sleep(0.3)
     if not confirmed:
-        print(f"ERR: start_open_sine not confirmed (open_sine={verify_st['open_sine']} "
-              f"freq={verify_st['open_sine_freq_millihz']}, expected {freq_millihz}) -- skipping this point.")
-        send_command(ser, "stop_open_sine")
+        print(f"ERR: start_open_sine could not be confirmed after 5 full resend attempts -- skipping this point.")
+        ensure_stopped(ser)
         return None
 
     records = []
@@ -229,7 +317,7 @@ def run_one_frequency(ser, freq, amplitude_counts, base_dac_y, duration, amp_was
     stop_event.set()
     reader.join(timeout=1.0)
 
-    send_command(ser, "stop_open_sine")
+    ensure_stopped(ser)
     send_command(ser, f"set_y {base_dac_y}")
 
     if len(records) < 10:
@@ -347,8 +435,20 @@ def save_bode_summary(results, out_path):
     ax1.set_ylabel("open-loop gain (µm / DAC count)", fontsize=9.5, color=MUTED)
     ax1.set_title("Open-loop plant Bode plot (dac_y -> beam displacement)",
                    fontsize=12, color="#1A1A2E", loc="left")
-    ax1.axvline(38.5, color=MUTED, linewidth=1.0, linestyle=(0, (2, 2)))
-    ax1.text(38.5, max(gains_um) * 0.95, " 38.5Hz\n resonance", fontsize=8, color=MUTED)
+    # Peak marker computed from THIS sweep's own data -- was previously a
+    # hardcoded 38.5Hz literal, which went stale the moment the resonance
+    # was re-measured elsewhere in the project (ring-down: ~47Hz,
+    # 2026-08-27/2026-09-01). Note this sweep's own grid spacing near the
+    # peak (35/40/44Hz here) is coarse enough that the true peak could sit
+    # a few Hz off the nearest sampled point -- label says "sweep peak",
+    # not "the resonance", deliberately, since the ring-down method found
+    # a meaningfully different number (~47Hz) in the same session and
+    # that discrepancy is not resolved by this plot alone.
+    peak_idx = int(np.argmax(gains_um))
+    peak_freq = freqs[peak_idx]
+    ax1.axvline(peak_freq, color=MUTED, linewidth=1.0, linestyle=(0, (2, 2)))
+    ax1.text(peak_freq, max(gains_um) * 0.95, f" {peak_freq:g}Hz\n sweep peak\n (grid-limited)",
+              fontsize=8, color=MUTED)
     if freqs.min() <= 20 <= freqs.max() and freqs.min() <= 10 <= freqs.max():
         ax1.axvspan(10, 20, color=BLUE, alpha=0.07)
         ax2.axvspan(10, 20, color=BLUE, alpha=0.07)
@@ -360,7 +460,7 @@ def save_bode_summary(results, out_path):
     ax2.axhline(-180, color=MUTED, linewidth=0.8, linestyle=(0, (1, 2)))
     ax2.set_ylabel("phase (deg, unwrapped)", fontsize=9.5, color=MUTED)
     ax2.set_xlabel("frequency (Hz)", fontsize=9.5, color=MUTED)
-    ax2.axvline(38.5, color=MUTED, linewidth=1.0, linestyle=(0, (2, 2)))
+    ax2.axvline(peak_freq, color=MUTED, linewidth=1.0, linestyle=(0, (2, 2)))
 
     fig.tight_layout()
     fig.savefig(out_path, facecolor="white")
@@ -372,7 +472,11 @@ def main():
     parser.add_argument("--freq", type=float, default=None)
     parser.add_argument("--sweep", type=str, default=None,
                          help="comma-separated list of Hz values, run in one connection")
-    parser.add_argument("--amplitude-counts", type=int, default=300)
+    parser.add_argument("--amplitude-counts", type=int, default=150,
+                         help="lowered from the original 300 (2026-09-01) as a margin while the "
+                              "start/stop-confirmation logic is freshly rewritten -- 300 was never "
+                              "itself implicated in the incident that prompted this rewrite, but "
+                              "smaller reduces the consequence of any future confirmation bug.")
     parser.add_argument("--base-dac-y", type=int, default=2048)
     parser.add_argument("--duration", type=float, default=None)
     parser.add_argument("--port", default=None)

@@ -5770,6 +5770,242 @@ itself worth root-causing (TX queue depth? host read timing?) is
 untouched; the Ki=500 divergence's actual mechanical root cause (beyond
 "not float") remains unconfirmed.
 
+### Confident-packet / link completeness measured directly (both ~100%); a real, 100%-reproducible STATUS-reply truncation bug found and fixed; fresh open-loop Bode sweep confirms the same resonance shape (2026-09-01)
+
+Picked up the "is every incoming I2C message getting a completed PID
+loop" question. Two new ISR-level counters added to `main.c`:
+`g_confident_packet_count` (increments in `process_beam_packet()` when
+the packet's status bit0 is set) and reuse of the existing
+`g_ctrl_step_seq` (already exposed per-packet as `cseq=`, added
+2026-08-27 — see "Revert-and-retest" above) now also surfaced via
+`get_status` as `confident_pkts=`/`cseq=`. Built `scratch_confident_vs_fired.py`:
+diffs two `get_status` snapshots bracketing a closed-loop window. Result,
+3 trials, axis2 on, unthrottled, Kp=1.75/Ki=15: 99.96%/99.95%/100.00%
+per-trial, pooled **6423/6425 (99.97%) confident packets completed a PID
+loop** — the single-slot `g_latest_beam` mailbox's theoretical drop risk
+(two I2C completions landing before the main loop drains
+`g_new_packet_ready`) is real but rare, ~1 in 3200, not a practical
+limiter.
+
+Separately measured **link completeness** (does every Pi send reach the
+Nucleo's I2C receiver at all): unwrapped the Pi's own u8 `seq` byte
+across the relay stream and compared its reconstructed delta against
+`(pkts + errs)` delta over the same window — both firmware-side counters,
+immune to the already-known VCP-relay host-side line loss. 3 trials,
+open_loop/amp off: 3610/3610, 3672/3672, 3591/3591 — **0 lost across
+~10,873 real sends.** Both results say the I2C link + packet-to-PID
+pipeline are essentially lossless; nothing here is limiting control
+performance.
+
+**Built a real jitter histogram using `cseq` as ground truth** (real
+per-firing intervals from consecutive `tick=` deltas, not the old
+`dac_y`-value-change proxy this file has already documented as unreliable
+near settled periods). Kp=1.75/Ki=15, axis2 on, unthrottled, 3 trials
+pooled: dominant cluster n=6250, mean=2.17ms, std=0.86ms, **CV=39.6%** —
+a real, trustworthy consistency number. One 174ms outlier (1/6251,
+0.016%) reported separately rather than folded into the CV — since
+`cseq` only increments on a confident detection, this most likely
+reflects a real, brief detection dropout, not a comms/firmware stall.
+Both a link-completeness/PID-completion slide and a jitter-histogram
+slide were added to `docs/session_results_2026-08-18_pid_tuning.pptx`
+(now 25 slides at that point) — see the git history for the merge with
+another device's concurrent FEA-vs-bench/ring-down slide work
+(`dcd1cf6`/`672163c`), resolved via `git show origin/master:<path> ><path>`
+rather than `git checkout --theirs` (which failed once due to a
+lingering `soffice.bin` holding the file open).
+
+**Real, 100%-reproducible firmware bug found and fixed while re-running
+the existing open-loop Bode sweep (`fta_open_loop_bode_test.py`, built
+2026-08-19, see "Open-loop plant Bode plot" above).** Every
+`start_open_sine` confirmation read came back garbled (`freq=100,
+expected 1000` — consistently losing 2-3 trailing zero digits). Two
+theories were chased and disproven before finding the real cause: (1)
+digit corruption in transit — ruled out by slowing per-character pacing
+20ms→50ms, which changed nothing; (2) a bad host-side rate measurement
+that had reported "164Hz" against the Pi's real ~284Hz (traced to
+timestamping *after* a blind fixed-size `ser.read(3000)` call instead of
+at the moment a confirmed reply parses — fixed by reusing the
+already-proven timestamp-at-parse helpers from other scripts; corrected
+measurement: 286.6Hz, matching the Pi). Neither fix resolved the garbled
+replies. **Real root cause, found via direct raw-byte inspection**: the
+STATUS reply was being torn mid-transmission with no line break
+(`...open_sine_freq_millihz=10seq=102 status=1 x=...`) — a direct 20-sample
+test showed **0/20 complete replies, every single one exactly 614 bytes**,
+a perfectly consistent length that was the key clue this was a fixed
+buffer-size truncation, not a random timing race. Traced to
+`TX_MSG_MAX_LEN`/`cmd_get_status`'s local `line[]` still at 520 bytes
+(last bumped 460→520 earlier the same day) while the real STATUS line had
+grown to ~521-522 bytes once `confident_pkts=`/`cseq=` were added above —
+`enqueue_tx()`'s silent truncation clamp (`if (len >= TX_MSG_MAX_LEN) len
+= TX_MSG_MAX_LEN - 1`) was clipping the exact same offset every call, and
+`ser.readline()` kept reading past the missing `\n` into the next
+telemetry line, producing the corrupted-looking concatenation. Fixed:
+`TX_MSG_MAX_LEN` and `line[650]` both grown 520→650. Rebuilt (`.bss` grew
+by exactly 1040 bytes = 8×130, confirming the fix's arithmetic), reflashed,
+confirmed 20/20 clean replies afterward (521-522 bytes each). **This bug
+had nothing to do with the actuator, timing, or transmission pacing** —
+every earlier theory this incident chased was a red herring; the fix is
+purely "grow the buffer to match the current STATUS line length," and is
+the same recurring bug class this file has hit before (add a wire-format
+field, forget to bump the buffer that holds it).
+
+**Real hardware consequence mid-incident**: with the buffer bug
+un-diagnosed, the sweep script's flawed confirmation logic issued new
+`start_open_sine` calls for the next frequency without ever confirming
+the previous one had stopped, cascading into overlapping/rapidly-changing
+sine drives (`dac_y=1771` observed live while supposedly idle). Not a
+hazard-level event — this is a small, low-force flexure/voice-coil
+actuator, not something that can hurt anyone — but real, unnecessary
+component stress and bad data, secured immediately (`stop_open_sine`,
+mode/dac/amp reset, `clear_estop`, confirmed idle) once caught.
+
+**Fresh 18-point sweep, 1-55Hz, amplitude reduced 300→150 counts for
+margin** (this incident is not itself evidence 300 was unsafe — it's just
+extra headroom given what happened), confirms the same qualitative shape
+already on record from the original 2026-08-19 16-point sweep: flat gain
+1-13Hz (~0.088-0.093 px/count), real phase margin through 10-20Hz
+(40° lag at 10Hz, matching the earlier sweep almost exactly), a sharp
+resonant peak with the sampled grid maximum landing at **40Hz** (gain
+0.997, ~11x the low-frequency baseline). Given this sweep's grid only
+samples 35/40/44Hz around the peak, this 40Hz figure should be read as
+"grid-limited," not a precise re-measurement — it's consistent with,
+not a correction to, both the 38.5Hz ring-down number and the later
+~47-50Hz re-measurement already on record above; the true peak could sit
+anywhere in the unsampled 35-47Hz window depending on which session's
+number is currently accurate. `results/fta_open_loop_bode_20260901_*`
+(per-frequency plots + summary) regenerated after the fix; single-point
+10Hz validation (gain=0.0892 px/count, lag=10.7ms/38.6°) matches the
+historical baseline (0.0909, 40.4°) closely.
+
+**State left**: hardware safely idle. `TX_MSG_MAX_LEN`/`line[650]` fix,
+`scratch_confident_vs_fired.py`/`scratch_link_completeness.py` (scratch,
+not committed), and the two new pptx slides were committed/pushed this
+session (see git log around this date). **Not yet done**: the
+`TELEMETRY_RE`-duplication bug class (every VCP telemetry consumer
+script re-declares its own copy, independently — flagged again, not yet
+fixed with a shared module) hit again this session in
+`fta_open_loop_bode_test.py`/`fta_closed_loop_step_response_vcp.py`
+(missing `cseq=`), same as several times before.
+
+### Fresh lead compensator, designed from real Bode data, fails violently — a loop-gain simulation and a real-hardware higher-Q notch sweep both point at the plant resonance itself, not an implementation bug, as the reason every compensator trick (D-term, notch, now lead) keeps failing (2026-09-01, same day)
+
+With a trustworthy fresh Bode sweep in hand (previous entry), designed a
+lead compensator from first principles: standard sizing formula
+(`α=(1-sinφ)/(1+sinφ)`, `fz=fc√α`, `fp=fc/√α`) targeting ~55-60° added
+phase margin at a 20Hz crossover, using the 40Hz worst-case phase
+estimate from the fresh sweep (not the ring-down number, per an explicit
+decision to proceed conservatively rather than re-measure the
+38.5Hz-vs-47-50Hz discrepancy) — landed on **fz≈15.4Hz, fp≈26Hz**
+(`set_lead 15400 26000`).
+
+**Tested on hardware (Kp=1.75/Ki=400, unthrottled, no notch) — violently
+unstable, worse than the no-lead baseline, not better.** No-lead baseline
+(same Kp/Ki): 105.8% overshoot, never settled. With lead: **598.1%
+overshoot**, never settled, and the recorded trace shows oscillation
+building even BEFORE the commanded step — the signature of a genuinely
+unstable (not just poorly-damped) closed loop, independent of any input.
+This closely reproduces an earlier, previously-unresolved "sustained
+instability" finding from a prior session that a bumpless-transfer fix
+had reduced but not solved.
+
+**Checked the implementation for a bug before concluding it's fundamental
+— found none.** Hand-derived the bilinear-transform discretization of
+`C(s)=(1+s/ωz)/(1+s/ωp)` and compared directly against
+`lead_compute_coeffs()`/`lead_apply()` in `main.c`: the `Kz=1/(π·fz·T)`,
+`Kp_=1/(π·fp·T)` constants and the `b0,b1,a1` formulas match the standard
+substitution exactly, and the difference equation
+(`y[n]=b0·x[n]+b1·x[n-1]-a1·y[n-1]`) is the correct realization. Sanity
+checks on the actual fz=15.4/fp=26 coefficients at the real ~280Hz rate:
+DC gain ≈1.0 (correct for a lead compensator) and Nyquist-band gain
+≈1.69 (matches the designed fp/fz ratio exactly). **The math is right —
+this ruled out a coefficient bug as the explanation.**
+
+**Root cause found instead via a loop-gain simulation against the real
+measured Bode data** (continuous-domain: PI's own frequency response
+`Kp-jKi/w`, the lead's `(1+jw/wz)/(1+jw/wp)`, and the plant's measured
+gain/phase interpolated from the fresh sweep, all multiplied together —
+valid regardless of where in the loop the lead filter is actually applied,
+since LTI blocks in series commute for loop-gain/stability purposes; this
+firmware applies lead to the *measurement* before computing error, not to
+the PI output, which doesn't change this analysis). Both configurations
+show loop gain **crossing back above 1 a second time near the resonance,
+with phase already well past -180°**:
+
+| | 2nd crossover | phase there | naive "margin" |
+|---|---|---|---|
+| no lead (baseline) | 36.4Hz | -217° | -37° |
+| with lead (fz=15.4/fp=26) | 34.3Hz | -177° | +2.6° |
+
+The lead's extra ~1.2-1.5x gain boost in the 15-35Hz band (inherent to
+any lead compensator — phase lead cannot be added without adding gain)
+lands right where the plant's resonance gain is already climbing steeply
+(20Hz=0.11, 25Hz=0.136, 30Hz=0.182, 35Hz=0.282 px/count, well before the
+40Hz peak itself) — pushing the second crossover to a lower frequency
+with essentially zero margin instead of the comfortable ~55-60° the
+single-worst-case-point design assumed. **This is a real, physical
+mechanism, not a coefficient bug**: the phase-margin design method used a
+single worst-case phase estimate rather than checking the full measured
+gain curve, and the plant's resonance skirt is wide/steep enough that any
+added gain in that band is dangerous regardless of how it's implemented.
+
+**Caveat on the "margin" numbers above**: the naive "180+phase at a gain=1
+crossing" formula only strictly applies to a loop with one crossing. This
+loop's gain dips below 1 then rises again (three total crossings), and
+when the same formula was applied to a config already known clean on real
+hardware (Kp=1.75/Ki=15, throttled 200Hz) it predicted -103° margin —
+contradicting known ground truth. So the ABSOLUTE margin numbers above
+aren't trustworthy; the COMPARATIVE conclusion (lead's second crossing is
+lower-frequency and worse than no-lead's, both landing in the
+resonance-driven danger zone) is the load-bearing part of this finding,
+not the exact degree values. A real Nyquist encirclement count would be
+needed for trustworthy absolute margins; not built (time-boxed).
+
+**Followed up by testing whether a much tighter notch could recover
+margin, on real hardware rather than trusting more simulation** (the
+simulation's passband-cost check — Q=3 through Q=30 all showed <0.4% gain
+loss in the 10-20Hz band relative to no notch — suggested tightening
+should be free or beneficial). `scratch_notch_q_sweep.py` built (reuses
+`scratch_notch_comparison.py`'s harness), swept **Q ∈ {8,12,20} × Ki ∈
+{200,400,600,800}** at Kp=1.75, notch centered 40Hz, throttled 200Hz, on
+top of the already-fixed real (not mis-clocked) notch from the
+"Notch fix built" entry above. **Result: every single one of the 12
+combinations was worse than Q=3, and worse monotonically as Q
+increased** — Q=8/Ki=200 (a value safe under both no-notch and Q=3):
+RINGING (91.4% overshoot); Q=12/Ki=200: GROWING/UNSTABLE; Q=20/Ki=200:
+DIVERGED outright. Every higher Ki at every Q: DIVERGED. **This directly
+contradicts the simulation's magnitude-only prediction** — real hardware
+says tighter is worse, not better or neutral.
+
+**Best explanation**: the passband simulation only checked *magnitude*
+attenuation in 10-20Hz, never *phase*. A notch's phase distortion swings
+across a much wider band than its visible magnitude dip, and at a ~200Hz
+sample rate against a 40Hz center (only ~5x oversampled), that phase
+penalty is real, extends into the control-relevant band, and gets worse
+as Q tightens — the opposite of what the magnitude-only view suggested.
+Not confirmed by a follow-up phase-domain simulation (time-boxed), but
+consistent with every other result this investigation produced.
+
+**Net conclusion — four independent approaches have now failed against
+this resonance**: the D-term (multiple cutoffs, multiple sessions), the
+original Q=3 notch, this session's higher-Q notch sweep (Q=8/12/20), and
+now a freshly-designed lead compensator with verified-correct math. This
+is no longer "try another filter" territory — it's strong, repeated,
+convergent evidence that the plant's resonance is a genuine mechanical
+bandwidth ceiling that firmware/controller tricks cannot route around at
+this Kp/Ki operating regime. Recommend treating the flexure hardware
+redesign (already in progress per the FEA-vs-bench slides) as the primary
+path forward, not further controller tuning.
+
+**State left**: hardware safely idle (`mode=open_loop amp=0 estop=0
+dac_x=95 dac_y=95`) after every trial, confirmed via `get_status`.
+`scratch_notch_q_sweep.py` committed at repo root. **Not yet done**: a
+proper Nyquist/discrete-time stability analysis (to get trustworthy
+absolute margins, not just the comparative conclusion above); a
+phase-domain check of why tighter notches make things worse in practice;
+whether a hardware fix (stiffer/damped flexure) genuinely raises the
+resonance frequency enough to matter, vs. just moving the same problem —
+not testable until the new flexures arrive.
+
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 
 Frequency-domain complement to the step-response tests, motivated by the

@@ -617,13 +617,33 @@ static uint16_t          vcp_cur_len  = 0;  /* length assembled so far into vcp_
  * the largest message (get_status's ~220-byte reply) with a little
  * margin. */
 #define TX_QUEUE_DEPTH   8U
-#define TX_MSG_MAX_LEN   520U  /* bumped 400->460 2026-08-19 for the open_sine=/
+#define TX_MSG_MAX_LEN   650U  /* bumped 400->460 2026-08-19 for the open_sine=/
                                 * open_sine_freq_millihz= STATUS fields, then
                                 * 460->520 same day for lead=/lead_fz_millihz=/
                                 * lead_fp_millihz= -- matches this file's
                                 * established pattern of growing this
                                 * alongside line[] whenever a new STATUS
-                                * field is added. */
+                                * field is added. Bumped again 520->650
+                                * 2026-09-01: confident_pkts=/cseq= (added
+                                * 2026-08-27/2026-09-01) pushed the real
+                                * STATUS line past 520 without a matching
+                                * bump here -- this was a REAL, silent,
+                                * 100%-reproducible bug, not host-side
+                                * flakiness: enqueue_tx's own clamp
+                                * (`if (len >= TX_MSG_MAX_LEN) len =
+                                * TX_MSG_MAX_LEN - 1`) was truncating the
+                                * STATUS reply at the exact same byte
+                                * offset on every single call, silently
+                                * dropping the last few fields
+                                * (open_sine=/sine=) every time -- found
+                                * 2026-09-01 chasing a Bode-sweep
+                                * verification failure that survived
+                                * resend retries, slower pacing, AND a
+                                * lowered telemetry rate, none of which
+                                * could have fixed a fixed-offset buffer
+                                * truncation. 650 gives real margin above
+                                * the current real line length, not just
+                                * enough to fit today's fields exactly. */
 typedef struct { char data[TX_MSG_MAX_LEN]; uint16_t len; } tx_msg_t;
 static tx_msg_t          tx_queue[TX_QUEUE_DEPTH];
 static volatile uint8_t  tx_head  = 0;  /* next slot enqueue_tx fills */
@@ -2719,7 +2739,7 @@ static void cmd_get_status(void)
   int16_t  tel_x_scaled, tel_y_scaled;
   uint32_t pkt_count, err_count, confident_count, last_tel_tick, now;
   int32_t  dac_x, dac_y;
-  char     line[520];  /* grown alongside TX_MSG_MAX_LEN, see that #define's comment */
+  char     line[650];  /* grown alongside TX_MSG_MAX_LEN, see that #define's comment */
   int      len;
 
   /* Same 2026-08-13 fix as the telemetry snapshot in main()'s while(1)

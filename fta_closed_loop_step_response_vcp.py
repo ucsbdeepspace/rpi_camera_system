@@ -95,7 +95,7 @@ MICRONS_PER_PIXEL = 3.0  # OV9281 pixel pitch, same constant used throughout thi
 REPLY_RE = re.compile(r"^(OK|ERR|STATUS|WARN)\b")
 TELEMETRY_RE = re.compile(
     r"^seq=\s*(\d+)\s+status=(\d+)\s+x=(-?\d+\.\d)\s+y=(-?\d+\.\d)\s+"
-    r"tgt=(-?\d+\.\d)\s+dac_y=(-?\d+)\s+tick=(\d+)\s+pkts=(\d+)\s+errs=(\d+)$")
+    r"tgt=(-?\d+\.\d)\s+dac_y=(-?\d+)\s+tick=(\d+)\s+pkts=(\d+)\s+errs=(\d+)\s+cseq=(\d+)$")
 STATUS_FIELD_RE = {
     "dac_x": re.compile(r"dac_x=(-?\d+)"),
     "dac_y": re.compile(r"dac_y=(-?\d+)"),
