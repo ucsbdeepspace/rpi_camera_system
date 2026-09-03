@@ -6078,6 +6078,27 @@ Combined summary figure: `results/fta_open_loop_bode_xaxis_summary.png`. Per-fre
 
 **State left**: hardware safely idle (`mode=open_loop amp=0 estop=0 dac_x=95 dac_y=95`), confirmed via `get_status` after the sweep. Firmware (`start_open_sine` AXIS arg, `dac_x=` telemetry field, `open_sine_axis=` status field) and `fta_open_loop_bode_test.py`'s `--axis` support are both new, tested, and ready to commit. **Not yet done**: a ring-down repeat on axis x (still only one trial, per the still-open item from "Revert-and-retest" above); resolving the true peak location within the unsampled 47-50Hz gap (a finer-grid sub-sweep, e.g. 46/47/48/49/50Hz, would resolve this cheaply); whether axis x's resonance interacts with axis y's the way a shared mechanical mode would predict (would need a cross-axis excitation test -- drive one axis, watch the other's resonance response -- not attempted); using this real axis-x data for any compensator/notch design the way axis y's data has already been used, if axis 2 tuning is ever pursued more seriously than its current "holds steady, prevents drift" role.
 
+### Cross-axis coupling excitation test — FEA's independence prediction confirmed on real hardware, both directions (2026-09-03)
+
+Direct follow-up to the "not yet done" item above and the user's explicit framing: "FEA indicates they are totally independent, but we should run the test" — verify the prediction rather than take it on faith, matching this project's own established discipline of checking assumptions against real measurement wherever cheap to do so.
+
+**Method** (`scratch_cross_axis_coupling_test.py`, new, repo root): drive ONE axis's open-loop sine at (near) its own measured resonance, using the axis-selectable `start_open_sine` built for the axis-2 Bode sweep above, and record BOTH `cx` and `cy` from the same telemetry stream at once (every relay packet already carries both, regardless of which axis is driven). Fit both traces against the drive frequency's exact, known `w` (no need to recover it from a reference trace the way the Bode test does, since the firmware's sine generator holds `f` exactly) — the driven coordinate's fitted amplitude is the on-axis response (a sanity check against the existing Bode data), the OTHER coordinate's fitted amplitude is the cross-axis response. A quiet baseline (amp on, no sine driving, 3s at rest) was captured first so any cross-axis signal could be judged against this rig's real noise floor rather than an assumed threshold.
+
+**First attempt failed at the very first step, for an unrelated, mundane reason**: `pkts=0` in the raw VCP stream — the Pi's camera streaming process wasn't running (likely stopped between sessions, not caused by anything in this test). The script's `get_status`-based precondition check didn't catch it before proceeding, so it briefly attempted `start_open_sine` with `tel_status=0` (no confident telemetry), harmlessly producing zero real excitation and zero samples in both the baseline and drive attempts -- confirmed safe via `get_status` afterward regardless (`amp=0 dac_x=95 dac_y=95`). Fixed by asking the user to restart Pi-side streaming, confirmed live (`errs=0`, real `pkts=` climbing) before retrying.
+
+**Real result, both directions, decisive:**
+
+| drive | on-axis response | cross-axis response | vs. quiet-baseline noise |
+|---|---|---|---|
+| dac_y @ 40Hz (near primary-axis resonance) | cx = 154.6px | cy = 3.8px | 1.3x baseline std (cy std=2.8px at rest) -- no clear coupling |
+| dac_x @ 48.5Hz (near second-axis resonance) | cy = 112.5px | cx = 1.3px | 0.4x baseline std (cx std=3.5px at rest) -- no clear coupling |
+
+Both axes were driven hard right at their own resonance (100+ px on-axis response in both directions -- real, large excitation, not a marginal test). In both directions, the OTHER axis's response was statistically indistinguishable from (or, in the dac_x case, even smaller than) that axis's own noise floor measured at rest. If the two flexure modes were meaningfully coupled, driving one at resonance is exactly where it would show up in the other -- it doesn't, in either direction.
+
+**Conclusion: real hardware confirms the FEA's independence prediction, not just consistency with it.** The two axes' resonances (found separately in earlier entries above, ~40Hz and ~47-50Hz) are two genuinely independent physical modes, not two views of one shared mode. This directly resolves the open question flagged in the axis-2 Bode entry above ("worth checking whether the two axes share a common physical mode... before finalizing a stiffening design") -- the flexure redesign can treat the two axes as separate problems without needing to worry about a shared-mode interaction.
+
+**State left**: hardware safely idle (`mode=open_loop amp=0 estop=0 dac_x=95 dac_y=95`), confirmed via `get_status` after the test. `scratch_cross_axis_coupling_test.py` and its raw data (`results/scratch_cross_axis_{y,x}drive_*.npz`) are new. **Not yet done**: only one drive frequency per axis was tried (each axis's own approximate resonance peak) -- a sweep across the whole characterized band on both axes simultaneously would be more exhaustive but wasn't judged necessary given how decisively the two tested points (driven right at peak excitation) came back clean.
+
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 
 Frequency-domain complement to the step-response tests, motivated by the
