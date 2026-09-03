@@ -42,9 +42,13 @@ FTA_BAUD = 460800
 MICRONS_PER_PIXEL = 3.0
 
 REPLY_RE = re.compile(r"^(OK|ERR|STATUS|WARN)\b")
+# dac_x= added 2026-09-03 (see the cross-axis coupling test) -- same
+# recurring "add a wire field, forget the other consuming script's regex"
+# bug class this project has hit repeatedly; this script had gone
+# completely silent (0 samples matched, no error) until this was fixed.
 TELEMETRY_RE = re.compile(
     r"^seq=\s*(\d+)\s+status=(\d+)\s+x=(-?\d+\.\d)\s+y=(-?\d+\.\d)\s+"
-    r"tgt=(-?\d+\.\d)\s+dac_y=(-?\d+)\s+tick=(\d+)\s+pkts=(\d+)\s+errs=(\d+)\s+cseq=(\d+)$")
+    r"tgt=(-?\d+\.\d)\s+dac_y=(-?\d+)\s+dac_x=(-?\d+)\s+tick=(\d+)\s+pkts=(\d+)\s+errs=(\d+)\s+cseq=(\d+)$")
 
 BLUE = "#2a78d6"
 ORANGE = "#eb6834"
@@ -99,7 +103,7 @@ def _reader_thread(ser, records, stop_event):
             continue
         x = float(m.group(3))
         y = float(m.group(4))
-        tick_ms = int(m.group(7))
+        tick_ms = int(m.group(8))
         records.append((tick_ms, x, y))
 
 

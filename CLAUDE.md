@@ -6099,6 +6099,39 @@ Both axes were driven hard right at their own resonance (100+ px on-axis respons
 
 **State left**: hardware safely idle (`mode=open_loop amp=0 estop=0 dac_x=95 dac_y=95`), confirmed via `get_status` after the test. `scratch_cross_axis_coupling_test.py` and its raw data (`results/scratch_cross_axis_{y,x}drive_*.npz`) are new. **Not yet done**: only one drive frequency per axis was tried (each axis's own approximate resonance peak) -- a sweep across the whole characterized band on both axes simultaneously would be more exhaustive but wasn't judged necessary given how decisively the two tested points (driven right at peak excitation) came back clean.
 
+### Wire-position ring-down test — a real, reproducible effect on the second axis, but a repeat trial shows it's only a PARTIAL explanation for the historical resonance drift (2026-09-03, same day)
+
+Direct follow-up to the user's own hypothesis: could cable routing/dressing explain why this project's resonance measurements have drifted session to session (38.5Hz -> ~47-50Hz, still unexplained as of the "Revert-and-retest" entry above)? Worth checking directly given `fta_ringdown_test.py`'s peak-spacing method is already trustworthy and validated on both axes.
+
+**Real bug hit and fixed on the very first run**: `fta_ringdown_test.py`'s `TELEMETRY_RE` had never been updated for the `dac_x=` field added during the cross-axis coupling test above -- the exact same "add a wire field, forget the other consuming script's regex" mistake this project has now made at least four separate times (`tgt=`, `dac_y=`, `tick=`, and now `dac_x=`, each time in a different script). Fixed the same way as the others (added the field to the regex, shifted the `tick_ms` group index).
+
+**Protocol**: ring-down on both axes (2 trials each, matching this project's repeat-for-confidence convention) at each of several distinct wire configurations, physically changed by the user between runs:
+- **A (original "baseline")**: wires away from the flexure, not touching either side
+- **B**: wires touching one side of the flexure
+- **C**: wires pulled toward and touching the OTHER side (initially mislabeled "wires pulled away" -- corrected mid-session: this is a third distinct physical state, not a return to A)
+- **A' (repeat)**: back to the original away position, run specifically to check reversibility
+
+**Primary axis (dac_y->cx): completely unaffected across all three configurations tested** (A/B/C) -- 39.6-40.7Hz total spread, indistinguishable from ordinary trial noise. No wire effect on this pathway at all.
+
+**Second axis (dac_x->cy): a real, reproducible, side-dependent effect** -- not a coincidence:
+
+| config | trial 1 | trial 2 |
+|---|---|---|
+| A: away (original) | 46.86Hz | 52.41Hz |
+| B: touching one side | 56.64Hz | 53.91Hz |
+| C: touching other side | 51.45Hz | 52.40Hz |
+| A': away (repeat) | 43.01Hz | 40.79Hz |
+
+Config B sits clearly above both A trials and both C trials (avg ~55.3Hz vs. A's ~49.6Hz and C's ~51.9Hz) -- consistent with the wire coupling asymmetrically depending on which side of the flexure it contacts, physically sensible since different sides of a flexure have different local stiffness/geometry.
+
+**But the A' repeat did NOT reproduce A** -- it came back lower (43.0/40.8Hz) than the original A trials (46.9/52.4Hz), with the second A' trial landing almost exactly on the PRIMARY axis's own resonance (~40.6Hz). This is a real result, not swept under the rug: if wire position alone fully explained this axis's variability, returning to the same physical configuration should reproduce the same number. It didn't. **Conclusion: wire contact is a real, confirmed, reproducible physical lever on the second axis's resonance (Config B's elevation above both A and C trials is not explained by noise alone), but it is a PARTIAL explanation for the documented cross-session drift, not the full story** -- the measured wire effect here (~5-6Hz, comparing B vs. A) is smaller than the ~9-12Hz historical shift (38.5Hz -> 47-50Hz), and the A' repeat shows real additional variability beyond wire position that remains unexplained.
+
+**Does this block the flexure/FEA work? No.** The ~47-50Hz figure already used for the FEA comparison sits comfortably inside this session's full observed range across all 8 second-axis trials (40.8-56.6Hz) -- nothing here contradicts that comparison or the redesign built on it. User's own framing, agreed: proceed with the flexure work; this remains a real but non-blocking open question about the rig's own measurement variability.
+
+Comparison plot (both axes, all 4 configurations, strip-chart style with per-config means): `results/scratch_wire_position_ringdown_plot.png`, added as its own slide in `docs/session_results_2026-08-18_pid_tuning.pptx`.
+
+**State left**: hardware safely idle (`mode=open_loop amp=0 estop=0 dac_x=95 dac_y=95`), confirmed via `get_status` after every trial. `fta_ringdown_test.py`'s `TELEMETRY_RE` fix and all 16 raw ring-down `.npz`/`.png` pairs from this entry are new. **Not yet done**: what specifically causes the A'-vs-A discrepancy (thermal drift over the session, incidental wire micro-repositioning from handling, genuine amplitude-dependent nonlinearity in the ring-down excitation, or something else entirely) -- not investigated further; a true controlled reversibility check (e.g. marking the exact wire position with tape/a fixture rather than eyeballing "away") would be needed to isolate this properly if it's ever revisited.
+
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 
 Frequency-domain complement to the step-response tests, motivated by the
