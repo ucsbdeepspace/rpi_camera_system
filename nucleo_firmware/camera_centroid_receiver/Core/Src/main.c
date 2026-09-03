@@ -221,10 +221,6 @@ static int32_t g_kd_milli = 0;          /* Kd = g_kd_milli/1000, DAC counts per 
 static int32_t g_kp2_milli = 0;
 static int32_t g_ki2_milli = 0;
 static int32_t g_kd2_milli = 0;
-static float   g_last_axis2_correction = 0.0f;  /* TEMP DEBUG 2026-09-03 -- last raw
-                                          * pid_wrapper_calculate2() return value, to
-                                          * diagnose why dac_x isn't moving under axis-2
-                                          * closed-loop control. Remove once resolved. */
 static int32_t g_fc_millihz = 20000;    /* derivative filter cutoff = g_fc_millihz/1000 Hz --
                                           * default matches PIDController.hpp's own example value,
                                           * found 2026-08-18 to be far too high relative to this
@@ -1571,7 +1567,6 @@ static void run_closed_loop_step_axis2(int16_t tel_y_scaled, uint32_t now)
   measured_py = (float)tel_y_scaled / (float)POSITION_SCALE;
 
   correction = pid_wrapper_calculate2(target_py, measured_py, dt_s);
-  g_last_axis2_correction = correction;  /* TEMP DEBUG, see its own docstring */
   output = g_closed_loop_base_dac_x - (int32_t)correction;  /* negated -- see sign note above */
 
   apply_dac(AXIS_X, output);  /* clamps internally to [DAC_MIN_COUNT, DAC_MAX_COUNT] */
@@ -3000,7 +2995,7 @@ static void cmd_get_status(void)
                     "lead=%u lead_fz_millihz=%ld lead_fp_millihz=%ld "
                     "meas_ctrl_rate_millihz=%ld "
                     "open_sine=%u open_sine_freq_millihz=%ld open_sine_axis=%u "
-                    "sine=%u sine_freq_millihz=%ld corr2_x100=%ld\r\n",
+                    "sine=%u sine_freq_millihz=%ld\r\n",
                     (g_mode == MODE_OPEN_LOOP) ? "open_loop" : "closed_loop",
                     (unsigned)amp_en, (unsigned)estop_latched,
                     (long)dac_x, (long)dac_y,
@@ -3023,8 +3018,7 @@ static void cmd_get_status(void)
                     (long)(1000000.0f / g_measured_ctrl_interval_ms),
                     (unsigned)g_open_sine_active, (long)g_open_sine_freq_millihz,
                     (unsigned)g_open_sine_axis,
-                    (unsigned)g_sine_active, (long)g_sine_freq_millihz,
-                    (long)(g_last_axis2_correction * 100.0f));
+                    (unsigned)g_sine_active, (long)g_sine_freq_millihz);
   }
   if (len > 0)
   {
