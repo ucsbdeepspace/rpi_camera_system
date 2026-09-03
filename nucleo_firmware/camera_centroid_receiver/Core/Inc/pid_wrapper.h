@@ -61,6 +61,14 @@ extern "C" {
 void  pid_wrapper_init(float kp, float ki, float kd, float ts_s, float fc_hz,
                         float out_min, float out_max);
 void  pid_wrapper_set_gains(float kp, float ki, float kd);
+void  pid_wrapper_set_gains2(float kp, float ki, float kd);  /* second axis (dac_x <- cy)
+                                            * gains, independent of the first -- added 2026-09-03
+                                            * so axis 2 can be tuned on its own merits (its
+                                            * measured resonance is a gentler ~8x DC gain vs.
+                                            * axis 1's ~11x) instead of only ever mirroring
+                                            * axis 1's gains. ts_s/fc_hz/out_limits stay shared
+                                            * between both axes (timing/safety parameters, not
+                                            * per-axis tuning) -- only Kp/Ki/Kd are independent. */
 void  pid_wrapper_set_fc(float fc_hz);  /* derivative low-pass cutoff, live-settable -- see
                                             * the g_fc_hz comment in pid_wrapper.cpp for why this
                                             * was added (20Hz default found too high relative to

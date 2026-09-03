@@ -47,6 +47,11 @@ static float g_out_min = 0.0f;
 static float g_out_max = 0.0f;
 static float g_kp = 0.0f, g_ki = 0.0f, g_kd = 0.0f;  /* last-commanded gains, so pid_wrapper_set_fc
                                                       * can reconstruct without needing them re-sent */
+/* Second axis's own independent gains -- added 2026-09-03, see
+ * pid_wrapper_set_gains2's header docstring. Seeded equal to the first
+ * axis's gains at pid_wrapper_init() (preserves prior "identical by
+ * default" behavior until explicitly overridden). */
+static float g_kp2 = 0.0f, g_ki2 = 0.0f, g_kd2 = 0.0f;
 
 static void reconstruct(void)
 {
@@ -55,7 +60,7 @@ static void reconstruct(void)
     g_pid->setOutputLimits(g_out_min, g_out_max);
 
     g_pid2->~PIDController();
-    g_pid2 = new (g_pid2_storage) PIDController(g_kp, g_ki, g_kd, g_ts_s, g_fc_hz);
+    g_pid2 = new (g_pid2_storage) PIDController(g_kp2, g_ki2, g_kd2, g_ts_s, g_fc_hz);
     g_pid2->setOutputLimits(g_out_min, g_out_max);
 }
 
@@ -67,6 +72,7 @@ extern "C" void pid_wrapper_init(float kp, float ki, float kd, float ts_s, float
     g_out_min = out_min;
     g_out_max = out_max;
     g_kp = kp; g_ki = ki; g_kd = kd;
+    g_kp2 = kp; g_ki2 = ki; g_kd2 = kd;
     g_pid = new (g_pid_storage) PIDController(kp, ki, kd, g_ts_s, g_fc_hz);
     g_pid->setOutputLimits(g_out_min, g_out_max);
     g_pid2 = new (g_pid2_storage) PIDController(kp, ki, kd, g_ts_s, g_fc_hz);
@@ -82,6 +88,13 @@ extern "C" void pid_wrapper_set_gains(float kp, float ki, float kd)
      * the old integral" behavior (previously done by hand in
      * cmd_set_kp/cmd_set_ki). */
     g_kp = kp; g_ki = ki; g_kd = kd;
+    reconstruct();
+}
+
+extern "C" void pid_wrapper_set_gains2(float kp, float ki, float kd)
+{
+    /* Second axis, independent of the first -- see pid_wrapper.h. */
+    g_kp2 = kp; g_ki2 = ki; g_kd2 = kd;
     reconstruct();
 }
 

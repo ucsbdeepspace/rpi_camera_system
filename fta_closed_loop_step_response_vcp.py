@@ -95,7 +95,7 @@ MICRONS_PER_PIXEL = 3.0  # OV9281 pixel pitch, same constant used throughout thi
 REPLY_RE = re.compile(r"^(OK|ERR|STATUS|WARN)\b")
 TELEMETRY_RE = re.compile(
     r"^seq=\s*(\d+)\s+status=(\d+)\s+x=(-?\d+\.\d)\s+y=(-?\d+\.\d)\s+"
-    r"tgt=(-?\d+\.\d)\s+dac_y=(-?\d+)\s+tick=(\d+)\s+pkts=(\d+)\s+errs=(\d+)\s+cseq=(\d+)$")
+    r"tgt=(-?\d+\.\d)\s+dac_y=(-?\d+)\s+dac_x=(-?\d+)\s+tick=(\d+)\s+pkts=(\d+)\s+errs=(\d+)\s+cseq=(\d+)$")
 STATUS_FIELD_RE = {
     "dac_x": re.compile(r"dac_x=(-?\d+)"),
     "dac_y": re.compile(r"dac_y=(-?\d+)"),
@@ -300,7 +300,7 @@ def _reader_thread(ser, t0, records, stop_event):
             continue
         x = float(m.group(3))
         y = float(m.group(4))
-        tick_ms = int(m.group(7))
+        tick_ms = int(m.group(8))
         records.append((host_now, x, y, tick_ms))
 
 

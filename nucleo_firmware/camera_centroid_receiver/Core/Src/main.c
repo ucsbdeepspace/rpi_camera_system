@@ -212,6 +212,19 @@ static uint8_t g_axis2_enabled = 1;     /* 0 = second axis (dac_x <- cy) holds d
 static int32_t g_kp_milli = 0;          /* Kp = g_kp_milli/1000, DAC counts per pixel of error */
 static int32_t g_ki_milli = 0;          /* Ki = g_ki_milli/1000, DAC counts per (pixel*second) */
 static int32_t g_kd_milli = 0;          /* Kd = g_kd_milli/1000, DAC counts per (pixel/second) */
+/* Second axis's own gains -- added 2026-09-03 so axis 2 (dac_x <- cy)
+ * can be tuned independently instead of only ever mirroring axis 1's
+ * gains (its measured resonance is a gentler ~8x DC gain vs. axis 1's
+ * ~11x, so it may tolerate more aggressive tuning). set_kp2/set_ki2/
+ * set_kd2 below; seeded equal to g_kp_milli/g_ki_milli/g_kd_milli at
+ * pid_wrapper_init() until explicitly overridden. */
+static int32_t g_kp2_milli = 0;
+static int32_t g_ki2_milli = 0;
+static int32_t g_kd2_milli = 0;
+static float   g_last_axis2_correction = 0.0f;  /* TEMP DEBUG 2026-09-03 -- last raw
+                                          * pid_wrapper_calculate2() return value, to
+                                          * diagnose why dac_x isn't moving under axis-2
+                                          * closed-loop control. Remove once resolved. */
 static int32_t g_fc_millihz = 20000;    /* derivative filter cutoff = g_fc_millihz/1000 Hz --
                                           * default matches PIDController.hpp's own example value,
                                           * found 2026-08-18 to be far too high relative to this
@@ -622,7 +635,7 @@ static uint16_t          vcp_cur_len  = 0;  /* length assembled so far into vcp_
  * the largest message (get_status's ~220-byte reply) with a little
  * margin. */
 #define TX_QUEUE_DEPTH   8U
-#define TX_MSG_MAX_LEN   650U  /* bumped 400->460 2026-08-19 for the open_sine=/
+#define TX_MSG_MAX_LEN   720U  /* bumped 400->460 2026-08-19 for the open_sine=/
                                 * open_sine_freq_millihz= STATUS fields, then
                                 * 460->520 same day for lead=/lead_fz_millihz=/
                                 * lead_fp_millihz= -- matches this file's
@@ -648,7 +661,10 @@ static uint16_t          vcp_cur_len  = 0;  /* length assembled so far into vcp_
                                 * could have fixed a fixed-offset buffer
                                 * truncation. 650 gives real margin above
                                 * the current real line length, not just
-                                * enough to fit today's fields exactly. */
+                                * enough to fit today's fields exactly.
+                                * Bumped again 650->720 2026-09-03 for
+                                * kp2_milli=/ki2_milli=/kd2_milli= (second
+                                * axis's own gains). */
 typedef struct { char data[TX_MSG_MAX_LEN]; uint16_t len; } tx_msg_t;
 static tx_msg_t          tx_queue[TX_QUEUE_DEPTH];
 static volatile uint8_t  tx_head  = 0;  /* next slot enqueue_tx fills */
@@ -684,9 +700,13 @@ static void cmd_amp_disable(void);
 static void cmd_clear_estop(void);
 static void cmd_get_status(void);
 static void cmd_set_target_x(const char *arg);
+static void cmd_set_target_y(const char *arg);
 static void cmd_set_kp(const char *arg);
 static void cmd_set_ki(const char *arg);
 static void cmd_set_kd(const char *arg);
+static void cmd_set_kp2(const char *arg);
+static void cmd_set_ki2(const char *arg);
+static void cmd_set_kd2(const char *arg);
 static void cmd_set_fc(const char *arg);
 static void cmd_set_out_limit(const char *arg);
 static void cmd_set_ctrl_rate(const char *arg);
@@ -1551,6 +1571,7 @@ static void run_closed_loop_step_axis2(int16_t tel_y_scaled, uint32_t now)
   measured_py = (float)tel_y_scaled / (float)POSITION_SCALE;
 
   correction = pid_wrapper_calculate2(target_py, measured_py, dt_s);
+  g_last_axis2_correction = correction;  /* TEMP DEBUG, see its own docstring */
   output = g_closed_loop_base_dac_x - (int32_t)correction;  /* negated -- see sign note above */
 
   apply_dac(AXIS_X, output);  /* clamps internally to [DAC_MIN_COUNT, DAC_MAX_COUNT] */
@@ -1728,6 +1749,10 @@ static void process_command_line(char *line)
   {
     cmd_set_target_x(arg);
   }
+  else if (strcmp(cmd, "set_target_y") == 0)
+  {
+    cmd_set_target_y(arg);
+  }
   else if (strcmp(cmd, "set_kp") == 0)
   {
     cmd_set_kp(arg);
@@ -1739,6 +1764,18 @@ static void process_command_line(char *line)
   else if (strcmp(cmd, "set_kd") == 0)
   {
     cmd_set_kd(arg);
+  }
+  else if (strcmp(cmd, "set_kp2") == 0)
+  {
+    cmd_set_kp2(arg);
+  }
+  else if (strcmp(cmd, "set_ki2") == 0)
+  {
+    cmd_set_ki2(arg);
+  }
+  else if (strcmp(cmd, "set_kd2") == 0)
+  {
+    cmd_set_kd2(arg);
   }
   else if (strcmp(cmd, "set_fc") == 0)
   {
@@ -1950,6 +1987,45 @@ static void cmd_set_target_x(const char *arg)
   g_target_x_set = 1;
 
   len = snprintf(resp, sizeof(resp), "OK target_x=%ld\r\n", val);
+  if (len > 0)
+  {
+    send_line(resp);
+  }
+}
+
+/* Sets the closed-loop pixel setpoint for cy -- added 2026-09-03 so axis
+ * 2 can be step-tested the same way axis 1 already is via set_target_x.
+ * Previously g_target_y_scaled was ONLY ever auto-captured (bumpless
+ * "hold cy where it already is") at closed_loop engagement, with no way
+ * to command a NEW target afterward -- fine for "just hold steady" but
+ * unusable for a real step-response test. Engagement still auto-captures
+ * the current cy as usual (see cmd_set_mode); this command lets the
+ * setpoint be moved explicitly at any time after that, exactly mirroring
+ * cmd_set_target_x's own semantics (no g_mode side effects, next control
+ * step just picks up the new target naturally). */
+static void cmd_set_target_y(const char *arg)
+{
+  long  val;
+  char *endptr;
+  char  resp[48];
+  int   len;
+
+  if (arg == NULL || arg[0] == '\0')
+  {
+    send_line("ERR set_target_y requires an argument (pixels)\r\n");
+    return;
+  }
+
+  val = strtol(arg, &endptr, 10);
+  if (endptr == arg)
+  {
+    send_line("ERR invalid integer\r\n");
+    return;
+  }
+
+  g_target_y_scaled = (int32_t)val * POSITION_SCALE;
+
+  len = snprintf(resp, sizeof(resp), "OK target_y=%ld\r\n", val);
   if (len > 0)
   {
     send_line(resp);
@@ -2288,6 +2364,101 @@ static void cmd_set_kd(const char *arg)
   pid_wrapper_set_gains((float)g_kp_milli / 1000.0f, (float)g_ki_milli / 1000.0f, (float)g_kd_milli / 1000.0f);
 
   len = snprintf(resp, sizeof(resp), "OK kd_milli=%ld\r\n", val);
+  if (len > 0)
+  {
+    send_line(resp);
+  }
+}
+
+/* set_kp2/set_ki2/set_kd2 -- second axis's OWN gains, independent of
+ * set_kp/set_ki/set_kd above. Added 2026-09-03 (see g_kp2_milli's own
+ * docstring). Same milli-units integer parsing convention, same
+ * reconstruct-on-every-change behavior (via pid_wrapper_set_gains2),
+ * just targeting g_pid2 instead of g_pid. */
+static void cmd_set_kp2(const char *arg)
+{
+  long  val;
+  char *endptr;
+  char  resp[48];
+  int   len;
+
+  if (arg == NULL || arg[0] == '\0')
+  {
+    send_line("ERR set_kp2 requires an argument (milli-units, e.g. 2500 = Kp 2.5)\r\n");
+    return;
+  }
+
+  val = strtol(arg, &endptr, 10);
+  if (endptr == arg)
+  {
+    send_line("ERR invalid integer\r\n");
+    return;
+  }
+
+  g_kp2_milli = (int32_t)val;
+  pid_wrapper_set_gains2((float)g_kp2_milli / 1000.0f, (float)g_ki2_milli / 1000.0f, (float)g_kd2_milli / 1000.0f);
+
+  len = snprintf(resp, sizeof(resp), "OK kp2_milli=%ld\r\n", val);
+  if (len > 0)
+  {
+    send_line(resp);
+  }
+}
+
+static void cmd_set_ki2(const char *arg)
+{
+  long  val;
+  char *endptr;
+  char  resp[48];
+  int   len;
+
+  if (arg == NULL || arg[0] == '\0')
+  {
+    send_line("ERR set_ki2 requires an argument (milli-units, e.g. 500 = Ki 0.5)\r\n");
+    return;
+  }
+
+  val = strtol(arg, &endptr, 10);
+  if (endptr == arg)
+  {
+    send_line("ERR invalid integer\r\n");
+    return;
+  }
+
+  g_ki2_milli = (int32_t)val;
+  pid_wrapper_set_gains2((float)g_kp2_milli / 1000.0f, (float)g_ki2_milli / 1000.0f, (float)g_kd2_milli / 1000.0f);
+
+  len = snprintf(resp, sizeof(resp), "OK ki2_milli=%ld\r\n", val);
+  if (len > 0)
+  {
+    send_line(resp);
+  }
+}
+
+static void cmd_set_kd2(const char *arg)
+{
+  long  val;
+  char *endptr;
+  char  resp[48];
+  int   len;
+
+  if (arg == NULL || arg[0] == '\0')
+  {
+    send_line("ERR set_kd2 requires an argument (milli-units, e.g. 100 = Kd 0.1)\r\n");
+    return;
+  }
+
+  val = strtol(arg, &endptr, 10);
+  if (endptr == arg)
+  {
+    send_line("ERR invalid integer\r\n");
+    return;
+  }
+
+  g_kd2_milli = (int32_t)val;
+  pid_wrapper_set_gains2((float)g_kp2_milli / 1000.0f, (float)g_ki2_milli / 1000.0f, (float)g_kd2_milli / 1000.0f);
+
+  len = snprintf(resp, sizeof(resp), "OK kd2_milli=%ld\r\n", val);
   if (len > 0)
   {
     send_line(resp);
@@ -2774,7 +2945,8 @@ static void cmd_get_status(void)
   int16_t  tel_x_scaled, tel_y_scaled;
   uint32_t pkt_count, err_count, confident_count, last_tel_tick, now;
   int32_t  dac_x, dac_y;
-  char     line[650];  /* grown alongside TX_MSG_MAX_LEN, see that #define's comment */
+  char     line[720];  /* grown alongside TX_MSG_MAX_LEN, see that #define's comment;
+                        * 650->720 2026-09-03 for kp2_milli=/ki2_milli=/kd2_milli= */
   int      len;
 
   /* Same 2026-08-13 fix as the telemetry snapshot in main()'s while(1)
@@ -2806,26 +2978,29 @@ static void cmd_get_status(void)
   now = HAL_GetTick();
 
   {
-    const char *tx_sign, *ty_sign, *tgt_sign;
-    int         tx_whole, tx_frac, ty_whole, ty_frac, tgt_whole, tgt_frac;
+    const char *tx_sign, *ty_sign, *tgt_sign, *tgty_sign;
+    int         tx_whole, tx_frac, ty_whole, ty_frac, tgt_whole, tgt_frac, tgty_whole, tgty_frac;
     uint32_t    tel_age_ms = (pkt_count > 0U) ? (now - last_tel_tick) : 0U;
 
     decode_scaled(tel_x_scaled, &tx_sign, &tx_whole, &tx_frac);
     decode_scaled(tel_y_scaled, &ty_sign, &ty_whole, &ty_frac);
+    decode_scaled(g_target_y_scaled, &tgty_sign, &tgty_whole, &tgty_frac);
     decode_scaled(g_target_x_scaled, &tgt_sign, &tgt_whole, &tgt_frac);
 
     len = snprintf(line, sizeof(line),
                     "STATUS mode=%s amp=%u estop=%u dac_x=%ld dac_y=%ld "
                     "tel_x=%s%d.%01d tel_y=%s%d.%01d tel_seq=%u tel_status=%u "
                     "tel_age_ms=%lu pkts=%lu errs=%lu confident_pkts=%lu cseq=%lu uptime=%lus "
-                    "target_x_set=%u target_x=%s%d.%01d kp_milli=%ld ki_milli=%ld kd_milli=%ld "
+                    "target_x_set=%u target_x=%s%d.%01d target_y=%s%d.%01d "
+                    "kp_milli=%ld ki_milli=%ld kd_milli=%ld "
+                    "kp2_milli=%ld ki2_milli=%ld kd2_milli=%ld "
                     "fc_millihz=%ld out_limit=%ld ctrl_rate_millihz=%ld ctrl_interval_ms=%lu "
                     "pulse_tick=%lu smoothing=%u axis2=%u "
                     "notch=%u notch_freq_millihz=%ld notch_q_milli=%ld "
                     "lead=%u lead_fz_millihz=%ld lead_fp_millihz=%ld "
                     "meas_ctrl_rate_millihz=%ld "
                     "open_sine=%u open_sine_freq_millihz=%ld open_sine_axis=%u "
-                    "sine=%u sine_freq_millihz=%ld\r\n",
+                    "sine=%u sine_freq_millihz=%ld corr2_x100=%ld\r\n",
                     (g_mode == MODE_OPEN_LOOP) ? "open_loop" : "closed_loop",
                     (unsigned)amp_en, (unsigned)estop_latched,
                     (long)dac_x, (long)dac_y,
@@ -2836,7 +3011,9 @@ static void cmd_get_status(void)
                     (unsigned long)confident_count, (unsigned long)g_ctrl_step_seq,
                     (unsigned long)(now / 1000U),
                     (unsigned)g_target_x_set, tgt_sign, tgt_whole, tgt_frac,
+                    tgty_sign, tgty_whole, tgty_frac,
                     (long)g_kp_milli, (long)g_ki_milli, (long)g_kd_milli,
+                    (long)g_kp2_milli, (long)g_ki2_milli, (long)g_kd2_milli,
                     (long)g_fc_millihz, (long)g_out_limit_counts,
                     (long)g_ctrl_rate_millihz, (unsigned long)g_control_interval_ms,
                     (unsigned long)g_pulse_step_tick, (unsigned)g_smoothing_enabled,
@@ -2846,7 +3023,8 @@ static void cmd_get_status(void)
                     (long)(1000000.0f / g_measured_ctrl_interval_ms),
                     (unsigned)g_open_sine_active, (long)g_open_sine_freq_millihz,
                     (unsigned)g_open_sine_axis,
-                    (unsigned)g_sine_active, (long)g_sine_freq_millihz);
+                    (unsigned)g_sine_active, (long)g_sine_freq_millihz,
+                    (long)(g_last_axis2_correction * 100.0f));
   }
   if (len > 0)
   {
