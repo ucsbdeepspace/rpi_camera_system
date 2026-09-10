@@ -611,6 +611,19 @@ last_stream_xy = {i: (0, 0) for i in indices}  # last (x, y) sent/would-send,
 n_streamed = 0
 n_stream_errors = 0
 t_stream_start = time.monotonic()
+# Recent-rate tracking (added after a real discrepancy: this shell print
+# used to report ONLY a cumulative average since t_stream_start, which
+# keeps dragging toward whatever the slowest stretch since startup was
+# -- e.g. it showed "128/s" while the on-screen overlay's rolling
+# ~30-frame window showed a real, current "518fps", and the cumulative
+# number could only climb toward that slowly, never jump to it. These
+# two track the streamed-count/time at the PREVIOUS print, so the rate
+# below can be recomputed over just the interval since then -- same
+# "recent window, not since-start" fix already applied to the overlay's
+# fps_history deque, just at the STREAM_STATUS_INTERVAL cadence instead
+# of every frame.
+n_streamed_at_last_print = 0
+t_at_last_print = t_stream_start
 
 link = None
 if STREAM_ENABLED and not STREAM_DRY_RUN:
@@ -697,10 +710,21 @@ try:
                                   f"also cap capture fps until the link recovers.")
                 n_streamed += 1
                 if n_streamed % STREAM_STATUS_INTERVAL == 0:
-                    rate = n_streamed / (time.monotonic() - t_stream_start)
-                    print(f"streamed {n_streamed} ({rate:.1f}/s average, "
+                    now_mono = time.monotonic()
+                    avg_rate = n_streamed / (now_mono - t_stream_start)
+                    # Recent rate: just this interval (since the last print),
+                    # not since program start -- see n_streamed_at_last_print's
+                    # own docstring for why the old since-start-only average
+                    # was misleading.
+                    interval_n = n_streamed - n_streamed_at_last_print
+                    interval_dt = now_mono - t_at_last_print
+                    recent_rate = interval_n / interval_dt if interval_dt > 0 else 0.0
+                    print(f"streamed {n_streamed} ({recent_rate:.1f}/s recent, "
+                          f"{avg_rate:.1f}/s avg since start, "
                           f"{n_stream_errors} send failures)  "
                           f"last=({stream_x:.1f},{stream_y:.1f}) valid={beam_valid}")
+                    n_streamed_at_last_print = n_streamed
+                    t_at_last_print = now_mono
 
                 # Auto-track recentering stays on the slower ANALYSIS_INTERVAL_S
                 # cadence regardless -- request_recenter() runs the actual

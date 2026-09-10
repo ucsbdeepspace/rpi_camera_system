@@ -32,6 +32,14 @@ _reader_thread = step_mod._reader_thread
 BASE_DAC_X = 2048  # matches axis 1's own established clean operating point (2048);
                     # axis 2 has no equivalent independently-established "clean region"
                     # yet, used as a reasonable starting point, not a validated one.
+BASE_DAC_Y = 2048  # axis 1's idle position while axis 2 is under test -- found 2026-09-10
+                    # (same bug fixed in fta_closed_loop_step_response_vcp.py): this script
+                    # never set dac_y at all, leaving axis 1's bumpless-transfer base at
+                    # whatever the open_loop floor was (95, near-MAX drive on this inverting
+                    # amp) since axis 1 has zero gain here. Sustained near-max drive on an
+                    # unused channel triggered a real thermal/current-limiting square-wave
+                    # oscillation when this happened on the other axis; parking at center
+                    # avoids it here too.
 STEP_PX = -25.0
 PRE_S = 0.5
 POST_S = 3.0
@@ -60,6 +68,7 @@ def run_trial(ser, kp_milli, ki_milli, kd_milli, label="", step_px=None):
             return None
 
     send_command(ser, f"set_x {BASE_DAC_X}")
+    send_command(ser, f"set_y {BASE_DAC_Y}")
     time.sleep(0.5)
 
     st = get_status(ser)

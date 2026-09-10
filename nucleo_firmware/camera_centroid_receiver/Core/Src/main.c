@@ -547,6 +547,16 @@ static int32_t  g_sine_center_scaled   = 0;  /* POSITION_SCALE-scaled, same unit
 static int32_t  g_sine_amplitude_scaled = 0; /* POSITION_SCALE-scaled */
 static int32_t  g_sine_freq_millihz    = 0;
 static uint32_t g_sine_start_tick      = 0;
+/* Which CONTROL target the closed-loop sine generator sweeps -- added
+ * 2026-09-10 so axis 2 (dac_x <- cy) can get the same on-board-generator
+ * sine-tracking validation axis 1 already had. AXIS_X (0, the default,
+ * matching every pre-existing 3-argument start_sine caller) sweeps
+ * g_target_x_scaled, feeding run_closed_loop_step (axis 1). AXIS_Y (1)
+ * sweeps g_target_y_scaled, feeding run_closed_loop_step_axis2 instead.
+ * Note this is a different meaning of "axis" than g_open_sine_axis above
+ * (which selects a physical DAC channel to drive directly, open-loop) --
+ * this one selects which CLOSED-LOOP control target moves. */
+static fta_axis_t g_sine_axis          = AXIS_X;
 
 /* Open-loop plant excitation (2026-08-19) -- for measuring a real open-
  * loop Bode plot (dac_y -> cx) instead of only ever characterizing the
@@ -888,8 +898,9 @@ int main(void)
       int16_t  y;
       uint32_t pkt_count;
       uint32_t err_count;
-      char     line[190];  /* grown 140->165 2026-08-27 for cseq= (see g_ctrl_step_seq),
-                            * 165->190 2026-09-01 for dac_x= (see g_last_dac_x below) */
+      char     line[210];  /* grown 140->165 2026-08-27 for cseq= (see g_ctrl_step_seq),
+                            * 165->190 2026-09-01 for dac_x= (see g_last_dac_x below),
+                            * 190->210 2026-09-10 for tgt_y= (see decode_scaled(g_target_y_scaled...) below) */
       int      len;
 
       /* Snapshot under a brief IRQ-disable so a new packet landing
@@ -994,8 +1005,8 @@ int main(void)
       }
 
       {
-        const char *x_sign, *y_sign, *tgt_sign;
-        int x_whole, x_frac, y_whole, y_frac, tgt_whole, tgt_frac;
+        const char *x_sign, *y_sign, *tgt_sign, *tgty_sign;
+        int x_whole, x_frac, y_whole, y_frac, tgt_whole, tgt_frac, tgty_whole, tgty_frac;
 
         decode_scaled(x, &x_sign, &x_whole, &x_frac);
         decode_scaled(y, &y_sign, &y_whole, &y_frac);
@@ -1013,6 +1024,14 @@ int main(void)
          * firmware's real start moment. Reporting the setpoint per-
          * sample removes the need to trust any host-side clock at all. */
         decode_scaled(g_target_x_scaled, &tgt_sign, &tgt_whole, &tgt_frac);
+        /* tgt_y= added 2026-09-10, unconditionally (same "report both
+         * channels regardless of which is active" convention as
+         * dac_y=/dac_x= below) -- needed so a host-side sine fit against
+         * axis 2 (g_sine_axis==AXIS_Y, see update_sine_target) has a
+         * per-sample ground-truth target the same way axis 1's fit
+         * already did via tgt=; previously target_y was never relayed at
+         * all. */
+        decode_scaled(g_target_y_scaled, &tgty_sign, &tgty_whole, &tgty_frac);
 
         /* g_last_dac_y is the actual commanded actuator output this
          * cycle (whatever apply_dac() last wrote to DAC1 channel 2) --
@@ -1047,10 +1066,11 @@ int main(void)
         uint32_t tick_now = HAL_GetTick();
 
         len = snprintf(line, sizeof(line),
-                        "seq=%3u status=%u x=%s%d.%01d y=%s%d.%01d tgt=%s%d.%01d dac_y=%ld dac_x=%ld tick=%lu pkts=%lu errs=%lu cseq=%lu\r\n",
+                        "seq=%3u status=%u x=%s%d.%01d y=%s%d.%01d tgt=%s%d.%01d tgt_y=%s%d.%01d dac_y=%ld dac_x=%ld tick=%lu pkts=%lu errs=%lu cseq=%lu\r\n",
                         (unsigned)seq, (unsigned)status,
                         x_sign, x_whole, x_frac, y_sign, y_whole, y_frac,
                         tgt_sign, tgt_whole, tgt_frac,
+                        tgty_sign, tgty_whole, tgty_frac,
                         (long)g_last_dac_y, (long)g_last_dac_x, (unsigned long)tick_now,
                         (unsigned long)pkt_count, (unsigned long)err_count,
                         (unsigned long)g_ctrl_step_seq);
@@ -2047,10 +2067,10 @@ static void cmd_start_sine(const char *arg)
    * matches the precision g_target_x_scaled/tel_x_scaled already carry
    * elsewhere in this firmware, just exposed on the wire directly rather
    * than re-deriving it by another *POSITION_SCALE multiply here. */
-  long  freq_millihz, amplitude_x10, center_px;
+  long  freq_millihz, amplitude_x10, center_px, axis_arg;
   char *p = (char *)arg;
   char *endptr;
-  char  resp[80];
+  char  resp[100];
   int   len;
 
   if (arg == NULL || arg[0] == '\0')
@@ -2083,6 +2103,26 @@ static void cmd_start_sine(const char *arg)
     send_line("ERR invalid center_px\r\n");
     return;
   }
+  p = endptr;
+  while (*p == ' ') { p++; }
+
+  /* AXIS is optional -- 0 (x, default) sweeps target_x/axis 1, matching
+   * every pre-existing 3-argument caller exactly; 1 (y) sweeps
+   * target_y/axis 2 instead, added 2026-09-10 so axis 2 can get the same
+   * on-board-generator sine validation axis 1 already had (see
+   * g_sine_axis's own docstring for why this "axis" means something
+   * different than g_open_sine_axis's). Same "missing arg keeps the
+   * default" tolerance as start_open_sine's axis parsing. */
+  axis_arg = strtol(p, &endptr, 10);
+  if (endptr == p)
+  {
+    axis_arg = (long)AXIS_X;
+  }
+  if (axis_arg != (long)AXIS_X && axis_arg != (long)AXIS_Y)
+  {
+    send_line("ERR axis must be 0 (x) or 1 (y)\r\n");
+    return;
+  }
 
   if (freq_millihz <= 0)
   {
@@ -2093,6 +2133,7 @@ static void cmd_start_sine(const char *arg)
   g_sine_freq_millihz     = (int32_t)freq_millihz;
   g_sine_amplitude_scaled = (int32_t)amplitude_x10;
   g_sine_center_scaled    = (int32_t)center_px * POSITION_SCALE;
+  g_sine_axis             = (fta_axis_t)axis_arg;
   g_sine_start_tick       = HAL_GetTick();
   g_sine_active           = 1;
   g_target_x_set          = 1;
@@ -2102,8 +2143,8 @@ static void cmd_start_sine(const char *arg)
     int amp_whole, amp_frac;
     decode_scaled(g_sine_amplitude_scaled, &amp_sign, &amp_whole, &amp_frac);
     len = snprintf(resp, sizeof(resp),
-                    "OK sine_started freq_millihz=%ld amplitude=%s%d.%01d center=%ld start_tick=%lu\r\n",
-                    freq_millihz, amp_sign, amp_whole, amp_frac, center_px, (unsigned long)g_sine_start_tick);
+                    "OK sine_started freq_millihz=%ld amplitude=%s%d.%01d center=%ld axis=%ld start_tick=%lu\r\n",
+                    freq_millihz, amp_sign, amp_whole, amp_frac, center_px, axis_arg, (unsigned long)g_sine_start_tick);
   }
   if (len > 0)
   {
@@ -2133,8 +2174,16 @@ static void update_sine_target(uint32_t now)
   float phase = 2.0f * 3.14159265358979323846f * freq_hz * elapsed_s;  /* M_PI isn't guaranteed defined by newlib's math.h without extra feature macros -- literal instead */
   float amplitude_scaled = (float)g_sine_amplitude_scaled;
   float center_scaled = (float)g_sine_center_scaled;
+  int32_t new_target = (int32_t)(center_scaled + amplitude_scaled * sinf(phase));
 
-  g_target_x_scaled = (int32_t)(center_scaled + amplitude_scaled * sinf(phase));
+  if (g_sine_axis == AXIS_Y)
+  {
+    g_target_y_scaled = new_target;
+  }
+  else
+  {
+    g_target_x_scaled = new_target;
+  }
 }
 
 /* start_open_sine FREQ_MILLIHZ AMPLITUDE_COUNTS CENTER_COUNTS [AXIS] --
@@ -2995,7 +3044,7 @@ static void cmd_get_status(void)
                     "lead=%u lead_fz_millihz=%ld lead_fp_millihz=%ld "
                     "meas_ctrl_rate_millihz=%ld "
                     "open_sine=%u open_sine_freq_millihz=%ld open_sine_axis=%u "
-                    "sine=%u sine_freq_millihz=%ld\r\n",
+                    "sine=%u sine_freq_millihz=%ld sine_axis=%u\r\n",
                     (g_mode == MODE_OPEN_LOOP) ? "open_loop" : "closed_loop",
                     (unsigned)amp_en, (unsigned)estop_latched,
                     (long)dac_x, (long)dac_y,
@@ -3018,7 +3067,8 @@ static void cmd_get_status(void)
                     (long)(1000000.0f / g_measured_ctrl_interval_ms),
                     (unsigned)g_open_sine_active, (long)g_open_sine_freq_millihz,
                     (unsigned)g_open_sine_axis,
-                    (unsigned)g_sine_active, (long)g_sine_freq_millihz);
+                    (unsigned)g_sine_active, (long)g_sine_freq_millihz,
+                    (unsigned)g_sine_axis);
   }
   if (len > 0)
   {

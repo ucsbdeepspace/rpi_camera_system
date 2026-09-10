@@ -69,8 +69,23 @@ FTA_BAUD = 460800  # camera_centroid_receiver's USART2 rate -- raised from
                     # or slower) for reliable delivery, matching this
                     # project's other VCP scripts.
 
-TELEMETRY_RE = re.compile(
-    r"^seq=\s*(\d+)\s+status=(\d+)\s+x=(-?\d+\.\d)\s+y=(-?\d+\.\d)\s+pkts=(\d+)\s+errs=(\d+)$")
+REPLY_RE = re.compile(r"^(OK|ERR|STATUS|WARN)\b")
+
+# Field-search regexes rather than one strict full-line TELEMETRY_RE match --
+# the relay line has grown several fields since this script was first
+# written (tgt=, dac_y=, dac_x=, tick=, cseq=, ...) and a positional
+# full-line regex anchored with `$` silently stops matching ANYTHING the
+# moment a new field is appended after the ones it expects last. That's a
+# real bug this project has hit repeatedly (see CLAUDE.md) -- confirmed
+# here too: the old regex expected `...pkts=N errs=N$` but the real line
+# now continues with `... errs=N cseq=N`, so it could never match, making
+# capture_centroid() report "NO BEAM DETECTED" on every single point
+# regardless of whether a beam was actually visible. \b word-boundary
+# anchors keep these safe against substring collisions (e.g. `x=` inside
+# `dac_x=`) since `_` is a word character and doesn't create a boundary.
+STATUS_TOKEN_RE = re.compile(r"\bstatus=(\d+)")
+X_TOKEN_RE = re.compile(r"\bx=(-?\d+\.\d)")
+Y_TOKEN_RE = re.compile(r"\by=(-?\d+\.\d)")
 
 STATUS_FIELD_RE = {
     "dac_x": re.compile(r"dac_x=(-?\d+)"),
@@ -91,38 +106,46 @@ def find_fta_port():
     return candidates[0].device
 
 
-def send_command(ser, cmd):
-    """Writes a VCP command and blocks until its reply line arrives, instead
-    of firing-and-forgetting like the old set_x/set_y calls did. Necessary
-    because the firmware's VCP line parser (HAL_UART_RxCpltCallback in
-    main.c) only buffers ONE pending command line at a time -- bytes of a
-    new command that arrive before the main loop has drained/replied to the
-    previous one are silently dropped, no error reported anywhere. Sending
-    set_x immediately followed by set_y with no wait between them raced
-    that one-line buffer: set_x (sent first) usually landed, but set_y's
-    bytes often arrived while set_x's "OK ..." reply was still pending and
-    got dropped -- which silently stuck dac_y while dac_x kept updating,
-    discovered 2026-08-12 when a grid sweep visibly moved only one axis
-    despite manual set_x/set_y control clearly working on both. Waiting for
-    each reply here guarantees the firmware's one-line buffer is empty
-    before the next command is written, removing the race rather than just
-    adding a delay that would still be racy under different timing.
-    Skips telemetry/heartbeat lines (they never start with OK/ERR) while
-    waiting. Raises on a firmware-reported error or a 1s timeout with no
-    reply at all (dropped command, same failure mode as above)."""
-    ser.write(f"{cmd}\n".encode("ascii"))
-    deadline = time.monotonic() + 1.0
-    while time.monotonic() < deadline:
-        raw = ser.readline()
-        if not raw:
-            continue
-        line = raw.decode(errors="replace").strip()
-        if line.startswith("OK"):
-            return line
-        if line.startswith("ERR"):
-            raise RuntimeError(f"firmware rejected {cmd!r}: {line}")
-    raise RuntimeError(f"no reply to {cmd!r} within 1s -- command was likely dropped "
-                        "(see send_command's docstring)")
+def send_command(ser, cmd, char_delay=0.02, reply_timeout=2.0, retries=5):
+    """Paces the write at ~20ms/char rather than one ser.write() burst --
+    a burst write of a whole command line reliably loses bytes under this
+    project's real telemetry load (confirmed repeatedly elsewhere, see
+    fta_closed_loop_step_response_vcp.py's send_command, whose pacing/retry
+    pattern this mirrors). The previous version here did a single-burst
+    write with no retry, which is exactly what crashed a real sweep against
+    the new flexure (RuntimeError on a dropped 'set_x 1100' reply,
+    2026-08-19) -- a single lost reply doesn't mean the command didn't
+    land, just that its acknowledgement did, so retrying instead of raising
+    immediately is both safer and more accurate.
+
+    Clears stale input right before writing (matches the fix in
+    fta_closed_loop_step_response_vcp.py): a prior timed-out command can
+    leave a backlog of unread telemetry sitting in the buffer, and without
+    clearing it the next reply-matching window gets spent draining that
+    backlog instead of watching for a fresh reply.
+
+    Retries up to `retries` times on a timeout (no reply matching
+    OK/ERR/STATUS/WARN within reply_timeout); raises RuntimeError only
+    after every attempt is exhausted, or immediately on a firmware-reported
+    ERR (that's a real rejection, not a dropped byte -- retrying won't
+    change the answer)."""
+    for attempt in range(retries):
+        ser.reset_input_buffer()
+        for ch in cmd + "\n":
+            ser.write(ch.encode("ascii"))
+            time.sleep(char_delay)
+        deadline = time.monotonic() + reply_timeout
+        while time.monotonic() < deadline:
+            raw = ser.readline()
+            if not raw:
+                continue
+            line = raw.decode(errors="replace").strip()
+            if line.startswith("ERR"):
+                raise RuntimeError(f"firmware rejected {cmd!r}: {line}")
+            if REPLY_RE.match(line):
+                return line
+    raise RuntimeError(f"no reply to {cmd!r} after {retries} attempts -- "
+                        "command was likely dropped repeatedly (see send_command's docstring)")
 
 
 def get_status(ser):
@@ -162,13 +185,18 @@ def capture_centroid(ser, capture_s):
     deadline = time.monotonic() + capture_s
     while time.monotonic() < deadline:
         raw = ser.readline()
-        if not raw:
+        if not raw or not raw.startswith(b"seq="):
             continue
-        m = TELEMETRY_RE.match(raw.decode(errors="replace").strip())
-        if not m or not (int(m.group(2)) & 1):
+        line = raw.decode(errors="replace").strip()
+        status_m = STATUS_TOKEN_RE.search(line)
+        if not status_m or not (int(status_m.group(1)) & 1):
             continue
-        xs.append(float(m.group(3)))
-        ys.append(float(m.group(4)))
+        x_m = X_TOKEN_RE.search(line)
+        y_m = Y_TOKEN_RE.search(line)
+        if not x_m or not y_m:
+            continue
+        xs.append(float(x_m.group(1)))
+        ys.append(float(y_m.group(1)))
     if not xs:
         return None
     return float(np.mean(xs)), float(np.mean(ys)), len(xs)
@@ -270,8 +298,23 @@ def main():
     try:
         t_start = time.monotonic()
         for i, (dac_x, dac_y) in enumerate(points):
-            send_command(ser, f"set_x {dac_x}")
-            send_command(ser, f"set_y {dac_y}")
+            try:
+                send_command(ser, f"set_x {dac_x}")
+                send_command(ser, f"set_y {dac_y}")
+            except RuntimeError as e:
+                # A single point failing to command even after
+                # send_command's own 5 retries is rare but real (seen
+                # 2026-08-19: a several-second comms stall, not just one
+                # dropped byte) -- skip this point rather than losing
+                # every point already collected before it. If this
+                # persists across many consecutive points it likely means
+                # a real link problem, not bad luck, but that's still
+                # better diagnosed from the surviving data than from an
+                # aborted run with none.
+                print(f"  [{i+1}/{len(points)}] dac=({dac_x},{dac_y}) "
+                      f"COMMAND FAILED ({e}) -- skipped")
+                n_skipped += 1
+                continue
             time.sleep(args.settle_s)
             result = capture_centroid(ser, args.capture_s)
             if result is None:

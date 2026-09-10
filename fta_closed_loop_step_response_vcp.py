@@ -261,8 +261,8 @@ def analyze_step(t, primary, t_step, settle_tol_px):
         "rise_time_s": rise_time, "overshoot_pct": overshoot_pct,
         "settling_time_s": settling_time,
         "note": None if settling_time is not None else
-                f"never stayed within {settle_tol_px}px of final for the rest "
-                "of the recorded window -- widen --post-s to get a real number",
+                f"never stayed within {settle_tol_px}px ({settle_tol_px*MICRONS_PER_PIXEL:.1f}um) "
+                "of final for the rest of the recorded window -- widen --post-s to get a real number",
     }
 
 
@@ -304,10 +304,180 @@ def _reader_thread(ser, t0, records, stop_event):
         records.append((host_now, x, y, tick_ms))
 
 
+def save_plot(t, x, y, t_step, target_from, target_to, args, metrics,
+              notch_active, notch_freq_hz, notch_q, lead_active, lead_fz_hz, lead_fp_hz,
+              out_limit, ctrl_rate_millihz, ctrl_interval_ms, smoothing, axis2, out_path):
+    """Builds and saves the two-panel (cx/cy) plot -- pulled out of main()
+    into its own function (2026-09-10) so a plotting-only fix (units,
+    layout, a badge) can be verified via --replot against an already-
+    collected npz instead of re-running the actual hardware test, matching
+    the pattern already used in fta_closed_loop_onboard_sine_test.py."""
+    um = MICRONS_PER_PIXEL
+    fig, (ax, ax_y) = plt.subplots(2, 1, figsize=(9, 6.5), dpi=150, sharex=True,
+                                    gridspec_kw={"height_ratios": [1.4, 1]})
+    for a in (ax, ax_y):
+        a.set_facecolor("white")
+        for spine in ("top", "right"):
+            a.spines[spine].set_visible(False)
+        for spine in ("left", "bottom"):
+            a.spines[spine].set_color(GRID)
+        a.tick_params(colors=MUTED, labelsize=9, length=3)
+
+    # Both segments drawn as explicit line SEGMENTS (t[0]->t_step,
+    # t_step->t[-1]), not axhline() for the first one -- axhline() draws
+    # across the FULL axes width regardless of x-limits, so it used to
+    # keep rendering at target_from's height even past t_step, overlapping
+    # the target_to segment and making the commanded step look like it
+    # never happened. Found 2026-09-10.
+    ax.plot([t[0], t_step], [target_from, target_from], color=TARGET_COLOR, linewidth=1.0,
+            linestyle=(0, (2, 2)), alpha=0.7)
+    ax.plot([t_step, t[-1]], [target_to, target_to], color=TARGET_COLOR, linewidth=1.2,
+            linestyle=(0, (2, 2)), label="target_x")
+    ax.plot(t, x, color=BLUE, linewidth=1.4, label="measured cx")
+    ax.axvline(t_step, color=MUTED, linewidth=0.8, linestyle=(0, (1, 2)))
+
+    sec = ax.secondary_yaxis("right", functions=(lambda px: px * um, lambda v: v / um))
+    sec.tick_params(colors=MUTED, labelsize=9, length=3)
+    sec.set_ylabel("µm", fontsize=9, color=MUTED)
+
+    ax.set_ylabel("cx (px)", fontsize=9.5, color=MUTED)
+    ax.legend(frameon=False, fontsize=9, loc="upper right")
+
+    ax_y.plot(t, y, color="#c9962c", linewidth=1.2, label="measured cy (other axis)")
+    ax_y.axvline(t_step, color=MUTED, linewidth=0.8, linestyle=(0, (1, 2)))
+    ax_y.set_xlabel("time (s)", fontsize=9.5, color=MUTED)
+    ax_y.set_ylabel("cy (px)", fontsize=9.5, color=MUTED)
+    # cy gets the same µm secondary axis as cx -- previously only cx had
+    # one, leaving cy pixel-only. Found 2026-09-10 (user: never show a
+    # distance in pixels alone, always pair it with microns).
+    sec_y = ax_y.secondary_yaxis("right", functions=(lambda px: px * um, lambda v: v / um))
+    sec_y.tick_params(colors=MUTED, labelsize=9, length=3)
+    sec_y.set_ylabel("µm", fontsize=9, color=MUTED)
+    y_std = y.std()
+    y_range = y.max() - y.min()
+    ax_y.text(0.02, 0.95, f"cy std={y_std:.2f}px ({y_std*um:.2f}um)  "
+              f"range={y_range:.2f}px ({y_range*um:.2f}um)", transform=ax_y.transAxes,
+              fontsize=8.5, color="#0b0b0b", va="top", ha="left",
+              bbox=dict(facecolor="white", edgecolor=GRID, alpha=0.9, pad=3))
+    # lower right, not upper right -- upper-right is the axis2 status
+    # badge's corner (below) and upper-left is the cy std/range box above;
+    # the legend used to sit directly on top of the axis2 badge text.
+    # Found 2026-09-10.
+    ax_y.legend(frameon=False, fontsize=8.5, loc="lower right")
+
+    if metrics is not None:
+        parts = [f"step: {args.step_px:+.1f}px ({args.step_px*um:+.1f}um) @ dac_y={args.base_dac_y}",
+                 f"Kp={args.kp_milli/1000:.2f} Ki={args.ki_milli/1000:.2f} Kd={args.kd_milli/1000:.2f}"]
+        if out_limit < 3905:  # firmware default is +-3905 (full DAC span) -- only worth
+            parts.append(f"out_limit: ±{out_limit} counts (tightened anti-windup)")  # flagging when tightened
+        if ctrl_interval_ms > 0:
+            parts.append(f"ctrl_rate: {ctrl_rate_millihz/1000.0:.0f}Hz (throttled, "
+                          f"{ctrl_interval_ms}ms gate)")
+        if smoothing:
+            parts.append("smoothing: boxcar ON")
+        if metrics["rise_time_s"] is not None:
+            parts.append(f"rise: {metrics['rise_time_s']*1000:.0f}ms")
+        if metrics["overshoot_pct"] is not None:
+            parts.append(f"overshoot: {metrics['overshoot_pct']:.1f}%")
+        if metrics["settling_time_s"] is not None:
+            parts.append(f"settling ({args.settle_tol_px}px / {args.settle_tol_px*um:.1f}um): "
+                          f"{metrics['settling_time_s']*1000:.0f}ms")
+        else:
+            parts.append("settling: not reached in window")
+        ax.text(0.02, 0.03, "\n".join(parts), transform=ax.transAxes, fontsize=8.5,
+                color="#0b0b0b", va="bottom", ha="left",
+                bbox=dict(facecolor="white", edgecolor=GRID, alpha=0.9, pad=4))
+
+    # Notch-filter badge -- always shown (not just when active), high-
+    # contrast, so a viewer glancing at a saved PNG can't mistake a
+    # notch-filtered run for a plain-PID one or vice versa. Ground-truth
+    # (from get_status), not just an echo of whatever CLI args were passed.
+    if notch_active:
+        notch_label = f"NOTCH ON: {notch_freq_hz:.1f}Hz  Q={notch_q:.1f}"
+        notch_box = dict(facecolor="#fff3cd", edgecolor="#c9962c", alpha=0.95, pad=5)
+        notch_color = "#7a5b00"
+    else:
+        notch_label = "notch: off"
+        notch_box = dict(facecolor="white", edgecolor=GRID, alpha=0.8, pad=4)
+        notch_color = MUTED
+    ax.text(0.02, 0.97, notch_label, transform=ax.transAxes, fontsize=9,
+            fontweight=("bold" if notch_active else "normal"), color=notch_color,
+            va="top", ha="left", bbox=notch_box)
+
+    # Lead-compensator badge -- stacked directly under the notch badge
+    # (same top-left corner, same "always shown, ground-truth" reasoning).
+    if lead_active:
+        lead_label = f"LEAD ON: fz={lead_fz_hz:.1f}Hz  fp={lead_fp_hz:.1f}Hz"
+        lead_box = dict(facecolor="#d9ecff", edgecolor="#2a78d6", alpha=0.95, pad=5)
+        lead_color = "#0b3d73"
+    else:
+        lead_label = "lead: off"
+        lead_box = dict(facecolor="white", edgecolor=GRID, alpha=0.8, pad=4)
+        lead_color = MUTED
+    ax.text(0.02, 0.89, lead_label, transform=ax.transAxes, fontsize=9,
+            fontweight=("bold" if lead_active else "normal"), color=lead_color,
+            va="top", ha="left", bbox=lead_box)
+
+    # Control-rate throttle badge -- top-right (notch's badge owns top-left),
+    # only shown when active: throttling is a deliberate deviation from real
+    # operating conditions (not a normal tuning knob like Kp/Ki), so a
+    # throttled run should never be mistaken for a full-rate one at a glance.
+    if ctrl_interval_ms > 0:
+        ax.text(0.98, 0.97, f"THROTTLED: {ctrl_rate_millihz/1000.0:.0f}Hz "
+                f"(gate {ctrl_interval_ms}ms)", transform=ax.transAxes, fontsize=9,
+                fontweight="bold", color="#8a1f1f", va="top", ha="right",
+                bbox=dict(facecolor="#fde2e2", edgecolor="#b33a3a", alpha=0.95, pad=5))
+
+    # Smoothing badge -- bottom-right (notch owns top-left, throttle owns
+    # top-right), only shown when active for the same "never mistaken at
+    # a glance" reasoning as the other two.
+    if smoothing:
+        ax.text(0.98, 0.03, "BOXCAR SMOOTHING ON", transform=ax.transAxes, fontsize=9,
+                fontweight="bold", color="#1f6b3a", va="bottom", ha="right",
+                bbox=dict(facecolor="#e3f5e8", edgecolor="#3a9c5c", alpha=0.95, pad=5))
+
+    # axis2 badge -- on the cy panel itself, since that's the axis it
+    # controls. Always shown (on AND off), since "was axis2 active" is
+    # exactly the thing an A/B comparison plot needs to be unambiguous
+    # about at a glance.
+    axis2_label = "AXIS2 ON (dac_x correcting cy)" if axis2 else "axis2 OFF (dac_x held fixed)"
+    axis2_box = (dict(facecolor="#e3f5e8", edgecolor="#3a9c5c", alpha=0.95, pad=4) if axis2
+                 else dict(facecolor="white", edgecolor=GRID, alpha=0.85, pad=4))
+    ax_y.text(0.98, 0.95, axis2_label, transform=ax_y.transAxes, fontsize=8.5,
+              fontweight=("bold" if axis2 else "normal"),
+              color=("#1f6b3a" if axis2 else MUTED), va="top", ha="right", bbox=axis2_box)
+
+    title = "Closed-loop step response, dac_y → cx (+ cy, axis2 "
+    title += "ON)" if axis2 else "OFF)"
+    if notch_active:
+        title += f"  (notch @ {notch_freq_hz:.1f}Hz)"
+    if ctrl_interval_ms > 0:
+        title += f"  (throttled {ctrl_rate_millihz/1000.0:.0f}Hz)"
+    if smoothing:
+        title += "  (boxcar smoothing)"
+    fig.suptitle(title, fontsize=13, fontweight="bold")
+    fig.tight_layout()
+    png_path = out_path.rsplit(".", 1)[0] + ".png"
+    fig.savefig(png_path, facecolor="white")
+    plt.close(fig)
+    print(f"Saved plot to {png_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--base-dac-y", type=int, default=2048)
+    parser.add_argument("--base-dac-x", type=int, default=2048,
+                         help="idle position for dac_x before closed_loop engages, default 2048 "
+                              "(center/near-zero drive on this inverting amp). Matters even when "
+                              "axis2 has zero gain: MODE_CLOSED_LOOP captures axis 2's bumpless-"
+                              "transfer base from whatever dac_x IS at the moment of engagement, "
+                              "then holds it there for the rest of the run. Every prior run of this "
+                              "script never set dac_x at all, leaving it at the open_loop default "
+                              "floor (95) -- near-MAX drive on this amp, not near-zero -- which was "
+                              "found 2026-09-10 to trigger a real thermal/current-limiting square-"
+                              "wave oscillation in cy over several seconds. Confirmed fixed by "
+                              "parking here at 2048 instead.")
     parser.add_argument("--step-px", type=float, default=-25.0)
     parser.add_argument("--kp-milli", type=int, default=1750)
     parser.add_argument("--ki-milli", type=int, default=200000)
@@ -363,7 +533,31 @@ def main():
     parser.add_argument("--settle-tol-px", type=float, default=2.0)
     parser.add_argument("--port", default=None)
     parser.add_argument("--out", default=None)
+    parser.add_argument("--replot", default=None,
+                         help="path to an existing results/*.npz from a previous run -- "
+                              "regenerates just its PNG (recomputing metrics from the saved "
+                              "t/x/y with the CURRENT analyze_step()/save_plot(), e.g. after a "
+                              "plotting or units fix) without touching the serial port or "
+                              "hardware at all. --settle-tol-px still applies (not saved in the "
+                              "npz); every other CLI arg is ignored in this mode.")
     args = parser.parse_args()
+
+    if args.replot:
+        d = np.load(args.replot, allow_pickle=True)
+        t, x, y = d["t"], d["x"], d["y"]
+        t_step = float(d["t_step"])
+        metrics = analyze_step(t, x, t_step, args.settle_tol_px)
+        if metrics is not None and metrics["note"]:
+            print(f"NOTE: {metrics['note']}")
+        save_args = argparse.Namespace(step_px=float(d["step_px"]), base_dac_y=int(d["base_dac_y"]),
+                                        kp_milli=int(d["kp_milli"]), ki_milli=int(d["ki_milli"]),
+                                        kd_milli=int(d["kd_milli"]), settle_tol_px=args.settle_tol_px)
+        save_plot(t, x, y, t_step, float(d["target_from"]), float(d["target_to"]), save_args, metrics,
+                  bool(d["notch_active"]), float(d["notch_freq_hz"]), float(d["notch_q"]),
+                  bool(d["lead_active"]), float(d["lead_fz_hz"]), float(d["lead_fp_hz"]),
+                  int(d["out_limit"]), int(d["ctrl_rate_millihz"]), int(d["ctrl_interval_ms"]),
+                  bool(d["smoothing"]), bool(d["axis2"]), args.replot)
+        return
 
     import serial
 
@@ -396,8 +590,9 @@ def main():
             ser.close()
             raise SystemExit(1)
 
-    print(f"Pre-positioning dac_y={args.base_dac_y} (open_loop)...")
+    print(f"Pre-positioning dac_y={args.base_dac_y}, dac_x={args.base_dac_x} (open_loop)...")
     print(send_command(ser, f"set_y {args.base_dac_y}"))
+    print(send_command(ser, f"set_x {args.base_dac_x}"))
     time.sleep(0.5)
 
     st = get_status(ser)
@@ -405,7 +600,8 @@ def main():
     target_from = round(baseline_cx)
     target_to = round(baseline_cx + args.step_px)
     print(f"baseline cx={baseline_cx:.1f}  target_from={target_from}  "
-          f"target_to={target_to} (step {args.step_px:+.1f}px)  "
+          f"target_to={target_to} (step {args.step_px:+.1f}px / "
+          f"{args.step_px*MICRONS_PER_PIXEL:+.1f}um)  "
           f"Kp_milli={args.kp_milli} Ki_milli={args.ki_milli} Kd_milli={args.kd_milli}")
 
     print(send_command(ser, f"set_target_x {target_from}"))
@@ -562,139 +758,9 @@ def main():
               ctrl_interval_ms=ctrl_interval_ms, smoothing=smoothing, axis2=axis2)
     print(f"Saved raw time series to {out_path}")
 
-    # --- plot --- two panels: cx (the driven axis) on top, cy (the OTHER
-    # axis -- what axis2, when enabled, is trying to hold steady) below,
-    # sharing the time axis, so a Y-step test directly shows whether the
-    # second axis controller visibly changes cy's behavior.
-    fig, (ax, ax_y) = plt.subplots(2, 1, figsize=(9, 6.5), dpi=150, sharex=True,
-                                    gridspec_kw={"height_ratios": [1.4, 1]})
-    for a in (ax, ax_y):
-        a.set_facecolor("white")
-        for spine in ("top", "right"):
-            a.spines[spine].set_visible(False)
-        for spine in ("left", "bottom"):
-            a.spines[spine].set_color(GRID)
-        a.tick_params(colors=MUTED, labelsize=9, length=3)
-
-    ax.axhline(target_from, color=TARGET_COLOR, linewidth=1.0, linestyle=(0, (2, 2)), alpha=0.7)
-    ax.plot([t_step, t[-1]], [target_to, target_to], color=TARGET_COLOR, linewidth=1.2,
-            linestyle=(0, (2, 2)), label="target_x")
-    ax.plot(t, x, color=BLUE, linewidth=1.4, label="measured cx")
-    ax.axvline(t_step, color=MUTED, linewidth=0.8, linestyle=(0, (1, 2)))
-
-    sec = ax.secondary_yaxis("right", functions=(lambda px: px * um, lambda v: v / um))
-    sec.tick_params(colors=MUTED, labelsize=9, length=3)
-    sec.set_ylabel("µm", fontsize=9, color=MUTED)
-
-    ax.set_ylabel("cx (px)", fontsize=9.5, color=MUTED)
-    ax.legend(frameon=False, fontsize=9, loc="upper right")
-
-    ax_y.plot(t, y, color="#c9962c", linewidth=1.2, label="measured cy (other axis)")
-    ax_y.axvline(t_step, color=MUTED, linewidth=0.8, linestyle=(0, (1, 2)))
-    ax_y.set_xlabel("time (s)", fontsize=9.5, color=MUTED)
-    ax_y.set_ylabel("cy (px)", fontsize=9.5, color=MUTED)
-    y_std = y.std()
-    y_range = y.max() - y.min()
-    ax_y.text(0.02, 0.95, f"cy std={y_std:.2f}px  range={y_range:.2f}px", transform=ax_y.transAxes,
-              fontsize=8.5, color="#0b0b0b", va="top", ha="left",
-              bbox=dict(facecolor="white", edgecolor=GRID, alpha=0.9, pad=3))
-    ax_y.legend(frameon=False, fontsize=8.5, loc="upper right")
-
-    if metrics is not None:
-        parts = [f"step: {args.step_px:+.1f}px @ dac_y={args.base_dac_y}",
-                 f"Kp={args.kp_milli/1000:.2f} Ki={args.ki_milli/1000:.2f} Kd={args.kd_milli/1000:.2f}"]
-        if out_limit < 3905:  # firmware default is +-3905 (full DAC span) -- only worth
-            parts.append(f"out_limit: ±{out_limit} counts (tightened anti-windup)")  # flagging when tightened
-        if ctrl_interval_ms > 0:
-            parts.append(f"ctrl_rate: {ctrl_rate_millihz/1000.0:.0f}Hz (throttled, "
-                          f"{ctrl_interval_ms}ms gate)")
-        if smoothing:
-            parts.append("smoothing: boxcar ON")
-        if metrics["rise_time_s"] is not None:
-            parts.append(f"rise: {metrics['rise_time_s']*1000:.0f}ms")
-        if metrics["overshoot_pct"] is not None:
-            parts.append(f"overshoot: {metrics['overshoot_pct']:.1f}%")
-        if metrics["settling_time_s"] is not None:
-            parts.append(f"settling ({args.settle_tol_px}px): {metrics['settling_time_s']*1000:.0f}ms")
-        else:
-            parts.append("settling: not reached in window")
-        ax.text(0.02, 0.03, "\n".join(parts), transform=ax.transAxes, fontsize=8.5,
-                color="#0b0b0b", va="bottom", ha="left",
-                bbox=dict(facecolor="white", edgecolor=GRID, alpha=0.9, pad=4))
-
-    # Notch-filter badge -- always shown (not just when active), high-
-    # contrast, so a viewer glancing at a saved PNG can't mistake a
-    # notch-filtered run for a plain-PID one or vice versa. Ground-truth
-    # (from get_status), not just an echo of whatever CLI args were passed.
-    if notch_active:
-        notch_label = f"NOTCH ON: {notch_freq_hz:.1f}Hz  Q={notch_q:.1f}"
-        notch_box = dict(facecolor="#fff3cd", edgecolor="#c9962c", alpha=0.95, pad=5)
-        notch_color = "#7a5b00"
-    else:
-        notch_label = "notch: off"
-        notch_box = dict(facecolor="white", edgecolor=GRID, alpha=0.8, pad=4)
-        notch_color = MUTED
-    ax.text(0.02, 0.97, notch_label, transform=ax.transAxes, fontsize=9,
-            fontweight=("bold" if notch_active else "normal"), color=notch_color,
-            va="top", ha="left", bbox=notch_box)
-
-    # Lead-compensator badge -- stacked directly under the notch badge
-    # (same top-left corner, same "always shown, ground-truth" reasoning).
-    if lead_active:
-        lead_label = f"LEAD ON: fz={lead_fz_hz:.1f}Hz  fp={lead_fp_hz:.1f}Hz"
-        lead_box = dict(facecolor="#d9ecff", edgecolor="#2a78d6", alpha=0.95, pad=5)
-        lead_color = "#0b3d73"
-    else:
-        lead_label = "lead: off"
-        lead_box = dict(facecolor="white", edgecolor=GRID, alpha=0.8, pad=4)
-        lead_color = MUTED
-    ax.text(0.02, 0.89, lead_label, transform=ax.transAxes, fontsize=9,
-            fontweight=("bold" if lead_active else "normal"), color=lead_color,
-            va="top", ha="left", bbox=lead_box)
-
-    # Control-rate throttle badge -- top-right (notch's badge owns top-left),
-    # only shown when active: throttling is a deliberate deviation from real
-    # operating conditions (not a normal tuning knob like Kp/Ki), so a
-    # throttled run should never be mistaken for a full-rate one at a glance.
-    if ctrl_interval_ms > 0:
-        ax.text(0.98, 0.97, f"THROTTLED: {ctrl_rate_millihz/1000.0:.0f}Hz "
-                f"(gate {ctrl_interval_ms}ms)", transform=ax.transAxes, fontsize=9,
-                fontweight="bold", color="#8a1f1f", va="top", ha="right",
-                bbox=dict(facecolor="#fde2e2", edgecolor="#b33a3a", alpha=0.95, pad=5))
-
-    # Smoothing badge -- bottom-right (notch owns top-left, throttle owns
-    # top-right), only shown when active for the same "never mistaken at
-    # a glance" reasoning as the other two.
-    if smoothing:
-        ax.text(0.98, 0.03, "BOXCAR SMOOTHING ON", transform=ax.transAxes, fontsize=9,
-                fontweight="bold", color="#1f6b3a", va="bottom", ha="right",
-                bbox=dict(facecolor="#e3f5e8", edgecolor="#3a9c5c", alpha=0.95, pad=5))
-
-    # axis2 badge -- on the cy panel itself, since that's the axis it
-    # controls. Always shown (on AND off), since "was axis2 active" is
-    # exactly the thing an A/B comparison plot needs to be unambiguous
-    # about at a glance.
-    axis2_label = "AXIS2 ON (dac_x correcting cy)" if axis2 else "axis2 OFF (dac_x held fixed)"
-    axis2_box = (dict(facecolor="#e3f5e8", edgecolor="#3a9c5c", alpha=0.95, pad=4) if axis2
-                 else dict(facecolor="white", edgecolor=GRID, alpha=0.85, pad=4))
-    ax_y.text(0.98, 0.95, axis2_label, transform=ax_y.transAxes, fontsize=8.5,
-              fontweight=("bold" if axis2 else "normal"),
-              color=("#1f6b3a" if axis2 else MUTED), va="top", ha="right", bbox=axis2_box)
-
-    title = "Closed-loop step response, dac_y → cx (+ cy, axis2 "
-    title += "ON)" if axis2 else "OFF)"
-    if notch_active:
-        title += f"  (notch @ {notch_freq_hz:.1f}Hz)"
-    if ctrl_interval_ms > 0:
-        title += f"  (throttled {ctrl_rate_millihz/1000.0:.0f}Hz)"
-    if smoothing:
-        title += "  (boxcar smoothing)"
-    fig.suptitle(title, fontsize=13, fontweight="bold")
-    fig.tight_layout()
-    png_path = out_path.rsplit(".", 1)[0] + ".png"
-    fig.savefig(png_path, facecolor="white")
-    plt.close(fig)
-    print(f"Saved plot to {png_path}")
+    save_plot(t, x, y, t_step, target_from, target_to, args, metrics,
+              notch_active, notch_freq_hz, notch_q, lead_active, lead_fz_hz, lead_fp_hz,
+              out_limit, ctrl_rate_millihz, ctrl_interval_ms, smoothing, axis2, out_path)
 
 
 if __name__ == "__main__":
