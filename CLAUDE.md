@@ -6174,6 +6174,37 @@ Plots: `results/scratch_buzz_fft_axis1_kp1750_ki200000_<ts>.png`, `results/scrat
 
 **State left**: hardware safely idle (`mode=open_loop amp=0 estop=0 dac_x=95 dac_y=95`), confirmed via `get_status` after both checks. `scratch_buzz_fft.py` is new. **Not yet done**: whether a longer capture would resolve the ~37Hz peak more precisely against the 39.6-40.7Hz ring-down figure (8s gives ~0.12Hz FFT bin resolution, already fine enough to identify the SAME resonance, not fine enough to argue the exact Hz matters); whether axis 2's weak broadband bump is itself worth chasing further or is simply the noise floor.
 
+### Thermal/current-limit characterization on the stiffer flexure — a "fixed DAC threshold" was found then DISPROVEN; real effect is cumulative heat buildup, not an instantaneous power limit (2026-09-10)
+
+Different thread from the resonance/control-tuning work above: characterizing how far off-center this flexure (current stiffer one, current PCB coil board) can be driven before real current-limiting/thermal oscillation kicks in, and how many microns/watts that corresponds to — asked for specifically before moving on to test the old flexure with the new low-resistance coil board (that comparison is still deferred, not started).
+
+**Built `thermal_hold_test.py`** (scratchpad, not committed): holds one axis's DAC at a fixed open-loop value (amp enabled, other axis parked at 2048 — center, near-zero drive on this inverting amp, to avoid confounding with the already-known parked-at-floor bug below) and watches the corresponding measured coordinate for oscillation via a simple range>8px threshold over a short (~12s) hold — a real square-wave thermal-cycling artifact reads as std~30-35px/range~75-135px, vs. a clean hold's sub-1px noise, so 8px is a robust detector either way.
+
+**First-pass bisection (dac_y axis) suggested a fixed, asymmetric safe range: ~DAC 1200 (low side) to ~3800-4000 (high side)**, i.e. ~316um of real travel out of the firmware's full ~457um clamp range (95-4000) — around 69% of full range usable. Voltage/power at those two thresholds, computed from the existing old-board V(DAC) fit (`fta_amp_voltage_calibration.npz`, 2026-08-06) — **user directly measured this session's actual coil resistance at 1.6ohm** (not the initially-assumed "half of the old board's 2.85ohm" — every reference to that assumed value was found and corrected, in `thermal_hold_test.py` and the power-vs-DAC plot script, before anything got trusted): ~381mW at the low threshold, ~1.12W at the high threshold — a real ~3x power asymmetry between the two sides.
+
+**User pushback, correctly skeptical**: a 3x power asymmetry between two current-limit thresholds on what should be a roughly symmetric inverting-amp topology is a lot to explain away, and the original bisection data was never saved to disk (only printed to terminal) — no way to check whether it was contaminated by test-order/thermal-history effects (several trials run back-to-back while bisecting, no controlled cooldown between them).
+
+**Built a proper order-independence recheck** (`thermal_asymmetry_recheck.py`): 4 trials at the two threshold values, order **low(1200) -> high(3900) -> high(3900) repeat -> low(1200) repeat**, with a 90s cooldown (idle, amp on but zero-drive) between each — designed so trial 2 vs 3 isolates whether High's verdict depends on what ran immediately before it, and trial 1 vs 4 isolates the same for Low.
+
+**Result: the "fixed threshold" finding is DISPROVEN, decisively.** Both DAC values flipped verdict depending purely on trial order, not on which DAC value was driven:
+
+| trial | order | value | range (px) | verdict |
+|---|---|---|---|---|
+| 1 | cold start | low (1200) | 1.40 | clean |
+| 2 | right after low | high (3900) | 2.00 | clean |
+| 3 | right after high | high (3900) | 77.00 | **OSCILLATING** |
+| 4 | right after two high trials | low (1200) | 37.90 | **OSCILLATING** |
+
+DAC=1200 gave opposite verdicts (clean -> oscillating) between trial 1 and trial 4; DAC=3900 gave opposite verdicts (clean -> oscillating) between trial 2 and trial 3 — same DAC value, same nominal test, only the recent history differed. A 90s cooldown was not enough to reset state. **Real conclusion: this is cumulative heat buildup from sustained/repeated driving, not an instantaneous power threshold tied to a fixed DAC value** — a cold actuator tolerates a setting the same actuator, warmed up from recent driving, will not. The whole earlier "~1200 low / ~3900 high, asymmetric" characterization (and by extension the specific power/micron numbers derived from it) does not hold up as a fixed property and should not be trusted or reused — the recheck data supersedes it.
+
+**Separately, re-confirmed via a more rigorous FFT-based test** (`thermal_hold_test_fft.py`: 60s hold instead of 12s, raw telemetry saved, spectral SNR check in the 0.3-3Hz band) that DAC=1500 (near center) is genuinely quiet, not just under-detected by the simple range threshold — std=0.47px/range=2.2px, ~60x smaller than the confirmed-oscillating cases, and the one FFT "peak" it flagged (0.33Hz, band-edge, monotonically-decaying low-frequency spectrum shape) is consistent with ordinary slow drift, not a discrete periodic component. This finding is unaffected by the order-dependence discovery above — it was checking "is near-center quiet," not "is there a fixed threshold farther out."
+
+**Still solid, unaffected by the retraction**: parking an inactive axis at the open-loop floor (DAC=95) draws **~1.69W continuously** (R=1.6ohm, measured) — the single highest-power state across the whole DAC range, directly explaining the amp heat observed mid-session when this bug was first found and fixed (inactive axis left parked at the open-loop floor = near-max drive on this inverting amp, not near-zero).
+
+**Slide added** (`docs/session_results_2026-08-18_pid_tuning.pptx`, slide 37, zip-integrity-verified): "Thermal/current-limit oscillation is cumulative heating, not a fixed DAC threshold" — the corrected framing above, plus the order-dependence bar chart (`results/scratch_thermal_order_recheck.png`) as the key evidence. The earlier power-vs-DAC plot (`results/scratch_power_estimate_newboard.png`) had its "confirmed-clean range" shading removed since that range is no longer a trustworthy claim; the R=1.6ohm correction is baked into its power curves.
+
+**State left**: hardware safely idle (`mode=open_loop amp=0 estop=0 dac_x=95 dac_y=95`) after every trial. `thermal_hold_test.py`, `thermal_hold_test_fft.py`, `thermal_asymmetry_recheck.py`, `build_updated_power_plot.py`, `build_thermal_order_plot.py`, and `add_thermal_slide.py` are scratchpad-only (not in this repo) — worth promoting to a real committed script if this thermal-characterization work continues. **Not yet done**: a real thermal time-constant characterization (how long at a given power to trip oscillation, how long to actually cool down — 90s was shown insufficient but the real number isn't known); dac_x (axis 2) has had no thermal-threshold characterization at all, cumulative-heating-aware or otherwise; the old-flexure-with-new-PCB-board comparison, still explicitly deferred by the user to a future session.
+
 ### Sine-tracking test built, 3 frequencies run — clean shape tracking, phase-lag magnitude unresolved (2026-08-04)
 
 Frequency-domain complement to the step-response tests, motivated by the
