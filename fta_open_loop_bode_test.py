@@ -60,9 +60,15 @@ REPLY_RE = re.compile(r"^(OK|ERR|STATUS|WARN)\b")
 # dac_x= added 2026-09-01 alongside the axis-selectable open-loop sine
 # generator -- previously only dac_y was relayed per-packet, which had no
 # ground truth for a dac_x-driven (axis=x) sweep.
+# tgt_y= added here 2026-09-10 -- the wire format grew this field back in
+# the axis-2 closed-loop sine work (2026-08-13/14) but this script's regex
+# was never updated for it; the old ^...$-anchored pattern silently failed
+# to match ANY telemetry line (0 samples on every single trial), the same
+# bug class this project has hit repeatedly. Group indices below shifted
+# by one to account for the new group.
 TELEMETRY_RE = re.compile(
     r"^seq=\s*(\d+)\s+status=(\d+)\s+x=(-?\d+\.\d)\s+y=(-?\d+\.\d)\s+"
-    r"tgt=(-?\d+\.\d)\s+dac_y=(-?\d+)\s+dac_x=(-?\d+)\s+tick=(\d+)\s+pkts=(\d+)\s+errs=(\d+)\s+cseq=(\d+)$")
+    r"tgt=(-?\d+\.\d)\s+tgt_y=(-?\d+\.\d)\s+dac_y=(-?\d+)\s+dac_x=(-?\d+)\s+tick=(\d+)\s+pkts=(\d+)\s+errs=(\d+)\s+cseq=(\d+)$")
 # Core fields only required for the connectivity/amp check -- open_sine
 # fields are read separately with retries, same reasoning as the
 # 2026-08-19 fix in fta_closed_loop_onboard_sine_test.py (a corrupted/
@@ -205,7 +211,7 @@ def _reader_thread(ser, records, stop_event, axis="y"):
     firmware's axis-selectable start_open_sine, to characterize the
     second control pathway with the same rigor as the first."""
     meas_group = 3 if axis == "y" else 4
-    dac_group = 6 if axis == "y" else 7
+    dac_group = 7 if axis == "y" else 8
     while not stop_event.is_set():
         try:
             raw = ser.readline()
@@ -221,7 +227,7 @@ def _reader_thread(ser, records, stop_event, axis="y"):
             continue
         measured = float(m.group(meas_group))
         dac_commanded = int(m.group(dac_group))
-        tick_ms = int(m.group(8))
+        tick_ms = int(m.group(9))
         records.append((tick_ms, measured, dac_commanded))
 
 
