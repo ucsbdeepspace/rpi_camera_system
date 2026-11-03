@@ -38,12 +38,11 @@ Usage:
                    for a fast first pass -- narrow it once a rough
                    calibration confirms the safe/valid range).
     --settle-s SEC  wait after each set_x/set_y before capturing, default
-                   0.3 -- comfortably above the largest small-step settling
-                   time measured in the step-response tests (469ms was the
-                   outlier; most were under 250ms), short of the ~1s
-                   large-step settling times (grid steps stay in the
-                   small-step regime by design, matching CLAUDE.md's
-                   guidance for why grid_scan wasn't needed here).
+                   0.5 (raised from an earlier 0.3 default, 2026-11-03, to
+                   give a comfortable margin over every settling time this
+                   project has measured for a grid-sized step, including
+                   the 469ms outlier and the slower large-step tail, not
+                   just the ~250ms typical case).
     --capture-s SEC  how long to average relayed telemetry samples over
                    after settling, default 0.15 (~25-30 samples at the
                    ~170-190/s relay rate).
@@ -244,7 +243,7 @@ def main():
     parser.add_argument("x2", type=int)
     parser.add_argument("y2", type=int)
     parser.add_argument("--grid-step", type=int, default=300)
-    parser.add_argument("--settle-s", type=float, default=0.3)
+    parser.add_argument("--settle-s", type=float, default=0.5)
     parser.add_argument("--capture-s", type=float, default=0.15)
     parser.add_argument("--port", default=None)
     parser.add_argument("--out", default=None)
