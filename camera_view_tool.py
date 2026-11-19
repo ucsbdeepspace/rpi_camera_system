@@ -76,6 +76,12 @@ Controls:
       trade recenter responsiveness for request volume or vice versa.
   q   quit
 
+Blinks an LED on GPIO22 (BCM, via lgpio -- see HEARTBEAT_LED_PIN) at a
+fixed ~1Hz rate for as long as this tool is running, as a simple "is this
+actually alive" bench indicator independent of camera mode/stream rate. A
+missing/already-claimed GPIO line is a warning, not a crash -- the viewer
+runs fine without it.
+
 Full-speed streaming to the Nucleo (ON BY DEFAULT, camera 0): normally
 this tool throttles beam detection to ANALYSIS_INTERVAL_S (~20Hz) because
 find_beam_blob is too expensive to run on every one of 500-900 frames/sec
@@ -154,6 +160,7 @@ import time
 from collections import deque
 
 import cv2
+import lgpio
 import numpy as np
 from picamera2 import Picamera2
 
@@ -234,6 +241,20 @@ ANALYSIS_INTERVAL_S = 0.05  # beam detection + auto-track recenter run at most
 STREAM_STATUS_INTERVAL = 200  # print a send-rate summary every this many
                                 # streamed frames -- printing every frame at
                                 # ~339fps would flood the terminal
+
+HEARTBEAT_LED_PIN = 22      # BCM GPIO numbering, matching this project's
+                              # other lgpio-based LED scripts (e.g.
+                              # led_timing_test_raw.py's LED_PIN) -- NOT the
+                              # physical 40-pin header position. Confirmed
+                              # free (plain input, unclaimed) before use.
+HEARTBEAT_LED_GPIOCHIP = 4  # /dev/gpiochip4 -- the RP1 GPIO controller on a
+                              # Raspberry Pi 5, same chip every other
+                              # lgpio-based script in this project uses.
+HEARTBEAT_BLINK_PERIOD_S = 1.0  # full on+off cycle -- a fixed, slow,
+                                   # legible "this tool is alive" indicator,
+                                   # deliberately NOT tied to capture/stream
+                                   # rate (which varies by mode and would
+                                   # make the blink unreadable at 500+ Hz).
 
 
 DEFAULT_STREAM_ROI = (640, 100)  # fastest binned mode -- measured combined
@@ -452,6 +473,48 @@ def request_recenter(index, target):
     threading.Thread(target=_recenter_worker, args=(index,), daemon=True).start()
 
 
+_heartbeat_led_stop = threading.Event()
+
+
+def start_heartbeat_led():
+    """Blink an LED on HEARTBEAT_LED_PIN at a fixed, slow rate for as long as
+    this tool is running -- a visible "is this actually alive" indicator on
+    the bench, independent of camera mode/stream rate (see
+    HEARTBEAT_BLINK_PERIOD_S). Runs on its own background thread, same
+    pattern as request_recenter()'s worker, so its on_s/time.sleep() can't
+    interact with the capture loop's own timing.
+
+    A missing/already-claimed GPIO line is reported as a warning and the
+    tool keeps running without the LED -- matches this file's existing
+    treatment of a missing/unresponsive Nucleo link (best-effort hardware,
+    not something that should crash the whole bench viewer). Returns
+    (gpio handle, thread) on success or (None, None) on failure. Callers
+    MUST join() the thread before closing the gpio handle -- the thread's
+    own pin-off write on exit would otherwise race a chip already closed
+    by the main thread.
+    """
+    try:
+        gpio = lgpio.gpiochip_open(HEARTBEAT_LED_GPIOCHIP)
+        lgpio.gpio_claim_output(gpio, HEARTBEAT_LED_PIN, 0)
+    except lgpio.error as e:
+        print(f"WARNING: could not claim GPIO{HEARTBEAT_LED_PIN} for the "
+              f"heartbeat LED ({e}) -- continuing without it.")
+        return None, None
+
+    def _blink():
+        on_s = HEARTBEAT_BLINK_PERIOD_S / 2
+        state = 0
+        while not _heartbeat_led_stop.wait(on_s):
+            state ^= 1
+            lgpio.gpio_write(gpio, HEARTBEAT_LED_PIN, state)
+        lgpio.gpio_write(gpio, HEARTBEAT_LED_PIN, 0)  # leave it off, not
+                                                         # mid-blink, on exit
+
+    thread = threading.Thread(target=_blink, daemon=True)
+    thread.start()
+    return gpio, thread
+
+
 def cycle_height():
     """Step to the next mode/size, reconfiguring every camera, then --
     for the two ROI-adjustable tiers -- center each camera's new window
@@ -646,6 +709,8 @@ elif STREAM_ENABLED and STREAM_DRY_RUN:
 print("Streaming -- 'h' cycles mode (1280x800 -> 640x200 -> 640x100 -> 1280x800), "
       "'t' toggles auto-track, 'q' quits.\n")
 
+heartbeat_gpio, heartbeat_thread = start_heartbeat_led()
+
 try:
     while True:
         for i, cam in zip(indices, cams):
@@ -837,3 +902,24 @@ finally:
         cam.stop()
     if link is not None:
         link.close()
+    _heartbeat_led_stop.set()
+    if heartbeat_thread is not None:
+        heartbeat_thread.join(timeout=HEARTBEAT_BLINK_PERIOD_S)  # let the
+                                                                     # blink
+                                                                     # thread's
+                                                                     # own
+                                                                     # pin-off
+                                                                     # write
+                                                                     # finish
+                                                                     # BEFORE
+                                                                     # the
+                                                                     # chip
+                                                                     # closes
+                                                                     # below
+    if heartbeat_gpio is not None:
+        lgpio.gpiochip_close(heartbeat_gpio)  # closing releases the line's
+                                                 # output claim too -- no
+                                                 # separate gpio_free() call
+                                                 # needed, same convention
+                                                 # this project's other
+                                                 # lgpio scripts use

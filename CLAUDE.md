@@ -3771,6 +3771,161 @@ User moving to the laptop next to work on the Nucleo's closed-loop PID
 code — nothing about this session's changes touches firmware or the
 Nucleo side at all, purely Pi-side camera/I2C throughput.
 
+### `camera_view_tool.py` gains a heartbeat LED (GPIO22); new `led_timing_histogram_test.py` built — full per-sample latency histograms across all 4 validated raw sizes, two real methodology bugs found and fixed, a real verdict flip on `640x400` (2026-11-19)
+
+Picked back up after the long gap above (the PID/resonance thread
+documented between here and the next entry is laptop-side, from a
+different session pulling the throughput fix — unrelated to this entry).
+User repositioned a bench LED so a camera can watch it and asked to redo
+this project's LED-toggle timing characterization properly: keep every
+per-toggle sample instead of collapsing to mean/max (as every prior
+`led_timing_test*.py` script in this project has always done), so the
+real shape of the latency distribution is visible, not just two summary
+numbers.
+
+**`camera_view_tool.py`: added a fixed ~1Hz heartbeat blink on BCM
+GPIO22** (`start_heartbeat_led()`/`HEARTBEAT_LED_PIN`), via `lgpio` same
+as this project's other LED scripts (`GPIOCHIP=4`) — a simple "is this
+tool actually alive" bench indicator, deliberately NOT tied to capture/
+stream rate (fixed period regardless of camera mode, since a rate-tied
+blink would be unreadable at 500+Hz). Runs on its own background thread;
+a missing/already-claimed GPIO line is a warning, not a crash, matching
+this script's existing treatment of a missing Nucleo link. Verified live
+by polling `/sys/kernel/debug/gpio` from a second process while the tool
+ran (the GPIO line itself can't be read back by a second process once
+claimed as output, so this was the only way to confirm it was really
+toggling) — confirmed `GPIO22 (|lg) out lo/hi` alternating at the
+expected ~0.5s interval, line releases cleanly on exit.
+
+**New script: `led_timing_histogram_test.py`.** Same closed-loop
+toggle-and-confirm methodology as `led_timing_test_raw.py` (command a
+state, time until the camera detects it, repeat), but drives `LED_PIN=22`
+(not the old `LED_PIN=14`, a physically different circuit/position),
+auto-calibrates ROI/threshold at startup instead of trusting stale
+hardcoded values (averages several frames per LED state, centers a fixed-
+size box on the pixel of peak ON-minus-OFF difference, same spirit as
+`led_calibrate_raw.py`'s manual workflow but automated), and — the actual
+point — saves every single sample to `results/*.npz` and renders a real
+histogram instead of only printing mean/std/min/max.
+
+**Real bug #1, caught before trusting any data**: the first version
+didn't apply `.view(np.uint16)` to raw captures, hitting this project's
+own long-documented byte-interleaving issue (`capture_array("raw")`
+returns flat uint8, double-width, with the real 16-bit pixel values split
+across adjacent "pixels" — see `camera_preview.py`'s docstring). Caught
+by eyeballing the auto-calibration debug PNG (looked like garbage
+striping, not a real scene), confirmed with a standalone shape check
+((400,1280) uint8 vs the correct (400,640) uint16), fixed both capture
+sites, reran clean.
+
+**Real physical finding, not a bug**: this LED floods the ENTIRE sensor
+to hard saturation (65280, confirmed `on_frame.min() == on_frame.max()`
+across every pixel) rather than appearing as a point source — user-
+confirmed independently ("the whole frame gets brighter"). Doesn't hurt
+the latency measurement (arguably a more robust toggle signal than a
+small ROI, since detection can't be thrown off by imprecise box
+placement) but means the debug image renders from the OFF-state frame
+(the only one with real spatial texture) rather than ON, and "ROI
+centered on the LED" is really "ROI centered wherever OFF happened to be
+darkest." Deliberately left as-is (not tuning exposure/gain down to avoid
+saturation) per user's call — the per-sample data is valid either way.
+
+**First histogram run revealed a real, confusing-at-first structure: two
+sharp, narrow peaks, not one smooth distribution** (e.g. at the default
+`640x100`/1050µs mode: tight clusters at ~2.2ms and ~3.25ms, almost
+nothing between). Root-caused and confirmed, not just theorized:
+measured peak separation (5.058ms at a 5000µs/5ms-period run) matched the
+camera's own configured frame period almost exactly, and deliberately
+doubling the frame period (5000→10000µs) shifted the peak location
+accordingly. **Mechanism**: the camera only delivers a new frame every
+`frame_duration` — not continuous — so a toggle's new state can only
+first appear in whichever upcoming frame's exposure window started after
+the command; since exposure (1.5ms) is short relative to the period, this
+is close to a hard per-period cutoff (catch this period's window, or wait
+a full extra period), producing two discrete latency bands rather than a
+smooth spread. Confirmed at three very different frame rates (5ms, 10ms,
+1.05ms periods) — the gap always tracked the configured period.
+
+**Real bug #2 (methodology, not code): the test loop's own structure was
+biasing the measurement.** Each new command fired immediately after
+detecting the previous toggle — tying command timing back to the
+camera's own clock (self-entrainment) rather than landing at a genuinely
+random phase, the way a real, unpredictable disturbance (the actual
+10-20Hz beacon wobble this project targets) would. Added a `"random"` 4th
+CLI arg: inserts a random delay (0 to `RANDOM_DELAY_PERIODS`x the frame
+period, default 3x) before each command instead of firing immediately.
+**Confirmed this was real, not cosmetic**: with random delay, the sharp
+two-peak structure dissolved into a smooth, continuous distribution at
+every mode tested — direct visual/statistical proof the peaks were a test
+-loop artifact layered on top of (not instead of) the real frame-cadence
+quantization.
+
+**Full 4-mode sweep, both ways, all at each mode's own already-validated
+floor (no new floor-discovery, no hangs, `tainted` stayed `4096`
+throughout):**
+
+| mode | frame period | immediate max | random (realistic) max | 10ms budget |
+|---|---|---|---|---|
+| 1280x800 (full sensor) | 6000µs (clamped to 6961µs) | 15.92ms | 19.07ms | **NO** |
+| 640x400 (stock binned) | 3400µs | 9.86ms | **15.18ms** | **NO** |
+| 640x200 (ROI binned) | 1800µs | 7.85ms | 7.51ms | YES |
+| 640x100 (ROI binned) | 1050µs | 6.76ms | 6.61ms | YES |
+
+**This is the real payoff of the random-delay fix, not just a cleaner
+plot: it flipped a practical verdict.** `640x400`'s immediate-recommand
+max (9.86ms) looked like a marginal pass; its realistic/random-delay max
+(15.18ms, p99 already 10.28ms) is a clear fail. The self-entrained test
+was quietly biased toward favorable phases relative to the camera's
+clock, understating the true worst case. The two ROI-windowed binned
+modes (`640x200`, `640x100`) are the only ones that hold up under
+realistic timing — consistent with this project's earlier conclusion
+(driver-patch section, above) that the binned ROI modes are the right
+choice for real tracking, now backed by actual closed-loop latency
+numbers instead of just raw throughput.
+
+**Secondary finding, flagged but not fully resolved: ON→OFF is
+consistently slower than OFF→ON, in every mode, by an amount that scales
+with camera timing (737µs-2141µs) rather than being a fixed electrical
+delay** (which rules out a simple "LED turns off slower than it turns on"
+explanation — a fixed electrical lag wouldn't scale with frame period
+the way this does). Gap-to-period ratio grows 1280x800→640x400→640x200
+(0.12x→0.43x→1.19x) then drops at 640x100 (1.03x), which lines up with
+640x100 being the one mode where the camera silently clamped the
+requested 1500µs exposure down to 856µs (can't expose longer than one
+frame period) — less absolute exposure time, less room for whatever
+asymmetric effect this is. Best current guess (unconfirmed): this LED's
+full-frame-saturation behavior means a pixel can hit max brightness from
+only a small ON-overlap within a frame's exposure window, but needs the
+LED off for most/all of that window to read back down to background —
+an inherently asymmetric relationship between toggle timing and a frame's
+exposure window. Not tested further; would need something like a
+deliberately-timed sub-exposure toggle to confirm directly.
+
+**Secondary bug: legend/stats-box overlap on at least one real plot**
+(`ax.legend()`'s auto-placed "best" position collided with the stats text
+box, both pinned near upper-right). Fixed by pinning the legend to
+`upper left` unconditionally. Refactored the plotting code into a shared
+`plot_histogram()` function, used by both the live-test path and a new
+`--replot PATH` mode (matches `fta_closed_loop_onboard_sine_test.py`'s
+existing `--replot` convention) — regenerated all 12 individual run PNGs
+and both comparison panels from their saved `npz` files with zero camera/
+GPIO interaction. Also dropped an ad-hoc "10ms budget" reference line
+that had only ever existed in the one-off comparison-panel scripts, not
+the main script, per user request.
+
+**State left**: hardware safely idle (`tainted=4096`, GPIO22 inactive, no
+camera/I2C handles held). Only camera 0 enumerated this whole session —
+camera 1's already-documented intermittent ribbon-seating fault (see
+"Hardware status" below) — so this entire characterization is single-
+camera only; a dual-camera repeat would need that cable reseated first.
+Results: `results/led_timing_histogram_*.npz` (12 raw-sample files total —
+4 early exploratory runs at the old 5ms/10ms periods kept as the
+frame-cadence-quantization evidence, 4 immediate-recommand from the clean
+4-mode sweep, 4 random-delay from the same sweep rerun realistically) and
+their matching `.png` histograms, plus `led_timing_histogram_mode_comparison.png`
+/ `_random.png` (4-panel comparison, no budget line). Next step mentioned
+by the user: build a slide deck from these findings.
+
 ### Chasing "why is the loop unstable at the new ~465Hz rate" — rate itself ruled out by direct diagnostic; a real ring-down remeasurement effort found the ORIGINAL 15.3Hz resonance number was itself broken (host timestamp bucketing), and the true resonance is ~38.5Hz, not 15.3 or 22 (2026-08-19, same day)
 
 Direct continuation of the entry above: after pulling the Pi-side
